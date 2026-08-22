@@ -42,6 +42,7 @@ type Result struct {
 type ListedFile struct {
 	Path string
 	Size int64
+	Hash string
 }
 
 // ListFiles returns regular, non-ignored files without hashing their content.
@@ -88,7 +89,11 @@ func ListFiles(root string, patterns []string) ([]ListedFile, error) {
 		if err != nil {
 			return fmt.Errorf("stat %q: %w", path, err)
 		}
-		files = append(files, ListedFile{Path: relative, Size: info.Size()})
+		fileHash, err := hash(path)
+		if err != nil {
+			return err
+		}
+		files = append(files, ListedFile{Path: relative, Size: info.Size(), Hash: fileHash})
 		return nil
 	})
 	if err != nil {

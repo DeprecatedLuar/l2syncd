@@ -38,12 +38,14 @@ type message struct {
 	Share string `json:"share,omitempty"`
 	Path  string `json:"path,omitempty"`
 	Size  int64  `json:"size,omitempty"`
+	Hash  string `json:"hash,omitempty"`
 }
 
 // PeerFile is one regular file reported by a peer listing.
 type PeerFile struct {
 	Path string
 	Size int64
+	Hash string
 }
 
 type frameWriter struct {
@@ -151,7 +153,10 @@ func readFiles(reader io.Reader) ([]PeerFile, error) {
 			if message.Size < 0 {
 				return nil, fmt.Errorf("peer returned a negative file size for %q", message.Path)
 			}
-			files = append(files, PeerFile{Path: message.Path, Size: message.Size})
+			if message.Hash == "" {
+				return nil, fmt.Errorf("peer returned an empty hash for %q", message.Path)
+			}
+			files = append(files, PeerFile{Path: message.Path, Size: message.Size, Hash: message.Hash})
 		case messageEnd:
 			return files, nil
 		default:
@@ -243,10 +248,10 @@ func writeFiles(writer io.Writer, share string, files []PeerFile) error {
 		if err := validateRelativePath(file.Path); err != nil {
 			return err
 		}
-		if file.Size < 0 {
+		if file.Size < 0 || file.Hash == "" {
 			return fmt.Errorf("invalid peer file %q", file.Path)
 		}
-		if err := responseWriter.write(message{Type: messageFile, Path: file.Path, Size: file.Size}); err != nil {
+		if err := responseWriter.write(message{Type: messageFile, Path: file.Path, Size: file.Size, Hash: file.Hash}); err != nil {
 			return err
 		}
 	}

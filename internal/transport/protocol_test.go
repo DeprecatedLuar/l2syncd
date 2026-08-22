@@ -56,7 +56,7 @@ func TestReadSharesRejectsUnexpectedMessage(t *testing.T) {
 
 func TestReadFilesRequiresEndMarker(t *testing.T) {
 	var stream bytes.Buffer
-	if err := (frameWriter{w: &stream}).write(message{Type: messageFile, Path: "a.txt", Size: 1}); err != nil {
+	if err := (frameWriter{w: &stream}).write(message{Type: messageFile, Path: "a.txt", Size: 1, Hash: "hash"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -72,7 +72,7 @@ func TestServePeerSortsAndTerminatesFileListing(t *testing.T) {
 		t.Fatal(err)
 	}
 	var response bytes.Buffer
-	files := []PeerFile{{Path: "z.txt", Size: 3}, {Path: "a.txt", Size: 1}}
+	files := []PeerFile{{Path: "z.txt", Size: 3, Hash: "z"}, {Path: "a.txt", Size: 1, Hash: "a"}}
 	err := ServePeer(&request, &response, []string{"notes"}, func(share string) ([]PeerFile, error) {
 		if share != "notes" {
 			t.Fatalf("file lister share = %q, want notes", share)
@@ -101,7 +101,7 @@ func TestServePeerDispatchesFileListing(t *testing.T) {
 		if share != "notes" {
 			t.Fatalf("file lister share = %q, want notes", share)
 		}
-		return []PeerFile{{Path: "notes/a.txt", Size: 4}}, nil
+		return []PeerFile{{Path: "notes/a.txt", Size: 4, Hash: "a"}}, nil
 	})
 	if err != nil {
 		t.Fatal(err)

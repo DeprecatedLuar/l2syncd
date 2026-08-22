@@ -47,37 +47,16 @@ func Join(args []string, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "l2sync: folder %q already exists\n", name)
 		return joinExitError
 	}
-	matched := make([]string, 0, 1)
-	for peerName, peer := range cfg.Peers {
-		address, resolveErr := config.ResolvePeerAddress(peer)
-		if resolveErr != nil {
-			fmt.Fprintf(stderr, "l2sync: resolve peer %q: %v\n", peerName, resolveErr)
-			return joinExitError
-		}
-		offered, listErr := transport.ListShares(context.Background(), address)
-		if listErr != nil {
-			fmt.Fprintf(stderr, "l2sync: peer %q unreachable: %v\n", peerName, listErr)
+	peerName, address, err := findProvider(context.Background(), cfg, name)
+	if err != nil {
+		fmt.Fprintf(stderr, "l2sync: %v\n", err)
+		if strings.Contains(err.Error(), "unreachable") {
 			return joinExitUnreachable
 		}
-		if contains(offered, name) {
-			matched = append(matched, peerName)
-		}
-	}
-	if len(matched) == 0 {
-		fmt.Fprintf(stderr, "l2sync: no peer offers folder %q\n", name)
-		return joinExitError
-	}
-	if len(matched) != 1 {
-		fmt.Fprintf(stderr, "l2sync: multiple peers offer folder %q\n", name)
-		return joinExitError
-	}
-	address, err := config.ResolvePeerAddress(cfg.Peers[matched[0]])
-	if err != nil {
-		fmt.Fprintf(stderr, "l2sync: resolve peer %q: %v\n", matched[0], err)
 		return joinExitError
 	}
 	if _, err := transport.ListFiles(context.Background(), address, name); err != nil {
-		fmt.Fprintf(stderr, "l2sync: verify folder %q on peer %q: %v\n", name, matched[0], err)
+		fmt.Fprintf(stderr, "l2sync: verify folder %q on peer %q: %v\n", name, peerName, err)
 		return joinExitUnreachable
 	}
 	path, err := filepath.Abs(args[1])

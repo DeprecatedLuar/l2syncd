@@ -45,6 +45,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return commands.Serve(os.Stdin, stdout, stderr)
 	case "status":
 		return commands.Status(stdout, stderr)
+	case "now":
+		return commands.Now(args[1:], stdout, stderr)
 	case "baseline":
 		if len(args) > 1 && args[1] == "commit" {
 			return commands.BaselineCommit(args[2:], stderr)

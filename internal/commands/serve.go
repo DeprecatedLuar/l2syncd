@@ -63,7 +63,7 @@ func Serve(stdin io.Reader, stdout, stderr io.Writer) int {
 		}
 		files := make([]transport.PeerFile, 0, len(listed))
 		for _, file := range listed {
-			files = append(files, transport.PeerFile{Path: file.Path, Size: file.Size})
+			files = append(files, transport.PeerFile{Path: file.Path, Size: file.Size, Hash: file.Hash})
 		}
 		return files, nil
 	}
