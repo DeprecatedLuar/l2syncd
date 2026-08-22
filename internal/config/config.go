@@ -25,30 +25,16 @@ const (
 var ErrNotFound = errors.New("configuration file does not exist")
 
 type Config struct {
-	Peers  map[string]Peer  `toml:"peers"`
-	Shares map[string]Share `toml:"shares"`
-	Mounts map[string]Mount `toml:"mounts"`
-}
-
-type Peer struct {
-	Addr string `toml:"addr"`
-}
-
-type Share struct {
-	Local  string   `toml:"local"`
-	Ignore []string `toml:"ignore"`
-}
-
-type Mount struct {
-	Peer  string `toml:"peer"`
-	Local string `toml:"local"`
+	Peers  map[string]string `toml:"peers"`
+	Shared map[string]string `toml:"shared"`
+	Remote map[string]string `toml:"remote"`
 }
 
 func New() Config {
 	return Config{
-		Peers:  make(map[string]Peer),
-		Shares: make(map[string]Share),
-		Mounts: make(map[string]Mount),
+		Peers:  make(map[string]string),
+		Shared: make(map[string]string),
+		Remote: make(map[string]string),
 	}
 }
 
@@ -157,8 +143,8 @@ func CheckStateDirWritable() error {
 
 // ResolvePeerAddress returns the SSH HostName for peer when it is configured,
 // or its configured address when no matching SSH configuration exists.
-func ResolvePeerAddress(peer Peer) (string, error) {
-	if peer.Addr == "" {
+func ResolvePeerAddress(peer string) (string, error) {
+	if peer == "" {
 		return "", errors.New("peer address is empty")
 	}
 
@@ -170,7 +156,7 @@ func ResolvePeerAddress(peer Peer) (string, error) {
 	sshConfig, err := os.Open(sshConfigPath)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			return peer.Addr, nil
+			return peer, nil
 		}
 		return "", fmt.Errorf("open SSH config: %w", err)
 	}
@@ -180,25 +166,25 @@ func ResolvePeerAddress(peer Peer) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("parse SSH config: %w", err)
 	}
-	hostname, err := parsed.Get(peer.Addr, "HostName")
+	hostname, err := parsed.Get(peer, "HostName")
 	if err != nil {
-		return "", fmt.Errorf("resolve SSH host %q: %w", peer.Addr, err)
+		return "", fmt.Errorf("resolve SSH host %q: %w", peer, err)
 	}
 	if hostname == "" {
-		return peer.Addr, nil
+		return peer, nil
 	}
 	return hostname, nil
 }
 
 func ensureMaps(cfg *Config) {
 	if cfg.Peers == nil {
-		cfg.Peers = make(map[string]Peer)
+		cfg.Peers = make(map[string]string)
 	}
-	if cfg.Shares == nil {
-		cfg.Shares = make(map[string]Share)
+	if cfg.Shared == nil {
+		cfg.Shared = make(map[string]string)
 	}
-	if cfg.Mounts == nil {
-		cfg.Mounts = make(map[string]Mount)
+	if cfg.Remote == nil {
+		cfg.Remote = make(map[string]string)
 	}
 }
 

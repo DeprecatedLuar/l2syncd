@@ -16,23 +16,10 @@ import (
 )
 
 const (
-	markerName      = ".l2sync"
 	fuseMagic       = 0x65735546
 	defaultRatio    = 0.20
 	defaultAbsFloor = 10
 )
-
-// Marker requires the share marker directory to exist and be a real directory.
-func Marker(root string) error {
-	info, err := os.Lstat(filepath.Join(root, markerName))
-	if err != nil {
-		return fmt.Errorf("marker %q is missing: %w", markerName, err)
-	}
-	if !info.IsDir() {
-		return fmt.Errorf("marker %q is not a directory", markerName)
-	}
-	return nil
-}
 
 // Filesystem rejects FUSE-backed shares after resolving the root path.
 func Filesystem(root string) error {

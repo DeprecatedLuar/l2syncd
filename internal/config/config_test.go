@@ -15,9 +15,9 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
 
 	want := New()
-	want.Peers["phone"] = Peer{Addr: "phone"}
-	want.Shares["notes"] = Share{Local: "/tmp/notes", Ignore: []string{"node_modules", "*.swp"}}
-	want.Mounts["notes"] = Mount{Peer: "phone", Local: "/tmp/phone-notes"}
+	want.Peers["phone"] = "phone"
+	want.Shared["notes"] = "/tmp/notes"
+	want.Remote["photos"] = "/tmp/photos"
 	if err := Save(want); err != nil {
 		t.Fatalf("Save() error = %v", err)
 	}
@@ -26,7 +26,7 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if !reflect.DeepEqual(got.Peers["phone"], want.Peers["phone"]) || !reflect.DeepEqual(got.Shares["notes"], want.Shares["notes"]) || !reflect.DeepEqual(got.Mounts["notes"], want.Mounts["notes"]) {
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("Load() = %#v, want %#v", got, want)
 	}
 }
@@ -61,7 +61,7 @@ func TestResolvePeerAddress(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := ResolvePeerAddress(Peer{Addr: "phone"})
+	got, err := ResolvePeerAddress("phone")
 	if err != nil {
 		t.Fatalf("ResolvePeerAddress() error = %v", err)
 	}
@@ -74,7 +74,7 @@ func TestResolvePeerAddressFallsBackToRawAddress(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("HOME", root)
 
-	got, err := ResolvePeerAddress(Peer{Addr: "phone"})
+	got, err := ResolvePeerAddress("phone")
 	if err != nil {
 		t.Fatalf("ResolvePeerAddress() error = %v", err)
 	}

@@ -34,8 +34,8 @@ func TestAddListAndRemoveShare(t *testing.T) {
 	if stdout.Len() != 0 || stderr.Len() != 0 {
 		t.Fatalf("add output = stdout %q, stderr %q, want silent", stdout.String(), stderr.String())
 	}
-	if info, err := os.Stat(filepath.Join(sharePath, ".l2sync")); err != nil || !info.IsDir() {
-		t.Fatalf("share marker = %v, %v, want directory", info, err)
+	if info, err := os.Stat(filepath.Join(sharePath, ".l2sync")); err != nil || info.IsDir() {
+		t.Fatalf("share marker = %v, %v, want file", info, err)
 	}
 
 	stdout.Reset()
@@ -43,7 +43,7 @@ func TestAddListAndRemoveShare(t *testing.T) {
 	if got := List(&stdout, &stderr); got != successExitCode {
 		t.Fatalf("list exit code = %d, stderr = %q", got, stderr.String())
 	}
-	if want := "share notes " + sharePath + "\n"; stdout.String() != want {
+	if want := "shared notes " + sharePath + "\n"; stdout.String() != want {
 		t.Fatalf("list stdout = %q, want %q", stdout.String(), want)
 	}
 
@@ -59,7 +59,7 @@ func TestAddListAndRemoveShare(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, exists := cfg.Shares["notes"]; exists {
+	if _, exists := cfg.Shared["notes"]; exists {
 		t.Fatal("share remains in config after rm")
 	}
 }
@@ -116,6 +116,13 @@ func TestConfigEditOpensConfigFile(t *testing.T) {
 	if strings.TrimSpace(string(contents)) != configPath {
 		t.Fatalf("editor received %q, want %q", strings.TrimSpace(string(contents)), configPath)
 	}
+	configContents, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(configContents), "# l2sync configuration") {
+		t.Fatalf("config = %q, want starter preset", configContents)
+	}
 }
 
 func TestConfigEditRejectsArguments(t *testing.T) {
@@ -128,7 +135,7 @@ func TestConfigEditRejectsArguments(t *testing.T) {
 	}
 }
 
-func TestAddPromptsForLowercaseSafeName(t *testing.T) {
+func TestAddRejectsUnsafeName(t *testing.T) {
 	root := t.TempDir()
 	sharePath := filepath.Join(root, "project")
 	if err := os.Mkdir(sharePath, 0o700); err != nil {
@@ -140,23 +147,23 @@ func TestAddPromptsForLowercaseSafeName(t *testing.T) {
 
 	cfg := config.New()
 	var stderr bytes.Buffer
-	if got := add(cfg, []string{sharePath}, &stderr, strings.NewReader("My Project\n")); got != 1 {
+	if got := add(cfg, []string{"My Project", sharePath}, &stderr); got != 1 {
 		t.Fatalf("add exit code = %d, stderr = %q", got, stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "share name must contain only") {
+	if !strings.Contains(stderr.String(), "folder name must contain only") {
 		t.Fatalf("stderr = %q, want unsafe-name error", stderr.String())
 	}
 
 	stderr.Reset()
-	if got := add(cfg, []string{sharePath}, &stderr, strings.NewReader("My_Project\n")); got != successExitCode {
+	if got := add(cfg, []string{"My_Project", sharePath}, &stderr); got != successExitCode {
 		t.Fatalf("add exit code = %d, stderr = %q", got, stderr.String())
 	}
 	loaded, err := config.Load()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := loaded.Shares["my_project"]; !ok {
-		t.Fatalf("shares = %#v, want lowercase share name", loaded.Shares)
+	if _, ok := loaded.Shared["my_project"]; !ok {
+		t.Fatalf("shared = %#v, want lowercase share name", loaded.Shared)
 	}
 }
 
@@ -173,7 +180,7 @@ func TestBaselineCommitAndStatus(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
 	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
 	var stdout, stderr bytes.Buffer
-	if got := Add([]string{sharePath, "--name", "notes"}, &stderr); got != successExitCode {
+	if got := Add([]string{"notes", sharePath}, &stderr); got != successExitCode {
 		t.Fatalf("add exit code = %d, stderr = %q", got, stderr.String())
 	}
 	stderr.Reset()

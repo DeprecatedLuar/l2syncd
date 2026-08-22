@@ -66,14 +66,20 @@ func TestReadFilesRequiresEndMarker(t *testing.T) {
 	}
 }
 
-func TestServeFilesSortsAndTerminatesListing(t *testing.T) {
+func TestServePeerSortsAndTerminatesFileListing(t *testing.T) {
 	var request bytes.Buffer
 	if err := writeListFilesRequest(&request, "notes"); err != nil {
 		t.Fatal(err)
 	}
 	var response bytes.Buffer
 	files := []PeerFile{{Path: "z.txt", Size: 3}, {Path: "a.txt", Size: 1}}
-	if err := ServeFiles(&request, &response, "notes", files); err != nil {
+	err := ServePeer(&request, &response, []string{"notes"}, func(share string) ([]PeerFile, error) {
+		if share != "notes" {
+			t.Fatalf("file lister share = %q, want notes", share)
+		}
+		return files, nil
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
 	got, err := readFiles(&response)
@@ -82,5 +88,39 @@ func TestServeFilesSortsAndTerminatesListing(t *testing.T) {
 	}
 	if len(got) != 2 || got[0].Path != "a.txt" || got[1].Path != "z.txt" {
 		t.Fatalf("files = %#v, want sorted file listing", got)
+	}
+}
+
+func TestServePeerDispatchesFileListing(t *testing.T) {
+	var request bytes.Buffer
+	if err := writeListFilesRequest(&request, "notes"); err != nil {
+		t.Fatal(err)
+	}
+	var response bytes.Buffer
+	err := ServePeer(&request, &response, []string{"notes"}, func(share string) ([]PeerFile, error) {
+		if share != "notes" {
+			t.Fatalf("file lister share = %q, want notes", share)
+		}
+		return []PeerFile{{Path: "notes/a.txt", Size: 4}}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	files, err := readFiles(&response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 1 || files[0].Path != "notes/a.txt" || files[0].Size != 4 {
+		t.Fatalf("files = %#v, want one dispatched file", files)
+	}
+}
+
+func TestReadFilesRejectsUnsafePath(t *testing.T) {
+	var stream bytes.Buffer
+	if err := (frameWriter{w: &stream}).write(message{Type: messageFile, Path: "../outside", Size: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readFiles(&stream); err == nil {
+		t.Fatal("readFiles error = nil, want unsafe path error")
 	}
 }

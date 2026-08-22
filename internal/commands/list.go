@@ -25,13 +25,11 @@ func list(cfg config.Config, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "usage: l2sync list [peer]")
 		return listExitError
 	}
-	for _, name := range sortedKeys(cfg.Shares) {
-		share := cfg.Shares[name]
-		fmt.Fprintf(stdout, "share %s %s\n", name, share.Local)
+	for _, name := range sortedKeys(cfg.Shared) {
+		fmt.Fprintf(stdout, "shared %s %s\n", name, cfg.Shared[name])
 	}
-	for _, name := range sortedKeys(cfg.Mounts) {
-		mount := cfg.Mounts[name]
-		fmt.Fprintf(stdout, "mount %s peer=%s local=%s\n", name, mount.Peer, mount.Local)
+	for _, name := range sortedKeys(cfg.Remote) {
+		fmt.Fprintf(stdout, "remote %s %s\n", name, cfg.Remote[name])
 	}
 	if len(args) == 0 {
 		return listExitOK
@@ -59,7 +57,7 @@ func list(cfg config.Config, args []string, stdout, stderr io.Writer) int {
 	return listExitOK
 }
 
-// List prints locally registered shares and mounts.
+// List prints locally registered folders.
 func List(stdout, stderr io.Writer) int {
 	cfg, err := preflight.LoadConfig()
 	if err != nil {
@@ -69,7 +67,7 @@ func List(stdout, stderr io.Writer) int {
 	return list(cfg, nil, stdout, stderr)
 }
 
-// ListPeer prints local registrations and the offered shares from one peer.
+// ListPeer prints local registrations and the folders offered by one peer.
 func ListPeer(args []string, stdout, stderr io.Writer) int {
 	cfg, err := preflight.LoadConfig()
 	if err != nil {

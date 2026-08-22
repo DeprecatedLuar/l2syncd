@@ -33,7 +33,7 @@ func TestCheckRejectsEmptyPeerAddress(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
 
 	cfg := config.New()
-	cfg.Peers["phone"] = config.Peer{}
+	cfg.Peers["phone"] = ""
 	if err := Check(cfg); err == nil {
 		t.Fatal("Check() error = nil, want empty peer address error")
 	}

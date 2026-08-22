@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"io"
 
-	"l2syncd/internal/config"
+	"l2syncd/internal/guard"
 	"l2syncd/internal/preflight"
 	"l2syncd/internal/scan"
 	"l2syncd/internal/state"
@@ -25,8 +25,8 @@ func Status(stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "l2sync: %v\n", err)
 		return statusExitInvalid
 	}
-	for _, name := range sortedKeys(cfg.Shares) {
-		if err := printStatus(stdout, name, cfg.Shares[name]); err != nil {
+	for _, name := range sortedKeys(cfg.Shared) {
+		if err := printStatus(stdout, name, cfg.Shared[name]); err != nil {
 			fmt.Fprintf(stderr, "l2sync: status %q: %v\n", name, err)
 			return statusExitError
 		}
@@ -44,7 +44,7 @@ func BaselineCommit(args []string, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "l2sync: %v\n", err)
 		return statusExitInvalid
 	}
-	share, found := cfg.Shares[args[0]]
+	path, found := cfg.Shared[args[0]]
 	if !found {
 		fmt.Fprintf(stderr, "l2sync: share %q not found\n", args[0])
 		return statusExitError
@@ -54,7 +54,12 @@ func BaselineCommit(args []string, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "l2sync: load baseline: %v\n", err)
 		return statusExitError
 	}
-	result, err := scan.DetectWithIgnore(share.Local, baseline, share.Ignore)
+	marker, err := guard.ReadMarker(path)
+	if err != nil {
+		fmt.Fprintf(stderr, "l2sync: read marker: %v\n", err)
+		return statusExitError
+	}
+	result, err := scan.DetectWithIgnore(path, baseline, marker.Ignore)
 	if err != nil {
 		fmt.Fprintf(stderr, "l2sync: scan share %q: %v\n", args[0], err)
 		return statusExitError
@@ -66,12 +71,16 @@ func BaselineCommit(args []string, stderr io.Writer) int {
 	return statusExitOK
 }
 
-func printStatus(stdout io.Writer, name string, share config.Share) error {
+func printStatus(stdout io.Writer, name, path string) error {
 	baseline, err := loadBaseline(name)
 	if err != nil {
 		return err
 	}
-	result, err := scan.DetectWithIgnore(share.Local, baseline, share.Ignore)
+	marker, err := guard.ReadMarker(path)
+	if err != nil {
+		return err
+	}
+	result, err := scan.DetectWithIgnore(path, baseline, marker.Ignore)
 	if err != nil {
 		return err
 	}

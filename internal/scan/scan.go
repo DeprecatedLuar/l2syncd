@@ -38,6 +38,66 @@ type Result struct {
 	Skipped  []string
 }
 
+// ListedFile is the minimal metadata needed for a peer tree listing.
+type ListedFile struct {
+	Path string
+	Size int64
+}
+
+// ListFiles returns regular, non-ignored files without hashing their content.
+func ListFiles(root string, patterns []string) ([]ListedFile, error) {
+	if _, err := guard.ReadMarker(root); err != nil {
+		return nil, err
+	}
+	if err := guard.Filesystem(root); err != nil {
+		return nil, err
+	}
+	ignore, err := guard.NewIgnore(patterns)
+	if err != nil {
+		return nil, err
+	}
+	files := make([]ListedFile, 0)
+	err = filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		relative, err := filepath.Rel(root, path)
+		if err != nil {
+			return fmt.Errorf("make path relative: %w", err)
+		}
+		relative = filepath.ToSlash(relative)
+		if relative == "." {
+			return nil
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			if entry.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if ignoredByDefault(relative) || ignore.Match(relative, entry.IsDir()) {
+			if entry.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if entry.IsDir() || !entry.Type().IsRegular() {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return fmt.Errorf("stat %q: %w", path, err)
+		}
+		files = append(files, ListedFile{Path: relative, Size: info.Size()})
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list share %q: %w", root, err)
+	}
+	sort.Slice(files, func(left, right int) bool { return files[left].Path < files[right].Path })
+	return files, nil
+}
+
 // Detect scans with the default local ignore policy.
 func Detect(root string, baseline state.Baseline) ([]Change, state.Baseline, error) {
 	result, err := DetectWithIgnore(root, baseline, nil)
@@ -49,7 +109,7 @@ func Detect(root string, baseline state.Baseline) ([]Change, state.Baseline, err
 
 // DetectWithIgnore scans a share while applying its local ignore patterns.
 func DetectWithIgnore(root string, baseline state.Baseline, patterns []string) (Result, error) {
-	if err := guard.Marker(root); err != nil {
+	if _, err := guard.ReadMarker(root); err != nil {
 		return Result{}, err
 	}
 	if err := guard.Filesystem(root); err != nil {

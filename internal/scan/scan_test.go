@@ -12,7 +12,7 @@ import (
 
 func TestDetectChangesAndSkipMarker(t *testing.T) {
 	root := t.TempDir()
-	if err := os.Mkdir(filepath.Join(root, ".l2sync"), 0o700); err != nil {
+	if err := os.WriteFile(filepath.Join(root, ".l2sync"), []byte("name = \"notes\"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(root, "same.txt"), []byte("same"), 0o600); err != nil {
@@ -59,7 +59,7 @@ func TestDetectChangesAndSkipMarker(t *testing.T) {
 
 func TestDetectSkipsIgnoredFilesAndSymlinks(t *testing.T) {
 	root := t.TempDir()
-	if err := os.Mkdir(filepath.Join(root, ".l2sync"), 0o700); err != nil {
+	if err := os.WriteFile(filepath.Join(root, ".l2sync"), []byte("name = \"notes\"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Mkdir(filepath.Join(root, "node_modules"), 0o700); err != nil {

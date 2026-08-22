@@ -13,7 +13,9 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"path"
 	"sort"
+	"strings"
 )
 
 const (
@@ -143,6 +145,9 @@ func readFiles(reader io.Reader) ([]PeerFile, error) {
 			if message.Path == "" {
 				return nil, errors.New("peer returned an empty file path")
 			}
+			if err := validateRelativePath(message.Path); err != nil {
+				return nil, err
+			}
 			if message.Size < 0 {
 				return nil, fmt.Errorf("peer returned a negative file size for %q", message.Path)
 			}
@@ -191,49 +196,54 @@ func ListFiles(ctx context.Context, address, share string) ([]PeerFile, error) {
 	return readFiles(bytes.NewReader(output))
 }
 
-// ServeShares handles one peer discovery request and writes a complete response.
-// It is intended to be called by the remote `l2sync serve` command.
-func ServeShares(reader io.Reader, writer io.Writer, shares []string) error {
+// ServePeer handles one discovery request. The fileLister is called only for
+// a requested share after the request has been validated.
+func ServePeer(reader io.Reader, writer io.Writer, shares []string, fileLister func(string) ([]PeerFile, error)) error {
 	requestReader := frameReader{r: bufio.NewReader(reader)}
 	request, err := requestReader.read()
 	if err != nil {
 		return err
 	}
-	if request.Type != messageListShares {
-		return fmt.Errorf("unexpected peer request %q", request.Type)
-	}
-
-	ordered := append([]string(nil), shares...)
-	sort.Strings(ordered)
-	responseWriter := frameWriter{w: writer}
-	for _, share := range ordered {
-		if share == "" {
-			return errors.New("cannot serve an empty share name")
+	switch request.Type {
+	case messageListShares:
+		ordered := append([]string(nil), shares...)
+		sort.Strings(ordered)
+		responseWriter := frameWriter{w: writer}
+		for _, share := range ordered {
+			if share == "" {
+				return errors.New("cannot serve an empty share name")
+			}
+			if err := responseWriter.write(message{Type: messageShare, Share: share}); err != nil {
+				return err
+			}
 		}
-		if err := responseWriter.write(message{Type: messageShare, Share: share}); err != nil {
+		return responseWriter.write(message{Type: messageEnd})
+	case messageListFiles:
+		if fileLister == nil {
+			return errors.New("file listing is not configured")
+		}
+		files, err := fileLister(request.Share)
+		if err != nil {
 			return err
 		}
+		return writeFiles(writer, request.Share, files)
+	default:
+		return fmt.Errorf("unexpected peer request %q", request.Type)
 	}
-	return responseWriter.write(message{Type: messageEnd})
 }
 
-// ServeFiles handles one file-list request. The caller supplies the already
-// guarded file paths; this transport layer does not walk a filesystem.
-func ServeFiles(reader io.Reader, writer io.Writer, share string, files []PeerFile) error {
-	requestReader := frameReader{r: bufio.NewReader(reader)}
-	request, err := requestReader.read()
-	if err != nil {
-		return err
+func writeFiles(writer io.Writer, share string, files []PeerFile) error {
+	if share == "" {
+		return errors.New("cannot serve an empty share name")
 	}
-	if request.Type != messageListFiles || request.Share != share {
-		return fmt.Errorf("unexpected file-list request for share %q", request.Share)
-	}
-
 	ordered := append([]PeerFile(nil), files...)
 	sort.Slice(ordered, func(left, right int) bool { return ordered[left].Path < ordered[right].Path })
 	responseWriter := frameWriter{w: writer}
 	for _, file := range ordered {
-		if file.Path == "" || file.Size < 0 {
+		if err := validateRelativePath(file.Path); err != nil {
+			return err
+		}
+		if file.Size < 0 {
 			return fmt.Errorf("invalid peer file %q", file.Path)
 		}
 		if err := responseWriter.write(message{Type: messageFile, Path: file.Path, Size: file.Size}); err != nil {
@@ -241,4 +251,11 @@ func ServeFiles(reader io.Reader, writer io.Writer, share string, files []PeerFi
 		}
 	}
 	return responseWriter.write(message{Type: messageEnd})
+}
+
+func validateRelativePath(value string) error {
+	if value == "" || strings.HasPrefix(value, "/") || path.Clean(value) != value || value == "." || strings.HasPrefix(value, "../") {
+		return fmt.Errorf("invalid peer file path %q", value)
+	}
+	return nil
 }

@@ -21,11 +21,19 @@ func remove(cfg config.Config, args []string, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "usage: l2sync remove <name>")
 		return removeExitError
 	}
-	if _, exists := cfg.Shares[args[0]]; !exists {
+	if _, exists := cfg.Shared[args[0]]; !exists {
+		if _, remote := cfg.Remote[args[0]]; remote {
+			delete(cfg.Remote, args[0])
+			if err := config.Save(cfg); err != nil {
+				fmt.Fprintf(stderr, "l2sync: save config: %v\n", err)
+				return removeExitError
+			}
+			return removeExitOK
+		}
 		fmt.Fprintf(stderr, "l2sync: share %q not found\n", args[0])
 		return removeExitError
 	}
-	delete(cfg.Shares, args[0])
+	delete(cfg.Shared, args[0])
 	if err := config.Save(cfg); err != nil {
 		fmt.Fprintf(stderr, "l2sync: save config: %v\n", err)
 		return removeExitError
