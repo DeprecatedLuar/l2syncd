@@ -1,37 +1,37 @@
+//go:build linux
+
 package preflight
 
 import (
+	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 
 	"l2syncd/internal/config"
 )
 
+// LoadConfig loads configuration and verifies it is safe to use.
+func LoadConfig() (config.Config, error) {
+	cfg, err := config.Load()
+	if err != nil && !errors.Is(err, config.ErrNotFound) {
+		return config.Config{}, fmt.Errorf("invalid config: %w", err)
+	}
+	if errors.Is(err, config.ErrNotFound) {
+		cfg = config.New()
+	}
+	if err := Check(cfg); err != nil {
+		return config.Config{}, fmt.Errorf("preflight failed: %w", err)
+	}
+	return cfg, nil
+}
+
 func Check(cfg config.Config) error {
-	stateDir, err := config.StateDir()
-	if err != nil {
+	if err := config.CheckStateDirWritable(); err != nil {
 		return err
-	}
-	if err := os.MkdirAll(stateDir, 0o700); err != nil {
-		return fmt.Errorf("state directory is not writable: %w", err)
-	}
-	test, err := os.CreateTemp(stateDir, ".preflight-*")
-	if err != nil {
-		return fmt.Errorf("state directory is not writable: %w", err)
-	}
-	testName := test.Name()
-	if err := test.Close(); err != nil {
-		os.Remove(testName)
-		return fmt.Errorf("close state preflight file: %w", err)
-	}
-	if err := os.Remove(testName); err != nil {
-		return fmt.Errorf("remove state preflight file: %w", err)
 	}
 
 	for name, peer := range cfg.Peers {
-		if filepath.IsAbs(peer.Addr) || peer.Addr == "" {
-			return fmt.Errorf("peer %q has invalid address", name)
+		if _, err := config.ResolvePeerAddress(peer); err != nil {
+			return fmt.Errorf("resolve peer %q: %w", name, err)
 		}
 	}
 	for name, mount := range cfg.Mounts {

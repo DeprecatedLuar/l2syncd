@@ -1,3 +1,5 @@
+//go:build linux
+
 package config
 
 import (
@@ -8,12 +10,16 @@ import (
 	"path/filepath"
 
 	"github.com/BurntSushi/toml"
+	"github.com/kevinburke/ssh_config"
 )
 
 const (
 	configDirectory = ".config/l2sync"
 	configFilename  = "config.toml"
 	stateDirectory  = ".local/state/l2sync"
+	directoryMode   = 0o700
+	fileMode        = 0o600
+	preflightPrefix = ".l2sync-preflight-*"
 )
 
 var ErrNotFound = errors.New("configuration file does not exist")
@@ -29,7 +35,8 @@ type Peer struct {
 }
 
 type Share struct {
-	Local string `toml:"local"`
+	Local  string   `toml:"local"`
+	Ignore []string `toml:"ignore"`
 }
 
 type Mount struct {
@@ -67,7 +74,7 @@ func Save(cfg Config) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), directoryMode); err != nil {
 		return fmt.Errorf("create config directory: %w", err)
 	}
 
@@ -78,7 +85,7 @@ func Save(cfg Config) error {
 	temporaryName := temporary.Name()
 	defer os.Remove(temporaryName)
 
-	if err := temporary.Chmod(0o600); err != nil {
+	if err := temporary.Chmod(fileMode); err != nil {
 		temporary.Close()
 		return fmt.Errorf("set config permissions: %w", err)
 	}
@@ -121,6 +128,68 @@ func StateDir() (string, error) {
 	return filepath.Join(base, stateDirectory), nil
 }
 
+// CheckStateDirWritable verifies that the state directory, or the closest
+// existing parent when it has not been created yet, is writable. It never
+// creates the directory.
+func CheckStateDirWritable() error {
+	stateDir, err := StateDir()
+	if err != nil {
+		return err
+	}
+	parent, err := existingParent(stateDir)
+	if err != nil {
+		return fmt.Errorf("inspect state directory: %w", err)
+	}
+	temporary, err := os.CreateTemp(parent, preflightPrefix)
+	if err != nil {
+		return fmt.Errorf("state directory is not writable: %w", err)
+	}
+	temporaryName := temporary.Name()
+	if err := temporary.Close(); err != nil {
+		os.Remove(temporaryName)
+		return fmt.Errorf("close state preflight file: %w", err)
+	}
+	if err := os.Remove(temporaryName); err != nil {
+		return fmt.Errorf("remove state preflight file: %w", err)
+	}
+	return nil
+}
+
+// ResolvePeerAddress returns the SSH HostName for peer when it is configured,
+// or its configured address when no matching SSH configuration exists.
+func ResolvePeerAddress(peer Peer) (string, error) {
+	if peer.Addr == "" {
+		return "", errors.New("peer address is empty")
+	}
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("find home directory: %w", err)
+	}
+	sshConfigPath := filepath.Join(home, ".ssh", "config")
+	sshConfig, err := os.Open(sshConfigPath)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return peer.Addr, nil
+		}
+		return "", fmt.Errorf("open SSH config: %w", err)
+	}
+	defer sshConfig.Close()
+
+	parsed, err := ssh_config.Decode(sshConfig)
+	if err != nil {
+		return "", fmt.Errorf("parse SSH config: %w", err)
+	}
+	hostname, err := parsed.Get(peer.Addr, "HostName")
+	if err != nil {
+		return "", fmt.Errorf("resolve SSH host %q: %w", peer.Addr, err)
+	}
+	if hostname == "" {
+		return peer.Addr, nil
+	}
+	return hostname, nil
+}
+
 func ensureMaps(cfg *Config) {
 	if cfg.Peers == nil {
 		cfg.Peers = make(map[string]Peer)
@@ -130,5 +199,25 @@ func ensureMaps(cfg *Config) {
 	}
 	if cfg.Mounts == nil {
 		cfg.Mounts = make(map[string]Mount)
+	}
+}
+
+func existingParent(path string) (string, error) {
+	for {
+		info, err := os.Stat(path)
+		if err == nil {
+			if !info.IsDir() {
+				return "", fmt.Errorf("%q is not a directory", path)
+			}
+			return path, nil
+		}
+		if !errors.Is(err, fs.ErrNotExist) {
+			return "", err
+		}
+		parent := filepath.Dir(path)
+		if parent == path {
+			return "", fmt.Errorf("no existing parent for %q", path)
+		}
+		path = parent
 	}
 }
