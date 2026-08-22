@@ -1,0 +1,61 @@
+# Build artifacts
+*
+*.exe
+dist/
+build/
+_*
+!__*
+!*/
+!*.*
+
+# Secrets
+.env
+
+# Dependencies
+node_modules/
+package-lock.json
+dist
+dist-ssr
+.output
+.vinxi
+.tanstack/**
+.nitro
+*.local
+.wrangler/
+.dev.vars
+
+# IDE files
+.vscode/
+.idea/
+.claude/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+
+# Logs
+logs
+*.log
+*-debug.log*
+
+# Assets
+*.png
+*.mp4
+*.kra
+
+# Purpose and planning files
+*.md
+
+# Whitelist
+!README.md
+!LICENCE
+!LICENSE
+!shell.nix
+!.gitignore
