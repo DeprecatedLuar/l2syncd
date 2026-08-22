@@ -5,11 +5,15 @@ package commands
 import (
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"sort"
 
+	"l2syncd/internal/apply"
 	"l2syncd/internal/config"
 	"l2syncd/internal/guard"
 	"l2syncd/internal/scan"
+	"l2syncd/internal/state"
 	"l2syncd/internal/transport"
 )
 
@@ -67,9 +71,90 @@ func Serve(stdin io.Reader, stdout, stderr io.Writer) int {
 		}
 		return files, nil
 	}
-	if err := transport.ServePeer(stdin, stdout, shares, fileLister); err != nil {
+	fileReader := func(name, relative string) (io.ReadCloser, error) {
+		path, exists := cfg.Shared[name]
+		if !exists {
+			return nil, fmt.Errorf("shared folder %q is not offered", name)
+		}
+		marker, markerErr := guard.ReadMarker(path)
+		if markerErr != nil || marker.Name != name {
+			return nil, fmt.Errorf("shared folder %q marker is invalid", name)
+		}
+		if relative == "" || filepath.IsAbs(relative) || filepath.Clean(relative) != relative {
+			return nil, fmt.Errorf("invalid peer file path %q", relative)
+		}
+		file, openErr := os.Open(filepath.Join(path, filepath.FromSlash(relative)))
+		if openErr != nil {
+			return nil, fmt.Errorf("open shared file %q: %w", relative, openErr)
+		}
+		return file, nil
+	}
+	fileWriter := func(name, relative string, contents io.Reader) error {
+		path, exists := cfg.Shared[name]
+		if !exists {
+			return fmt.Errorf("shared folder %q is not offered", name)
+		}
+		marker, markerErr := guard.ReadMarker(path)
+		if markerErr != nil || marker.Name != name {
+			return fmt.Errorf("shared folder %q marker is invalid", name)
+		}
+		if err := apply.Write(path, relative, contents, ""); err != nil {
+			return err
+		}
+		return commitSharedBaseline(name, path, marker.Ignore)
+	}
+	fileDeleter := func(name, relative string) error {
+		path, exists := cfg.Shared[name]
+		if !exists {
+			return fmt.Errorf("shared folder %q is not offered", name)
+		}
+		marker, markerErr := guard.ReadMarker(path)
+		if markerErr != nil || marker.Name != name {
+			return fmt.Errorf("shared folder %q marker is invalid", name)
+		}
+		if err := apply.Delete(path, relative); err != nil {
+			return err
+		}
+		return commitSharedBaseline(name, path, marker.Ignore)
+	}
+	conflictWriter := func(name, relative, loser string, contents io.Reader) error {
+		path, exists := cfg.Shared[name]
+		if !exists {
+			return fmt.Errorf("shared folder %q is not offered", name)
+		}
+		marker, markerErr := guard.ReadMarker(path)
+		if markerErr != nil || marker.Name != name {
+			return fmt.Errorf("shared folder %q marker is invalid", name)
+		}
+		if err := apply.PreserveConflict(path, relative, loser); err != nil {
+			return err
+		}
+		if err := apply.Write(path, relative, contents, ""); err != nil {
+			return err
+		}
+		return commitSharedBaseline(name, path, marker.Ignore)
+	}
+	if err := transport.ServePeerWithConflict(stdin, stdout, shares, fileLister, fileReader, fileWriter, fileDeleter, conflictWriter); err != nil {
 		fmt.Fprintf(stderr, "l2sync: serve peer request: %v\n", err)
 		return serveExitError
 	}
 	return serveExitOK
+}
+
+func commitSharedBaseline(name, path string, ignore []string) error {
+	baseline, err := state.Load(name)
+	if err != nil && err != state.ErrNotFound {
+		return fmt.Errorf("load shared baseline: %w", err)
+	}
+	if err == state.ErrNotFound {
+		baseline = state.New()
+	}
+	result, err := scan.DetectWithIgnore(path, baseline, ignore)
+	if err != nil {
+		return fmt.Errorf("scan shared folder after mutation: %w", err)
+	}
+	if err := state.Save(name, result.Snapshot); err != nil {
+		return fmt.Errorf("save shared baseline after mutation: %w", err)
+	}
+	return nil
 }

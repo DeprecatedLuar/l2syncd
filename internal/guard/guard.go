@@ -77,6 +77,6 @@ func DefaultIgnore(name string) bool {
 	case ".git", ".svn", ".hg", "node_modules", ".DS_Store", "Thumbs.db", ".l2sync-trash", ".l2sync":
 		return true
 	default:
-		return strings.HasSuffix(name, ".swp") || strings.HasPrefix(name, ".#")
+		return strings.HasSuffix(name, ".swp") || strings.HasPrefix(name, ".#") || strings.Contains(name, ".l2sync-conflict-")
 	}
 }

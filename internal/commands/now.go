@@ -3,10 +3,14 @@
 package commands
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 
+	"l2syncd/internal/apply"
 	"l2syncd/internal/config"
 	"l2syncd/internal/engine"
 	"l2syncd/internal/guard"
@@ -23,11 +27,9 @@ const (
 	nowExitUnreachable = 3
 )
 
-// Now performs a read-only reconciliation plan. Applying plans is a later
-// phase; --dry-run is therefore mandatory for this phase.
 func Now(args []string, stdout, stderr io.Writer) int {
-	if len(args) != 1 || args[0] != "--dry-run" {
-		fmt.Fprintln(stderr, "usage: l2sync now --dry-run")
+	if len(args) != 0 {
+		fmt.Fprintln(stderr, "usage: l2sync now")
 		return nowExitError
 	}
 	cfg, err := preflight.LoadConfig()
@@ -77,19 +79,78 @@ func planRemote(ctx context.Context, cfg config.Config, name, path string, stdou
 		return fmt.Errorf("halted: %s", plan.Reason)
 	}
 	for _, action := range plan.Actions {
-		if _, err := fmt.Fprintf(stdout, "%s %s %s", action.Kind, name, action.Path); err != nil {
-			return fmt.Errorf("write plan: %w", err)
+		if err := applyAction(ctx, action, name, path, provider, address, local.Snapshot, remote); err != nil {
+			return err
 		}
-		if action.Kind == engine.Conflict {
-			if _, err := fmt.Fprintf(stdout, " winner=%s loser=%s", action.Winner, action.Loser); err != nil {
-				return fmt.Errorf("write plan: %w", err)
-			}
+	}
+	if len(plan.Actions) > 0 {
+		result, err := scanShare(path, localBaseline, marker.Ignore)
+		if err != nil {
+			return fmt.Errorf("rescan after apply: %w", err)
 		}
-		if _, err := fmt.Fprintln(stdout); err != nil {
-			return fmt.Errorf("write plan: %w", err)
+		if err := state.Save(name, result.Snapshot); err != nil {
+			return fmt.Errorf("save baseline: %w", err)
 		}
 	}
 	return nil
+}
+
+func applyAction(ctx context.Context, action engine.Action, share, root, provider, address string, local, remote state.Baseline) error {
+	remoteFile := remote.Files[action.Path]
+	remoteSource := action.Source == provider || action.Winner == provider
+	switch action.Kind {
+	case engine.Pull, engine.Resurrect:
+		if !remoteSource {
+			return fmt.Errorf("cannot apply local source action %s for %q", action.Kind, action.Path)
+		}
+		data, err := transport.ReadFile(ctx, address, share, action.Path, remoteFile.Hash)
+		if err != nil {
+			return fmt.Errorf("read %q from peer: %w", action.Path, err)
+		}
+		return apply.Write(root, action.Path, bytes.NewReader(data), remoteFile.Hash)
+	case engine.Delete:
+		if remoteSource {
+			return apply.Delete(root, action.Path)
+		}
+		return transport.DeleteFile(ctx, address, share, action.Path)
+	case engine.Conflict:
+		if remoteSource {
+			if err := apply.PreserveConflict(root, action.Path, provider); err != nil {
+				return err
+			}
+			data, err := transport.ReadFile(ctx, address, share, action.Path, remoteFile.Hash)
+			if err != nil {
+				return fmt.Errorf("read conflict winner %q from peer: %w", action.Path, err)
+			}
+			return apply.Write(root, action.Path, bytes.NewReader(data), remoteFile.Hash)
+		}
+		data, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(action.Path)))
+		if err != nil {
+			return fmt.Errorf("read local conflict winner %q: %w", action.Path, err)
+		}
+		losing, err := transport.ReadFile(ctx, address, share, action.Path, remoteFile.Hash)
+		if err != nil {
+			return fmt.Errorf("read conflict loser %q from peer: %w", action.Path, err)
+		}
+		if err := apply.WriteConflictCopy(root, action.Path, provider, bytes.NewReader(losing), remoteFile.Hash); err != nil {
+			return fmt.Errorf("preserve conflict loser %q locally: %w", action.Path, err)
+		}
+		if err := transport.WriteConflictFile(ctx, address, share, action.Path, data, local.Files[action.Path].Hash, provider); err != nil {
+			return fmt.Errorf("write conflict winner %q to peer: %w", action.Path, err)
+		}
+		return nil
+	case engine.Push:
+		data, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(action.Path)))
+		if err != nil {
+			return fmt.Errorf("read local file %q: %w", action.Path, err)
+		}
+		if err := transport.WriteFile(ctx, address, share, action.Path, data, local.Files[action.Path].Hash); err != nil {
+			return fmt.Errorf("write %q to peer: %w", action.Path, err)
+		}
+		return nil
+	default:
+		return fmt.Errorf("unknown action %q", action.Kind)
+	}
 }
 
 func scanShare(path string, baseline state.Baseline, ignore []string) (scan.Result, error) {

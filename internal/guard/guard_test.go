@@ -57,3 +57,12 @@ func TestDeleteThreshold(t *testing.T) {
 		})
 	}
 }
+
+func TestDefaultIgnoreConflictArtifacts(t *testing.T) {
+	if !DefaultIgnore("notes.l2sync-conflict-20260822-204944-nuremberg.txt") {
+		t.Fatal("conflict artifact is not ignored")
+	}
+	if DefaultIgnore("notes.txt") {
+		t.Fatal("regular file is unexpectedly ignored")
+	}
+}
