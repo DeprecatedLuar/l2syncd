@@ -50,7 +50,14 @@ func Serve(stdin io.Reader, stdout, stderr io.Writer) int {
 		if !exists {
 			return nil, fmt.Errorf("shared folder %q is not offered", name)
 		}
-		listed, scanErr := scan.ListFiles(path, markers[name].Ignore)
+		marker, markerErr := guard.ReadMarker(path)
+		if markerErr != nil {
+			return nil, fmt.Errorf("shared folder %q marker: %w", name, markerErr)
+		}
+		if marker.Name != name {
+			return nil, fmt.Errorf("shared folder %q marker names %q", name, marker.Name)
+		}
+		listed, scanErr := scan.ListFiles(path, marker.Ignore)
 		if scanErr != nil {
 			return nil, fmt.Errorf("list shared folder %q: %w", name, scanErr)
 		}

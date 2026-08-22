@@ -4,12 +4,15 @@ package commands
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"l2syncd/internal/config"
+	"l2syncd/internal/guard"
 )
 
 const (
@@ -43,7 +46,7 @@ func TestAddListAndRemoveShare(t *testing.T) {
 	if got := List(&stdout, &stderr); got != successExitCode {
 		t.Fatalf("list exit code = %d, stderr = %q", got, stderr.String())
 	}
-	if want := "shared notes " + sharePath + "\n"; stdout.String() != want {
+	if want := "+ notes\n"; stdout.String() != want {
 		t.Fatalf("list stdout = %q, want %q", stdout.String(), want)
 	}
 
@@ -196,5 +199,52 @@ func TestBaselineCommitAndStatus(t *testing.T) {
 	stdout.Reset()
 	if got := Status(&stdout, &stderr); got != successExitCode || stdout.String() != "modified notes a.txt\n" {
 		t.Fatalf("modified status = code %d, stdout %q, stderr %q", got, stdout.String(), stderr.String())
+	}
+}
+
+func TestListVerifiesRemoteProvider(t *testing.T) {
+	root := t.TempDir()
+	remotePath := filepath.Join(root, "notes")
+	if err := os.Mkdir(remotePath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := guard.WriteMarker(remotePath, guard.Marker{Name: "notes"}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.New()
+	cfg.Peers["phone"] = "phone"
+	cfg.Remote["notes"] = remotePath
+
+	var stdout, stderr bytes.Buffer
+	got := listWithLister(cfg, nil, &stdout, &stderr, func(context.Context, string) ([]string, error) {
+		return []string{"notes"}, nil
+	})
+	if got != successExitCode || stdout.String() != "+ notes\n" || stderr.Len() != 0 {
+		t.Fatalf("list = code %d, stdout %q, stderr %q", got, stdout.String(), stderr.String())
+	}
+}
+
+func TestListKeepsLocalEntriesWhenPeerIsUnreachable(t *testing.T) {
+	root := t.TempDir()
+	sharedPath := filepath.Join(root, "notes")
+	if err := os.Mkdir(sharedPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := guard.WriteMarker(sharedPath, guard.Marker{Name: "notes"}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.New()
+	cfg.Peers["phone"] = "phone"
+	cfg.Shared["notes"] = sharedPath
+
+	var stdout, stderr bytes.Buffer
+	got := listWithLister(cfg, []string{"phone"}, &stdout, &stderr, func(context.Context, string) ([]string, error) {
+		return nil, errors.New("connection refused")
+	})
+	if got != listExitUnreachable || stdout.String() != "+ notes\n" {
+		t.Fatalf("list = code %d, stdout %q, stderr %q", got, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "peer \"phone\" unreachable") {
+		t.Fatalf("stderr = %q, want unreachable message", stderr.String())
 	}
 }

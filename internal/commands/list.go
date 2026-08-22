@@ -9,6 +9,7 @@ import (
 	"sort"
 
 	"l2syncd/internal/config"
+	"l2syncd/internal/guard"
 	"l2syncd/internal/preflight"
 	"l2syncd/internal/transport"
 )
@@ -21,38 +22,74 @@ const (
 )
 
 func list(cfg config.Config, args []string, stdout, stderr io.Writer) int {
+	return listWithLister(cfg, args, stdout, stderr, transport.ListShares)
+}
+
+type shareLister func(context.Context, string) ([]string, error)
+
+func listWithLister(cfg config.Config, args []string, stdout, stderr io.Writer, listShares shareLister) int {
 	if len(args) > 1 {
 		fmt.Fprintln(stderr, "usage: l2sync list [peer]")
 		return listExitError
 	}
-	for _, name := range sortedKeys(cfg.Shared) {
-		fmt.Fprintf(stdout, "shared %s %s\n", name, cfg.Shared[name])
-	}
-	for _, name := range sortedKeys(cfg.Remote) {
-		fmt.Fprintf(stdout, "remote %s %s\n", name, cfg.Remote[name])
-	}
-	if len(args) == 0 {
-		return listExitOK
+	if len(args) == 1 {
+		if _, found := cfg.Peers[args[0]]; !found {
+			fmt.Fprintf(stderr, "l2sync: peer %q not found\n", args[0])
+			return listExitError
+		}
 	}
 
-	peerName := args[0]
-	peer, found := cfg.Peers[peerName]
-	if !found {
-		fmt.Fprintf(stderr, "l2sync: peer %q not found\n", peerName)
-		return listExitError
+	peerShares := make(map[string][]string, len(cfg.Peers))
+	networkFailure := false
+	peerNames := make([]string, 0)
+	if len(args) == 1 {
+		peerNames = append(peerNames, args[0])
+	} else if len(cfg.Remote) > 0 {
+		peerNames = sortedKeys(cfg.Peers)
 	}
-	address, err := config.ResolvePeerAddress(peer)
-	if err != nil {
-		fmt.Fprintf(stderr, "l2sync: resolve peer %q: %v\n", peerName, err)
-		return listExitError
+	for _, peerName := range peerNames {
+		address, err := config.ResolvePeerAddress(cfg.Peers[peerName])
+		if err != nil {
+			fmt.Fprintf(stderr, "l2sync: resolve peer %q: %v\n", peerName, err)
+			return listExitError
+		}
+		shares, err := listShares(context.Background(), address)
+		if err != nil {
+			networkFailure = true
+			if len(args) == 1 && args[0] == peerName {
+				fmt.Fprintf(stderr, "l2sync: peer %q unreachable: %v\n", peerName, err)
+			}
+			continue
+		}
+		peerShares[peerName] = shares
 	}
-	shares, err := transport.ListShares(context.Background(), address)
-	if err != nil {
-		fmt.Fprintf(stderr, "l2sync: peer %q unreachable: %v\n", peerName, err)
+
+	for _, name := range sortedEntryNames(cfg) {
+		verified := localEntryVerified(cfg, name)
+		if verified && cfg.Remote[name] != "" {
+			providers := 0
+			for _, shares := range peerShares {
+				if contains(shares, name) {
+					providers++
+				}
+			}
+			verified = providers == 1 && !networkFailure
+		}
+		prefix := "-"
+		if verified {
+			prefix = "+"
+		}
+		fmt.Fprintf(stdout, "%s %s\n", prefix, name)
+	}
+
+	if len(args) == 1 {
+		peerName := args[0]
+		for _, name := range peerShares[peerName] {
+			fmt.Fprintf(stdout, "remote-share %s peer=%s\n", name, peerName)
+		}
+	}
+	if networkFailure {
 		return listExitUnreachable
-	}
-	for _, name := range shares {
-		fmt.Fprintf(stdout, "remote-share %s peer=%s\n", name, peerName)
 	}
 	return listExitOK
 }
@@ -84,4 +121,29 @@ func sortedKeys[T any](values map[string]T) []string {
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+func sortedEntryNames(cfg config.Config) []string {
+	entries := make(map[string]struct{}, len(cfg.Shared)+len(cfg.Remote))
+	for name := range cfg.Shared {
+		entries[name] = struct{}{}
+	}
+	for name := range cfg.Remote {
+		entries[name] = struct{}{}
+	}
+	names := make([]string, 0, len(entries))
+	for name := range entries {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func localEntryVerified(cfg config.Config, name string) bool {
+	path, shared := cfg.Shared[name]
+	if !shared {
+		path = cfg.Remote[name]
+	}
+	marker, err := guard.ReadMarker(path)
+	return err == nil && marker.Name == name
 }

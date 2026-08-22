@@ -71,6 +71,15 @@ func Join(args []string, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "l2sync: multiple peers offer folder %q\n", name)
 		return joinExitError
 	}
+	address, err := config.ResolvePeerAddress(cfg.Peers[matched[0]])
+	if err != nil {
+		fmt.Fprintf(stderr, "l2sync: resolve peer %q: %v\n", matched[0], err)
+		return joinExitError
+	}
+	if _, err := transport.ListFiles(context.Background(), address, name); err != nil {
+		fmt.Fprintf(stderr, "l2sync: verify folder %q on peer %q: %v\n", name, matched[0], err)
+		return joinExitUnreachable
+	}
 	path, err := filepath.Abs(args[1])
 	if err != nil {
 		fmt.Fprintf(stderr, "l2sync: resolve folder path: %v\n", err)
