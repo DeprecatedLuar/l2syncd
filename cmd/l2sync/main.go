@@ -35,6 +35,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 	case "remove", "rm":
 		return commands.Remove(args[1:], stderr)
 	case "list", "ls":
+		if len(args) > 1 && args[1] == "connections" {
+			return commands.Connection(append([]string{"ls"}, args[2:]...), stdout, stderr)
+		}
 		if len(args) > 1 {
 			return commands.ListPeer(args[1:], stdout, stderr)
 		}
@@ -42,7 +45,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 	case "join":
 		return commands.Join(args[1:], stderr)
 	case "serve":
-		return commands.Serve(os.Stdin, stdout, stderr)
+		return commands.Serve(args[1:], os.Stdin, stdout, stderr)
+	case "connection":
+		return commands.Connection(args[1:], stdout, stderr)
 	case "status":
 		return commands.Status(stdout, stderr)
 	case "now":

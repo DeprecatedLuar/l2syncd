@@ -10,9 +10,10 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"syscall"
 	"time"
+
+	"l2syncd/internal/sharepath"
 )
 
 const (
@@ -25,14 +26,17 @@ const (
 // Move moves an existing path to recoverable trash. The returned path is the
 // trash destination. The share root is used as the final fallback.
 func Move(shareRoot, relative string) (string, error) {
-	if err := validateRelative(relative); err != nil {
+	parent, err := sharepath.OpenParent(shareRoot, relative, false)
+	if err != nil {
 		return "", err
 	}
-	source := filepath.Join(shareRoot, filepath.FromSlash(relative))
+	defer parent.Close()
+	source := parent.Path()
 	if _, err := os.Lstat(source); err != nil {
 		return "", fmt.Errorf("trash %q: %w", relative, err)
 	}
-	if destination, ok := xdgDestination(source, relative); ok {
+	originalSource := filepath.Join(shareRoot, filepath.FromSlash(relative))
+	if destination, ok := xdgDestination(source, originalSource, relative); ok {
 		if moved, err := moveTo(source, destination); err == nil {
 			return moved, nil
 		}
@@ -43,15 +47,21 @@ func Move(shareRoot, relative string) (string, error) {
 		}
 	}
 	date := time.Now().UTC().Format(trashDate)
-	destination := filepath.Join(shareRoot, ".l2sync-trash", date, filepath.FromSlash(relative))
+	fallbackRelative := filepath.ToSlash(filepath.Join(".l2sync-trash", date, filepath.FromSlash(relative)))
+	fallbackParent, err := sharepath.OpenParent(shareRoot, fallbackRelative, true)
+	if err != nil {
+		return "", fmt.Errorf("resolve fallback trash for %q: %w", relative, err)
+	}
+	defer fallbackParent.Close()
+	destination := fallbackParent.Path()
 	moved, err := moveTo(source, destination)
 	if err != nil {
 		return "", fmt.Errorf("move %q to fallback trash: %w", relative, err)
 	}
-	return moved, nil
+	return filepath.Join(shareRoot, filepath.Dir(filepath.FromSlash(fallbackRelative)), filepath.Base(moved)), nil
 }
 
-func xdgDestination(source, relative string) (string, bool) {
+func xdgDestination(source, originalSource, relative string) (string, bool) {
 	dataHome := os.Getenv("XDG_DATA_HOME")
 	if dataHome == "" {
 		home, err := os.UserHomeDir()
@@ -73,7 +83,7 @@ func xdgDestination(source, relative string) (string, bool) {
 	if err := os.MkdirAll(filepath.Dir(info), trashInfoMode); err != nil {
 		return "", false
 	}
-	contents := "[Trash Info]\nPath=" + url.PathEscape(filepath.ToSlash(source)) + "\nDeletionDate=" + time.Now().UTC().Format("2006-01-02T15:04:05") + "\n"
+	contents := "[Trash Info]\nPath=" + url.PathEscape(filepath.ToSlash(originalSource)) + "\nDeletionDate=" + time.Now().UTC().Format("2006-01-02T15:04:05") + "\n"
 	if err := os.WriteFile(info, []byte(contents), trashFileMode); err != nil {
 		return "", false
 	}
@@ -137,11 +147,4 @@ func sameDevice(source, destination string) bool {
 	sourceStat, sourceOK := sourceInfo.Sys().(*syscall.Stat_t)
 	destinationStat, destinationOK := destinationInfo.Sys().(*syscall.Stat_t)
 	return sourceOK && destinationOK && sourceStat.Dev == destinationStat.Dev
-}
-
-func validateRelative(relative string) error {
-	if relative == "" || filepath.IsAbs(relative) || filepath.Clean(relative) != relative || strings.HasPrefix(filepath.ToSlash(relative), "../") {
-		return fmt.Errorf("invalid relative path %q", relative)
-	}
-	return nil
 }

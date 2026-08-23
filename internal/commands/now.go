@@ -5,10 +5,12 @@ package commands
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
-	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 
 	"l2syncd/internal/apply"
 	"l2syncd/internal/config"
@@ -17,6 +19,7 @@ import (
 	"l2syncd/internal/lock"
 	"l2syncd/internal/preflight"
 	"l2syncd/internal/scan"
+	"l2syncd/internal/sharepath"
 	"l2syncd/internal/state"
 	"l2syncd/internal/transport"
 )
@@ -26,6 +29,7 @@ const (
 	nowExitError       = 1
 	nowExitInvalid     = 2
 	nowExitUnreachable = 3
+	nowExitLocked      = 4
 )
 
 func Now(args []string, stdout, stderr io.Writer) int {
@@ -33,19 +37,14 @@ func Now(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "usage: l2sync now")
 		return nowExitError
 	}
-	cfg, err := preflight.LoadConfig()
-	if err != nil {
-		fmt.Fprintf(stderr, "l2sync: %v\n", err)
-		return nowExitInvalid
-	}
-	lockFile, err := lock.Acquire()
-	if err != nil {
-		fmt.Fprintf(stderr, "l2sync: %v\n", err)
-		return nowExitError
-	}
-	defer lock.Release(lockFile)
-	if err := RunCycle(context.Background(), cfg); err != nil {
+	if _, err := RunCycle(context.Background()); err != nil {
 		fmt.Fprintf(stderr, "l2sync: now: %v\n", err)
+		if errors.Is(err, errInvalidConfig) {
+			return nowExitInvalid
+		}
+		if errors.Is(err, lock.ErrTimeout) {
+			return nowExitLocked
+		}
 		if isTransportError(err) {
 			return nowExitUnreachable
 		}
@@ -54,143 +53,471 @@ func Now(args []string, stdout, stderr io.Writer) int {
 	return nowExitOK
 }
 
-// RunCycle reconciles all configured remote folders once.
-func RunCycle(ctx context.Context, cfg config.Config) error {
-	for _, name := range sortedKeys(cfg.Shared) {
-		peer, address, err := findPeerForShared(ctx, cfg, name)
-		if err != nil {
-			return fmt.Errorf("%s: %w", name, err)
-		}
-		if err := planFolder(ctx, cfg, name, cfg.Shared[name], peer, address); err != nil {
-			return fmt.Errorf("%s: %w", name, err)
-		}
-	}
-	for _, name := range sortedKeys(cfg.Remote) {
-		provider, address, err := findProvider(ctx, cfg, name)
-		if err != nil {
-			return fmt.Errorf("%s: %w", name, err)
-		}
-		if err := planFolder(ctx, cfg, name, cfg.Remote[name], provider, address); err != nil {
-			return fmt.Errorf("%s: %w", name, err)
-		}
-	}
-	return nil
+// CycleSummary reports the useful work completed by one reconciliation cycle.
+type CycleSummary struct {
+	Folders int
+	Actions int
 }
 
-func planFolder(ctx context.Context, cfg config.Config, name, path, peer, address string) error {
+var (
+	requestPeerCycle   = transport.RequestCycle
+	runBoundFolderPlan = planBoundFolder
+)
+
+// RunCycle dispatches each bound folder to its deterministic fingerprint
+// initiator. A non-initiator holds no mutation lock while requesting work.
+func RunCycle(ctx context.Context) (summary CycleSummary, err error) {
+	cfg, err := preflight.LoadConfig()
+	if err != nil {
+		return summary, errors.Join(errInvalidConfig, err)
+	}
+	localIdentity, err := localFingerprint()
+	if err != nil {
+		return summary, err
+	}
+	for _, name := range cycleFolderNames(cfg) {
+		cfg, peerName, endpoint, present, loadErr := loadActiveCycleFolder(ctx, name)
+		if loadErr != nil {
+			return summary, loadErr
+		}
+		if !present {
+			continue
+		}
+		binding := cfg.Bindings[name]
+		if len(binding) != 1 {
+			return summary, fmt.Errorf("folder %q requires exactly one peer binding", name)
+		}
+		remoteIdentity, err := peerFingerprint(cfg.Peers[peerName])
+		if err != nil {
+			return summary, fmt.Errorf("derive peer %q identity: %w", peerName, err)
+		}
+		initiates, err := localInitiatesCycle(localIdentity, remoteIdentity)
+		if err != nil {
+			return summary, fmt.Errorf("folder %q: %w", name, err)
+		}
+		var actions int
+		if initiates {
+			actions, err = runInitiatorFolderCycle(ctx, name, peerName, remoteIdentity)
+		} else {
+			actions, err = requestPeerCycle(ctx, endpoint, name)
+		}
+		if err != nil {
+			return summary, fmt.Errorf("%s: %w", name, err)
+		}
+		summary.Folders++
+		summary.Actions += actions
+	}
+	return summary, nil
+}
+
+// cycleFolderActivationAttempts bounds the reload retry in
+// loadActiveCycleFolder: one initial read plus one reload to pick up a peer
+// activation that completes concurrently with this cycle.
+const cycleFolderActivationAttempts = 2
+
+func loadActiveCycleFolder(ctx context.Context, name string) (config.Config, string, transport.Endpoint, bool, error) {
+	for attempt := 0; attempt < cycleFolderActivationAttempts; attempt++ {
+		cfg, err := preflight.LoadConfig()
+		if err != nil {
+			return config.Config{}, "", transport.Endpoint{}, false, errors.Join(errInvalidConfig, err)
+		}
+		if !contains(cycleFolderNames(cfg), name) {
+			return cfg, "", transport.Endpoint{}, false, nil
+		}
+		binding := cfg.Bindings[name]
+		if len(binding) != 1 {
+			return config.Config{}, "", transport.Endpoint{}, false, fmt.Errorf("folder %q requires exactly one peer binding", name)
+		}
+		peerName := binding[0]
+		peer := cfg.Peers[peerName]
+		endpoint, err := peerEndpoint(ctx, cfg, peerName)
+		if err != nil {
+			return config.Config{}, "", transport.Endpoint{}, false, err
+		}
+		if peer.Status == config.PeerPending {
+			continue
+		}
+		if peer.Status != config.PeerActive {
+			return config.Config{}, "", transport.Endpoint{}, false, fmt.Errorf("peer %q is not active", peerName)
+		}
+		return cfg, peerName, endpoint, true, nil
+	}
+	return config.Config{}, "", transport.Endpoint{}, false, fmt.Errorf("folder %q peer identity changed while activating", name)
+}
+
+func cycleFolderNames(cfg config.Config) []string {
+	names := make(map[string]struct{})
+	for name := range cfg.Shared {
+		if len(cfg.Bindings[name]) == 1 {
+			names[name] = struct{}{}
+		}
+	}
+	for name := range cfg.Remote {
+		names[name] = struct{}{}
+	}
+	return sortedKeys(names)
+}
+
+func localInitiatesCycle(localIdentity, remoteIdentity string) (bool, error) {
+	if localIdentity == "" || remoteIdentity == "" {
+		return false, errors.New("cycle fingerprints are required")
+	}
+	if localIdentity == remoteIdentity {
+		return false, errors.New("cycle fingerprints are equal")
+	}
+	return localIdentity < remoteIdentity, nil
+}
+
+func runInitiatorFolderCycle(ctx context.Context, name, expectedPeer, authenticatedFingerprint string) (actions int, err error) {
+	lockFile, err := lock.AcquireWait(ctx, lock.DefaultWait)
+	if err != nil {
+		return 0, err
+	}
+	defer func() {
+		if releaseErr := lock.Release(lockFile); releaseErr != nil {
+			err = errors.Join(err, releaseErr)
+		}
+	}()
+	cfg, err := loadConfigForTransaction()
+	if err != nil {
+		return 0, err
+	}
+	binding := cfg.Bindings[name]
+	if len(binding) != 1 || binding[0] != expectedPeer {
+		return 0, fmt.Errorf("folder %q is not bound to authenticated peer %q", name, expectedPeer)
+	}
+	configured, exists := cfg.Peers[expectedPeer]
+	if !exists || configured.Status != config.PeerActive {
+		return 0, fmt.Errorf("peer %q is not active", expectedPeer)
+	}
+	if err := requireAuthenticatedFingerprint(configured, authenticatedFingerprint); err != nil {
+		return 0, fmt.Errorf("peer %q authorization changed: %w", expectedPeer, err)
+	}
+	localIdentity, err := localFingerprint()
+	if err != nil {
+		return 0, err
+	}
+	remoteIdentity, err := peerFingerprint(configured)
+	if err != nil {
+		return 0, err
+	}
+	initiates, err := localInitiatesCycle(localIdentity, remoteIdentity)
+	if err != nil {
+		return 0, err
+	}
+	if !initiates {
+		return 0, fmt.Errorf("this installation is not the cycle initiator for folder %q", name)
+	}
+	return runBoundFolderPlan(ctx, cfg, name, expectedPeer)
+}
+
+func planBoundFolder(ctx context.Context, cfg config.Config, name, expectedPeer string) (int, error) {
+	if path, exists := cfg.Shared[name]; exists {
+		peer, endpoint, err := findPeerForShared(ctx, cfg, name)
+		if err != nil {
+			return 0, err
+		}
+		return planFolder(ctx, cfg, name, path, peer, endpoint)
+	}
+	path, exists := cfg.Remote[name]
+	if !exists {
+		return 0, fmt.Errorf("folder %q is not registered", name)
+	}
+	provider, endpoint, err := findProvider(ctx, cfg, name)
+	if err != nil {
+		return 0, err
+	}
+	return planFolder(ctx, cfg, name, path, provider, endpoint)
+}
+
+func planFolder(ctx context.Context, cfg config.Config, name, path, peer string, endpoint transport.Endpoint) (int, error) {
 	marker, err := guard.ReadMarker(path)
 	if err != nil {
-		return fmt.Errorf("read marker: %w", err)
+		return 0, fmt.Errorf("read marker: %w", err)
 	}
-	remoteFiles, err := transport.ListFiles(ctx, address, name)
+	remoteFiles, err := transport.ListFiles(ctx, endpoint, name)
 	if err != nil {
-		return fmt.Errorf("peer %q listing: %w", peer, err)
+		return 0, fmt.Errorf("peer %q listing: %w", peer, err)
 	}
 	localBaseline, err := loadBaseline(name)
 	if err != nil {
-		return fmt.Errorf("load baseline: %w", err)
+		return 0, fmt.Errorf("load baseline: %w", err)
 	}
 	local, err := scanShare(path, localBaseline, marker.Ignore)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	remote := state.New()
 	for _, file := range remoteFiles {
-		remote.Files[file.Path] = state.File{Hash: file.Hash, Size: file.Size}
+		if file.Directory {
+			remote.Directories[file.Path] = file.Metadata
+		} else {
+			remote.Files[file.Path] = state.File{Hash: file.Hash, Size: file.Size, Metadata: file.Metadata, MetadataKnown: true}
+		}
 	}
-	plan := engine.PlanStates("local", local.Snapshot, peer, remote, localBaseline)
+	localIdentity, err := localFingerprint()
+	if err != nil {
+		return 0, fmt.Errorf("derive local identity: %w", err)
+	}
+	remoteIdentity, err := peerFingerprint(cfg.Peers[peer])
+	if err != nil {
+		return 0, fmt.Errorf("derive peer %q identity: %w", peer, err)
+	}
+	plan := engine.PlanStates(localIdentity, local.Snapshot, remoteIdentity, remote, localBaseline)
 	if plan.Halted {
-		return fmt.Errorf("halted: %s", plan.Reason)
+		return 0, fmt.Errorf("halted: %s", plan.Reason)
+	}
+	reused, err := prepareContentReuse(ctx, plan.Actions, name, path, remoteIdentity, endpoint, localBaseline, local.Snapshot, remote)
+	if err != nil {
+		return 0, err
 	}
 	for _, action := range plan.Actions {
-		if err := applyAction(ctx, action, name, path, peer, address, local.Snapshot, remote); err != nil {
-			return err
+		if reused[action.Path] {
+			continue
+		}
+		if err := applyAction(ctx, action, name, path, remoteIdentity, endpoint, local.Snapshot, remote); err != nil {
+			return 0, err
 		}
 	}
-	if len(plan.Actions) > 0 {
-		result, err := scanShare(path, localBaseline, marker.Ignore)
-		if err != nil {
-			return fmt.Errorf("rescan after apply: %w", err)
+	directoryActions := append([]engine.Action(nil), plan.DirectoryActions...)
+	sortByDepthDescending(directoryActions, func(action engine.Action) string { return action.Path })
+	for _, action := range directoryActions {
+		if action.Kind != engine.Delete {
+			continue
 		}
-		if err := state.Save(name, result.Snapshot); err != nil {
-			return fmt.Errorf("save baseline: %w", err)
+		if err := applyDirectoryDelete(ctx, action, name, path, remoteIdentity, endpoint); err != nil {
+			return 0, err
+		}
+	}
+	if err := restoreDirectoryMetadata(ctx, plan.Actions, directoryActions, name, path, remoteIdentity, endpoint, local.Snapshot, remote); err != nil {
+		return 0, err
+	}
+	if err := commitFolderBaseline(name, path, marker.Ignore); err != nil {
+		return 0, err
+	}
+	return len(plan.Actions) + len(plan.DirectoryActions), nil
+}
+
+// sortByDepthDescending orders items so deeper paths (more path separators)
+// come first, so directory deletes and metadata restores process children
+// before their parents.
+func sortByDepthDescending[T any](items []T, path func(T) string) {
+	sort.SliceStable(items, func(left, right int) bool {
+		return strings.Count(path(items[left]), "/") > strings.Count(path(items[right]), "/")
+	})
+}
+
+func restoreDirectoryMetadata(ctx context.Context, fileActions, directoryActions []engine.Action, share, root, provider string, endpoint transport.Endpoint, local, remote state.Baseline) error {
+	directoryActionByPath := make(map[string]engine.Action, len(directoryActions))
+	paths := make(map[string]struct{})
+	for _, action := range directoryActions {
+		directoryActionByPath[action.Path] = action
+		if action.Kind != engine.Delete {
+			paths[action.Path] = struct{}{}
+		}
+	}
+	for _, action := range fileActions {
+		parent := filepath.ToSlash(filepath.Dir(filepath.FromSlash(action.Path)))
+		for parent != "." {
+			paths[parent] = struct{}{}
+			parent = filepath.ToSlash(filepath.Dir(filepath.FromSlash(parent)))
+		}
+	}
+	ordered := make([]string, 0, len(paths))
+	for path := range paths {
+		ordered = append(ordered, path)
+	}
+	sortByDepthDescending(ordered, func(path string) string { return path })
+	for _, path := range ordered {
+		action, changed := directoryActionByPath[path]
+		if changed && action.Kind == engine.Delete {
+			continue
+		}
+		manifest, exists := local.Directories[path]
+		if changed && action.Source == provider {
+			manifest, exists = remote.Directories[path]
+		} else if !exists {
+			manifest, exists = remote.Directories[path]
+		}
+		if !exists {
+			continue
+		}
+		if err := apply.ApplyDirectory(root, path, manifest); err != nil {
+			return err
+		}
+		if err := transport.ApplyDirectory(ctx, endpoint, share, path, manifest); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
-func findPeerForShared(ctx context.Context, cfg config.Config, name string) (string, string, error) {
-	peers := sortedKeys(cfg.Peers)
-	if len(peers) != 1 {
-		return "", "", fmt.Errorf("shared folder %q requires exactly one configured peer", name)
+func prepareContentReuse(ctx context.Context, actions []engine.Action, share, root, provider string, endpoint transport.Endpoint, baseline, local, remote state.Baseline) (map[string]bool, error) {
+	reused := make(map[string]bool)
+	for _, action := range actions {
+		remoteSource := action.Source == provider
+		switch {
+		case action.Kind == engine.Push || action.Kind == engine.Resurrect && !remoteSource:
+			file := local.Files[action.Path]
+			ok, err := transport.ReuseFile(ctx, endpoint, share, action.Path, file.Hash, file.Metadata)
+			if err != nil {
+				return nil, fmt.Errorf("reuse %q on peer: %w", action.Path, err)
+			}
+			reused[action.Path] = ok
+		case (action.Kind == engine.Pull || action.Kind == engine.Resurrect) && remoteSource:
+			ok, err := reuseLocal(root, action.Path, remote.Files[action.Path], baseline)
+			if err != nil {
+				return nil, err
+			}
+			reused[action.Path] = ok
+		}
 	}
-	peer := peers[0]
-	address, err := config.ResolvePeerAddress(cfg.Peers[peer])
-	if err != nil {
-		return "", "", fmt.Errorf("resolve peer %q: %w", peer, err)
-	}
-	if _, err := transport.ListFiles(ctx, address, name); err != nil {
-		return "", "", fmt.Errorf("peer %q does not serve folder %q: %w", peer, name, err)
-	}
-	return peer, address, nil
+	return reused, nil
 }
 
-func applyAction(ctx context.Context, action engine.Action, share, root, provider, address string, local, remote state.Baseline) error {
+func applyDirectoryDelete(ctx context.Context, action engine.Action, share, root, provider string, endpoint transport.Endpoint) error {
+	remoteSource := action.Source == provider
+	if remoteSource {
+		return apply.DeleteDirectory(root, action.Path)
+	}
+	return transport.DeleteDirectory(ctx, endpoint, share, action.Path)
+}
+
+func findPeerForShared(ctx context.Context, cfg config.Config, name string) (string, transport.Endpoint, error) {
+	peers := cfg.Bindings[name]
+	if len(peers) != 1 {
+		return "", transport.Endpoint{}, fmt.Errorf("shared folder %q requires exactly one peer binding", name)
+	}
+	peer := peers[0]
+	endpoint, err := peerEndpoint(ctx, cfg, peer)
+	if err != nil {
+		return "", transport.Endpoint{}, err
+	}
+	if _, err := transport.ListFiles(ctx, endpoint, name); err != nil {
+		return "", transport.Endpoint{}, fmt.Errorf("peer %q does not serve folder %q: %w", peer, name, err)
+	}
+	return peer, endpoint, nil
+}
+
+func applyAction(ctx context.Context, action engine.Action, share, root, provider string, endpoint transport.Endpoint, local, remote state.Baseline) error {
 	remoteFile := remote.Files[action.Path]
 	remoteSource := action.Source == provider || action.Winner == provider
 	switch action.Kind {
-	case engine.Pull, engine.Resurrect:
+	case engine.Pull:
 		if !remoteSource {
-			return fmt.Errorf("cannot apply local source action %s for %q", action.Kind, action.Path)
+			return fmt.Errorf("pull source for %q is not the provider", action.Path)
 		}
-		data, err := transport.ReadFile(ctx, address, share, action.Path, remoteFile.Hash)
-		if err != nil {
-			return fmt.Errorf("read %q from peer: %w", action.Path, err)
+		return pullFile(ctx, endpoint, share, root, action.Path, remoteFile)
+	case engine.Resurrect:
+		if remoteSource {
+			return pullFile(ctx, endpoint, share, root, action.Path, remoteFile)
 		}
-		return apply.Write(root, action.Path, bytes.NewReader(data), remoteFile.Hash)
+		return pushFile(ctx, endpoint, share, root, action.Path, local.Files[action.Path])
 	case engine.Delete:
 		if remoteSource {
 			return apply.Delete(root, action.Path)
 		}
-		return transport.DeleteFile(ctx, address, share, action.Path)
+		return transport.DeleteFile(ctx, endpoint, share, action.Path)
 	case engine.Conflict:
+		localFile := local.Files[action.Path]
+		suffix := deterministicConflictSuffix(localFile, remoteFile, action.Loser)
+		localCollision, err := apply.ConflictCopyExists(root, action.Path, suffix)
+		if err != nil {
+			return fmt.Errorf("check local conflict destination for %q: %w", action.Path, err)
+		}
+		remoteCollision, err := transport.ConflictCopyExists(ctx, endpoint, share, action.Path, suffix)
+		if err != nil {
+			return fmt.Errorf("check peer conflict destination for %q: %w", action.Path, err)
+		}
+		if localCollision || remoteCollision {
+			return fmt.Errorf("conflict destination for %q already exists on one or both replicas", action.Path)
+		}
 		if remoteSource {
-			if err := apply.PreserveConflict(root, action.Path, provider); err != nil {
-				return err
+			losing, err := readShareFile(root, action.Path)
+			if err != nil {
+				return fmt.Errorf("read local conflict loser %q: %w", action.Path, err)
 			}
-			data, err := transport.ReadFile(ctx, address, share, action.Path, remoteFile.Hash)
+			if err := transport.WriteConflictCopy(ctx, endpoint, share, action.Path, losing, localFile.Hash, suffix, localFile.Metadata); err != nil {
+				return fmt.Errorf("preserve conflict loser %q on peer: %w", action.Path, err)
+			}
+			data, err := transport.ReadFile(ctx, endpoint, share, action.Path, remoteFile.Hash)
 			if err != nil {
 				return fmt.Errorf("read conflict winner %q from peer: %w", action.Path, err)
 			}
-			return apply.Write(root, action.Path, bytes.NewReader(data), remoteFile.Hash)
+			return apply.WriteConflictWinnerWithSuffix(root, action.Path, suffix, bytes.NewReader(data), remoteFile.Hash, remoteFile.Metadata)
 		}
-		data, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(action.Path)))
+		data, err := readShareFile(root, action.Path)
 		if err != nil {
 			return fmt.Errorf("read local conflict winner %q: %w", action.Path, err)
 		}
-		losing, err := transport.ReadFile(ctx, address, share, action.Path, remoteFile.Hash)
+		losing, err := transport.ReadFile(ctx, endpoint, share, action.Path, remoteFile.Hash)
 		if err != nil {
 			return fmt.Errorf("read conflict loser %q from peer: %w", action.Path, err)
 		}
-		if err := apply.WriteConflictCopy(root, action.Path, provider, bytes.NewReader(losing), remoteFile.Hash); err != nil {
+		if err := apply.WriteConflictCopyWithSuffix(root, action.Path, suffix, bytes.NewReader(losing), remoteFile.Hash, remoteFile.Metadata); err != nil {
 			return fmt.Errorf("preserve conflict loser %q locally: %w", action.Path, err)
 		}
-		if err := transport.WriteConflictFile(ctx, address, share, action.Path, data, local.Files[action.Path].Hash, provider); err != nil {
+		if err := transport.WriteConflictFile(ctx, endpoint, share, action.Path, data, localFile.Hash, suffix, localFile.Metadata); err != nil {
 			return fmt.Errorf("write conflict winner %q to peer: %w", action.Path, err)
 		}
 		return nil
 	case engine.Push:
-		data, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(action.Path)))
-		if err != nil {
-			return fmt.Errorf("read local file %q: %w", action.Path, err)
-		}
-		if err := transport.WriteFile(ctx, address, share, action.Path, data, local.Files[action.Path].Hash); err != nil {
-			return fmt.Errorf("write %q to peer: %w", action.Path, err)
-		}
-		return nil
+		return pushFile(ctx, endpoint, share, root, action.Path, local.Files[action.Path])
 	default:
 		return fmt.Errorf("unknown action %q", action.Kind)
 	}
+}
+
+func deterministicConflictSuffix(left, right state.File, loser string) string {
+	stamp := left.Metadata.Mtime
+	if right.Metadata.Mtime.After(stamp) {
+		stamp = right.Metadata.Mtime
+	}
+	return stamp.UTC().Format("20060102-150405") + "-" + loser[:12]
+}
+
+func pullFile(ctx context.Context, endpoint transport.Endpoint, share, root, relative string, file state.File) error {
+	data, err := transport.ReadFile(ctx, endpoint, share, relative, file.Hash)
+	if err != nil {
+		return fmt.Errorf("read %q from peer: %w", relative, err)
+	}
+	return apply.WriteWithMetadata(root, relative, bytes.NewReader(data), file.Hash, file.Metadata)
+}
+
+func pushFile(ctx context.Context, endpoint transport.Endpoint, share, root, relative string, file state.File) error {
+	data, err := readShareFile(root, relative)
+	if err != nil {
+		return fmt.Errorf("read local file %q: %w", relative, err)
+	}
+	if err := transport.WriteFile(ctx, endpoint, share, relative, data, file.Hash, file.Metadata); err != nil {
+		return fmt.Errorf("write %q to peer: %w", relative, err)
+	}
+	return nil
+}
+
+func readShareFile(root, relative string) ([]byte, error) {
+	file, err := sharepath.OpenRegular(root, relative)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	return io.ReadAll(file)
+}
+
+func reuseLocal(root, relative string, offered state.File, baseline state.Baseline) (bool, error) {
+	for source, file := range baseline.Files {
+		if file.Hash != offered.Hash {
+			continue
+		}
+		if err := apply.Reuse(root, relative, source, offered.Hash, offered.Metadata); err != nil {
+			if errors.Is(err, apply.ErrReuseMismatch) {
+				continue
+			}
+			return false, err
+		}
+		return true, nil
+	}
+	return false, nil
 }
 
 func scanShare(path string, baseline state.Baseline, ignore []string) (scan.Result, error) {
@@ -201,32 +528,36 @@ func scanShare(path string, baseline state.Baseline, ignore []string) (scan.Resu
 	return result, nil
 }
 
-func findProvider(ctx context.Context, cfg config.Config, name string) (string, string, error) {
+func findProvider(ctx context.Context, cfg config.Config, name string) (string, transport.Endpoint, error) {
 	providers := make([]string, 0, 1)
-	addresses := make(map[string]string)
-	for peerName, peer := range cfg.Peers {
-		address, err := config.ResolvePeerAddress(peer)
+	endpoints := make(map[string]transport.Endpoint)
+	peerNames := sortedKeys(cfg.Peers)
+	if binding := cfg.Bindings[name]; len(binding) == 1 {
+		peerNames = binding
+	}
+	for _, peerName := range peerNames {
+		endpoint, err := peerEndpoint(ctx, cfg, peerName)
 		if err != nil {
-			return "", "", fmt.Errorf("resolve peer %q: %w", peerName, err)
+			return "", transport.Endpoint{}, err
 		}
-		shares, err := transport.ListShares(ctx, address)
+		shares, err := transport.ListShares(ctx, endpoint)
 		if err != nil {
-			return "", "", fmt.Errorf("peer %q unreachable: %w", peerName, err)
+			return "", transport.Endpoint{}, fmt.Errorf("peer %q unreachable: %w", peerName, err)
 		}
 		if contains(shares, name) {
 			providers = append(providers, peerName)
-			addresses[peerName] = address
+			endpoints[peerName] = endpoint
 		}
 	}
 	if len(providers) == 0 {
-		return "", "", fmt.Errorf("no peer offers folder %q", name)
+		return "", transport.Endpoint{}, fmt.Errorf("no peer offers folder %q", name)
 	}
 	if len(providers) != 1 {
-		return "", "", fmt.Errorf("multiple peers offer folder %q", name)
+		return "", transport.Endpoint{}, fmt.Errorf("multiple peers offer folder %q", name)
 	}
-	return providers[0], addresses[providers[0]], nil
+	return providers[0], endpoints[providers[0]], nil
 }
 
 func isTransportError(err error) bool {
-	return err != nil
+	return transport.IsError(err)
 }

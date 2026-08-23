@@ -22,7 +22,13 @@ const (
 )
 
 func list(cfg config.Config, args []string, stdout, stderr io.Writer) int {
-	return listWithLister(cfg, args, stdout, stderr, transport.ListShares)
+	return listWithLister(cfg, args, stdout, stderr, func(ctx context.Context, peer string) ([]string, error) {
+		endpoint, err := peerEndpoint(ctx, cfg, peer)
+		if err != nil {
+			return nil, err
+		}
+		return transport.ListShares(ctx, endpoint)
+	})
 }
 
 type shareLister func(context.Context, string) ([]string, error)
@@ -40,6 +46,7 @@ func listWithLister(cfg config.Config, args []string, stdout, stderr io.Writer, 
 	}
 
 	peerShares := make(map[string][]string, len(cfg.Peers))
+	peerFailed := make(map[string]bool, len(cfg.Peers))
 	networkFailure := false
 	peerNames := make([]string, 0)
 	if len(args) == 1 {
@@ -48,14 +55,10 @@ func listWithLister(cfg config.Config, args []string, stdout, stderr io.Writer, 
 		peerNames = sortedKeys(cfg.Peers)
 	}
 	for _, peerName := range peerNames {
-		address, err := config.ResolvePeerAddress(cfg.Peers[peerName])
-		if err != nil {
-			fmt.Fprintf(stderr, "l2sync: resolve peer %q: %v\n", peerName, err)
-			return listExitError
-		}
-		shares, err := listShares(context.Background(), address)
+		shares, err := listShares(context.Background(), peerName)
 		if err != nil {
 			networkFailure = true
+			peerFailed[peerName] = true
 			if len(args) == 1 && args[0] == peerName {
 				fmt.Fprintf(stderr, "l2sync: peer %q unreachable: %v\n", peerName, err)
 			}
@@ -67,13 +70,8 @@ func listWithLister(cfg config.Config, args []string, stdout, stderr io.Writer, 
 	for _, name := range sortedEntryNames(cfg) {
 		verified := localEntryVerified(cfg, name)
 		if verified && cfg.Remote[name] != "" {
-			providers := 0
-			for _, shares := range peerShares {
-				if contains(shares, name) {
-					providers++
-				}
-			}
-			verified = providers == 1 && !networkFailure
+			binding := cfg.Bindings[name]
+			verified = len(binding) == 1 && !peerFailed[binding[0]] && contains(peerShares[binding[0]], name)
 		}
 		prefix := "-"
 		if verified {

@@ -16,6 +16,7 @@ func Run(args []string) {
 		Usage("l2sync <command> [arguments]").
 		Section("Commands",
 			gohelp.Item("config, conf", "Open the configuration file in an editor"),
+			gohelp.Item("connection <add|ls|rm|edit>", "Manage peer credentials"),
 			gohelp.Item("add <name> <path>", "Register a shared folder"),
 			gohelp.Item("remove <name>", "Remove a registered folder"),
 			gohelp.Item("list, ls [peer]", "List local and network folders"),

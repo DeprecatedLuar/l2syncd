@@ -4,20 +4,23 @@
 package scan
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
+	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"syscall"
+	"time"
 
 	"l2syncd/internal/guard"
+	"l2syncd/internal/metadata"
+	"l2syncd/internal/sharepath"
 	"l2syncd/internal/state"
 )
+
+var afterScanOpen = func(string) {}
 
 type ChangeKind string
 
@@ -38,14 +41,17 @@ type Result struct {
 	Skipped  []string
 }
 
-// ListedFile is the minimal metadata needed for a peer tree listing.
+// ListedFile is one regular file or directory in a peer tree listing.
 type ListedFile struct {
-	Path string
-	Size int64
-	Hash string
+	Path      string
+	Size      int64
+	Hash      string
+	Metadata  metadata.Manifest
+	Directory bool
 }
 
-// ListFiles returns regular, non-ignored files without hashing their content.
+// ListFiles returns non-ignored regular files and directories with complete
+// portable metadata; regular file bytes are hashed with SHA-256.
 func ListFiles(root string, patterns []string) ([]ListedFile, error) {
 	if _, err := guard.ReadMarker(root); err != nil {
 		return nil, err
@@ -82,18 +88,44 @@ func ListFiles(root string, patterns []string) ([]ListedFile, error) {
 			}
 			return nil
 		}
-		if entry.IsDir() || !entry.Type().IsRegular() {
+		if entry.IsDir() {
+			opened, err := sharepath.OpenDirectory(root, relative)
+			if err != nil {
+				return err
+			}
+			manifest, _, err := metadata.CaptureFile(opened, false)
+			if err != nil {
+				return closeOpened(opened, err)
+			}
+			if err := opened.Close(); err != nil {
+				return err
+			}
+			files = append(files, ListedFile{Path: relative, Metadata: manifest, Directory: true})
 			return nil
 		}
-		info, err := entry.Info()
-		if err != nil {
-			return fmt.Errorf("stat %q: %w", path, err)
+		if !entry.Type().IsRegular() {
+			return nil
 		}
-		fileHash, err := hash(path)
+		opened, err := sharepath.OpenRegular(root, relative)
 		if err != nil {
 			return err
 		}
-		files = append(files, ListedFile{Path: relative, Size: info.Size(), Hash: fileHash})
+		afterScanOpen(relative)
+		manifest, info, err := metadata.CaptureFile(opened, true)
+		if err != nil {
+			return closeOpened(opened, err)
+		}
+		fileHash, err := hashOpened(opened, info)
+		if err != nil {
+			return closeOpened(opened, err)
+		}
+		if err := sharepath.RevalidateRegular(root, relative, info); err != nil {
+			return closeOpened(opened, err)
+		}
+		if err := opened.Close(); err != nil {
+			return err
+		}
+		files = append(files, ListedFile{Path: relative, Size: info.Size(), Hash: fileHash, Metadata: manifest})
 		return nil
 	})
 	if err != nil {
@@ -150,30 +182,54 @@ func DetectWithIgnore(root string, baseline state.Baseline, patterns []string) (
 			return nil
 		}
 		if entry.IsDir() {
+			opened, err := sharepath.OpenDirectory(root, relative)
+			if err != nil {
+				return err
+			}
+			manifest, _, err := metadata.CaptureFile(opened, false)
+			if err != nil {
+				return closeOpened(opened, err)
+			}
+			if err := opened.Close(); err != nil {
+				return err
+			}
+			snapshot.Directories[relative] = manifest
 			return nil
 		}
 		if !entry.Type().IsRegular() {
+			skipped = append(skipped, relative)
 			return nil
 		}
-		file, err := fileState(path)
+		opened, err := sharepath.OpenRegular(root, relative)
 		if err != nil {
 			return err
+		}
+		afterScanOpen(relative)
+		file, info, err := openedFileState(opened)
+		if err != nil {
+			return closeOpened(opened, err)
 		}
 		previous, found := baseline.Files[relative]
 		if found && sameMetadata(file, previous) {
 			file.Hash = previous.Hash
 		} else {
-			file.Hash, err = hash(path)
+			file.Hash, err = hashOpened(opened, info)
 			if err != nil {
-				return err
+				return closeOpened(opened, err)
 			}
-			if !found || file.Hash != previous.Hash || !sameMetadata(file, previous) {
+			if !found || file.Hash != previous.Hash || previous.MetadataKnown && !metadata.Equal(file.Metadata, previous.Metadata) {
 				kind := Modified
 				if !found {
 					kind = Added
 				}
 				changes = append(changes, Change{Path: relative, Kind: kind})
 			}
+		}
+		if err := sharepath.RevalidateRegular(root, relative, info); err != nil {
+			return closeOpened(opened, err)
+		}
+		if err := opened.Close(); err != nil {
+			return err
 		}
 		snapshot.Files[relative] = file
 		return nil
@@ -203,31 +259,37 @@ func ignoredByDefault(relative string) bool {
 	return false
 }
 
-func fileState(path string) (state.File, error) {
-	info, err := os.Lstat(path)
+func openedFileState(file *os.File) (state.File, os.FileInfo, error) {
+	manifest, info, err := metadata.CaptureFile(file, true)
 	if err != nil {
-		return state.File{}, fmt.Errorf("stat %q: %w", path, err)
+		return state.File{}, nil, err
 	}
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	if !ok {
-		return state.File{}, fmt.Errorf("read inode for %q", path)
+		return state.File{}, nil, fmt.Errorf("read inode for %q", file.Name())
 	}
-	return state.File{Ino: stat.Ino, Mtime: info.ModTime().UTC(), Size: info.Size()}, nil
+	return state.File{Ino: stat.Ino, Ctime: time.Unix(stat.Ctim.Sec, stat.Ctim.Nsec).UTC(), Size: info.Size(), Metadata: manifest, MetadataKnown: true}, info, nil
 }
 
 func sameMetadata(current, previous state.File) bool {
-	return current.Ino == previous.Ino && current.Size == previous.Size && current.Mtime.Equal(previous.Mtime)
+	return current.Ino == previous.Ino && current.Size == previous.Size && current.Ctime.Equal(previous.Ctime)
 }
 
-func hash(path string) (string, error) {
-	file, err := os.Open(path)
+func hashOpened(file *os.File, before os.FileInfo) (string, error) {
+	digest, err := sharepath.Hash(file)
 	if err != nil {
-		return "", fmt.Errorf("open %q: %w", path, err)
+		return "", err
 	}
-	defer file.Close()
-	digest := sha256.New()
-	if _, err := io.Copy(digest, file); err != nil {
-		return "", fmt.Errorf("hash %q: %w", path, err)
+	after, err := file.Stat()
+	if err != nil {
+		return "", fmt.Errorf("revalidate hashed file %q: %w", file.Name(), err)
 	}
-	return hex.EncodeToString(digest.Sum(nil)), nil
+	if !sharepath.SameState(before, after) {
+		return "", fmt.Errorf("file %q changed while hashing", file.Name())
+	}
+	return digest, nil
+}
+
+func closeOpened(file *os.File, err error) error {
+	return errors.Join(err, file.Close())
 }

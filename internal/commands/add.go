@@ -3,17 +3,17 @@
 package commands
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
-	"unicode"
 
 	"l2syncd/internal/config"
 	"l2syncd/internal/guard"
-	"l2syncd/internal/preflight"
+	"l2syncd/internal/sharename"
 )
 
 const (
@@ -22,22 +22,14 @@ const (
 	addExitInvalid = 2
 )
 
-func add(cfg config.Config, args []string, stderr io.Writer) int {
+func add(args []string, stderr io.Writer) int {
 	if len(args) != 2 {
 		fmt.Fprintln(stderr, "usage: l2sync add <name> <path>")
 		return addExitError
 	}
 	name := strings.ToLower(args[0])
-	if err := validateShareName(name); err != nil {
+	if err := sharename.Validate(name); err != nil {
 		fmt.Fprintf(stderr, "l2sync: %v\n", err)
-		return addExitError
-	}
-	if _, exists := cfg.Shared[name]; exists {
-		fmt.Fprintf(stderr, "l2sync: folder %q already exists\n", name)
-		return addExitError
-	}
-	if _, exists := cfg.Remote[name]; exists {
-		fmt.Fprintf(stderr, "l2sync: folder %q already exists as remote\n", name)
 		return addExitError
 	}
 	path, err := filepath.Abs(args[1])
@@ -58,42 +50,40 @@ func add(cfg config.Config, args []string, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "l2sync: folder filesystem: %v\n", err)
 		return addExitError
 	}
-	if err := guard.WriteMarker(path, guard.Marker{Name: name}); err != nil {
-		fmt.Fprintf(stderr, "l2sync: write folder marker: %v\n", err)
-		return addExitError
-	}
-	cfg.Shared[name] = path
-	if err := config.Save(cfg); err != nil {
+	if err := withConfigLocked(context.Background(), func(current *config.Config) error {
+		if _, exists := current.Shared[name]; exists {
+			return fmt.Errorf("folder %q already exists", name)
+		}
+		if _, exists := current.Remote[name]; exists {
+			return fmt.Errorf("folder %q already exists as remote", name)
+		}
+		markerCreated, err := prepareJoinMarker(path, name)
+		if err != nil {
+			return fmt.Errorf("write folder marker: %w", err)
+		}
+		current.Shared[name] = path
+		saveErr := saveConfig(*current)
+		installed := saveErr == nil || config.WasInstalled(saveErr)
+		if saveErr != nil {
+			if markerCreated && !installed {
+				if removeErr := os.Remove(guard.MarkerPath(path)); removeErr != nil {
+					return errors.Join(saveErr, fmt.Errorf("remove newly created marker: %w", removeErr))
+				}
+			}
+			return saveErr
+		}
+		return nil
+	}); err != nil {
 		fmt.Fprintf(stderr, "l2sync: save config: %v\n", err)
+		if errors.Is(err, errInvalidConfig) {
+			return addExitInvalid
+		}
 		return addExitError
 	}
 	return addExitOK
 }
 
-func validateShareName(name string) error {
-	if name == "" {
-		return errors.New("folder name must not be empty")
-	}
-	for _, character := range name {
-		if unicode.IsLetter(character) || unicode.IsDigit(character) {
-			if character > unicode.MaxASCII {
-				return errors.New("folder name must contain only ASCII letters, numbers, hyphens, or underscores")
-			}
-			continue
-		}
-		if character != '-' && character != '_' {
-			return errors.New("folder name must contain only ASCII letters, numbers, hyphens, or underscores")
-		}
-	}
-	return nil
-}
-
 // Add registers a local shared directory.
 func Add(args []string, stderr io.Writer) int {
-	cfg, err := preflight.LoadConfig()
-	if err != nil {
-		fmt.Fprintf(stderr, "l2sync: %v\n", err)
-		return addExitInvalid
-	}
-	return add(cfg, args, stderr)
+	return add(args, stderr)
 }

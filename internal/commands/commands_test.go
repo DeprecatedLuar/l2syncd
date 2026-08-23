@@ -6,13 +6,23 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"l2syncd/internal/config"
+	"l2syncd/internal/connection"
 	"l2syncd/internal/guard"
+	"l2syncd/internal/lock"
+	"l2syncd/internal/metadata"
+	"l2syncd/internal/state"
+	"l2syncd/internal/transport"
 )
 
 const (
@@ -67,6 +77,546 @@ func TestAddListAndRemoveShare(t *testing.T) {
 	}
 }
 
+func TestAddRollsBackOnlyMarkerCreatedByFailedCommit(t *testing.T) {
+	for _, existingMarker := range []bool{false, true} {
+		t.Run(fmt.Sprintf("existing=%v", existingMarker), func(t *testing.T) {
+			root := t.TempDir()
+			t.Setenv("HOME", root)
+			t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+			t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
+			folder := filepath.Join(root, "notes")
+			if err := os.Mkdir(folder, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			wantMarker := guard.Marker{Name: "notes", Ignore: []string{"private/**"}}
+			if existingMarker {
+				if err := guard.WriteMarker(folder, wantMarker); err != nil {
+					t.Fatal(err)
+				}
+			}
+			originalSave := saveConfig
+			saveConfig = func(config.Config) error { return errors.New("injected save failure") }
+			t.Cleanup(func() { saveConfig = originalSave })
+			var stderr bytes.Buffer
+			if code := Add([]string{"notes", folder}, &stderr); code == addExitOK {
+				t.Fatal("Add succeeded after save failure")
+			}
+			marker, err := guard.ReadMarker(folder)
+			if existingMarker {
+				if err != nil || !reflect.DeepEqual(marker, wantMarker) {
+					t.Fatalf("existing marker = %#v, %v", marker, err)
+				}
+			} else if !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("new marker survived failed commit: %v", err)
+			}
+		})
+	}
+}
+
+func TestRunCycleReloadsConfigInsteadOfUsingCallerSnapshot(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
+	if err := config.Save(config.New()); err != nil {
+		t.Fatal(err)
+	}
+	summary, err := RunCycle(context.Background())
+	if err != nil || summary.Folders != 0 {
+		t.Fatalf("RunCycle stale snapshot = %#v, %v", summary, err)
+	}
+}
+
+func TestRemoveRemoteUnbindsProviderBeforeLocalRegistration(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
+	folder := filepath.Join(root, "notes")
+	if err := os.Mkdir(folder, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := guard.WriteMarker(folder, guard.Marker{Name: "notes"}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.New()
+	cfg.Peers["phone"] = config.Peer{Address: "phone", Status: config.PeerActive, PublicKey: generatedPublicKey(t, filepath.Join(root, "peer-key"))}
+	cfg.Remote["notes"] = folder
+	cfg.Bindings["notes"] = []string{"phone"}
+	if err := config.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	original := removeUnbindShare
+	t.Cleanup(func() { removeUnbindShare = original })
+	unbound := false
+	removeUnbindShare = func(_ context.Context, endpoint transport.Endpoint, share string) error {
+		if endpoint.Name != "phone" || share != "notes" {
+			return fmt.Errorf("unexpected unbind %q/%q", endpoint.Name, share)
+		}
+		unbound = true
+		return nil
+	}
+	var stderr bytes.Buffer
+	if code := Remove([]string{"notes"}, &stderr); code != removeExitOK {
+		t.Fatalf("Remove = %d, stderr = %q", code, stderr.String())
+	}
+	loaded, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !unbound || loaded.Remote["notes"] != "" || len(loaded.Bindings["notes"]) != 0 {
+		t.Fatalf("unbound = %v, config = %#v", unbound, loaded)
+	}
+}
+
+func TestRemoveRemoteOfflineRetainsRetryableLocalRegistration(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
+	folder := filepath.Join(root, "notes")
+	if err := os.Mkdir(folder, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := guard.WriteMarker(folder, guard.Marker{Name: "notes"}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.New()
+	cfg.Peers["phone"] = config.Peer{Address: "phone", Status: config.PeerActive, PublicKey: generatedPublicKey(t, filepath.Join(root, "peer-key"))}
+	cfg.Remote["notes"] = folder
+	cfg.Bindings["notes"] = []string{"phone"}
+	if err := config.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	original := removeUnbindShare
+	t.Cleanup(func() { removeUnbindShare = original })
+	removeUnbindShare = func(context.Context, transport.Endpoint, string) error { return errors.New("offline") }
+	var stderr bytes.Buffer
+	if code := Remove([]string{"notes"}, &stderr); code == removeExitOK {
+		t.Fatal("Remove succeeded while provider was offline")
+	}
+	loaded, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Remote["notes"] != folder || !reflect.DeepEqual(loaded.Bindings["notes"], []string{"phone"}) {
+		t.Fatalf("offline removal changed retryable config: %#v", loaded)
+	}
+}
+
+func TestDeterministicConflictSuffixUsesLosingFingerprint(t *testing.T) {
+	left := state.File{Metadata: metadata.Manifest{Mtime: time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC)}}
+	right := state.File{Metadata: metadata.Manifest{Mtime: time.Date(2026, 8, 23, 13, 30, 45, 0, time.FixedZone("other", -3*60*60))}}
+	loser := strings.Repeat("a", 64)
+	if got, want := deterministicConflictSuffix(left, right, loser), "20260823-163045-aaaaaaaaaaaa"; got != want {
+		t.Fatalf("suffix = %q, want %q", got, want)
+	}
+}
+
+func TestCycleSharedNamesSkipsUnboundOffers(t *testing.T) {
+	cfg := config.New()
+	cfg.Shared["bound"] = "/bound"
+	cfg.Shared["offer-only"] = "/offer"
+	cfg.Bindings["bound"] = []string{"phone"}
+	if got := cycleFolderNames(cfg); !reflect.DeepEqual(got, []string{"bound"}) {
+		t.Fatalf("cycle shared folders = %#v, want only bound offer", got)
+	}
+}
+
+func TestCycleInitiatorOrderingIsSymmetricAndRejectsEqualIdentity(t *testing.T) {
+	if initiates, err := localInitiatesCycle("01", "02"); err != nil || !initiates {
+		t.Fatalf("lower fingerprint initiates = %v, %v", initiates, err)
+	}
+	if initiates, err := localInitiatesCycle("02", "01"); err != nil || initiates {
+		t.Fatalf("higher fingerprint initiates = %v, %v", initiates, err)
+	}
+	if _, err := localInitiatesCycle("01", "01"); err == nil {
+		t.Fatal("equal fingerprints selected an initiator")
+	}
+}
+
+func TestNonInitiatorRequestsActualCycleResultWithoutMutationLock(t *testing.T) {
+	root, cfg := cycleTestConfig(t, false)
+	folder := filepath.Join(root, "notes")
+	cfg.Shared["notes"] = folder
+	cfg.Bindings["notes"] = []string{"phone"}
+	if err := guard.WriteMarker(folder, guard.Marker{Name: "notes"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := config.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	original := requestPeerCycle
+	requestPeerCycle = func(_ context.Context, endpoint transport.Endpoint, name string) (int, error) {
+		if endpoint.Name != "phone" || name != "notes" {
+			t.Fatalf("cycle request = %q/%q", endpoint.Name, name)
+		}
+		lockFile, err := lock.Acquire()
+		if err != nil {
+			return 0, fmt.Errorf("request made while mutation lock held: %w", err)
+		}
+		if err := lock.Release(lockFile); err != nil {
+			return 0, err
+		}
+		return 7, nil
+	}
+	t.Cleanup(func() { requestPeerCycle = original })
+
+	summary, err := RunCycle(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary != (CycleSummary{Folders: 1, Actions: 7}) {
+		t.Fatalf("summary = %#v", summary)
+	}
+	requestPeerCycle = func(context.Context, transport.Endpoint, string) (int, error) {
+		return 0, lock.ErrTimeout
+	}
+	var stderr bytes.Buffer
+	if got := Now(nil, io.Discard, &stderr); got != nowExitLocked {
+		t.Fatalf("remote initiator lock timeout exit = %d, stderr = %q", got, stderr.String())
+	}
+}
+
+func TestInitiatorSerializesSimultaneousTriggersAndRejectsWrongPeer(t *testing.T) {
+	root, cfg := cycleTestConfig(t, true)
+	folder := filepath.Join(root, "notes")
+	cfg.Shared["notes"] = folder
+	cfg.Bindings["notes"] = []string{"phone"}
+	if err := guard.WriteMarker(folder, guard.Marker{Name: "notes"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := config.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	original := runBoundFolderPlan
+	remoteFingerprint, err := peerFingerprint(cfg.Peers["phone"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	secondEntered := make(chan struct{})
+	var calls int
+	var callsMu sync.Mutex
+	runBoundFolderPlan = func(_ context.Context, _ config.Config, name, peer string) (int, error) {
+		if name != "notes" || peer != "phone" {
+			return 0, fmt.Errorf("unexpected plan target %q/%q", peer, name)
+		}
+		callsMu.Lock()
+		calls++
+		call := calls
+		callsMu.Unlock()
+		if call == 1 {
+			close(firstEntered)
+			<-releaseFirst
+			return 1, nil
+		}
+		close(secondEntered)
+		return 0, nil
+	}
+	t.Cleanup(func() { runBoundFolderPlan = original })
+
+	results := make(chan int, 2)
+	errors := make(chan error, 2)
+	go func() {
+		value, err := runInitiatorFolderCycle(context.Background(), "notes", "phone", remoteFingerprint)
+		results <- value
+		errors <- err
+	}()
+	<-firstEntered
+	secondStarted := make(chan struct{})
+	go func() {
+		close(secondStarted)
+		value, err := runInitiatorFolderCycle(context.Background(), "notes", "phone", remoteFingerprint)
+		results <- value
+		errors <- err
+	}()
+	<-secondStarted
+	select {
+	case <-secondEntered:
+		t.Fatal("second trigger entered planning before the first released the mutation lock")
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(releaseFirst)
+	for range 2 {
+		if err := <-errors; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if first, second := <-results, <-results; first+second != 1 {
+		t.Fatalf("serialized action results = %d, %d", first, second)
+	}
+	if _, err := runInitiatorFolderCycle(context.Background(), "notes", "other", remoteFingerprint); err == nil {
+		t.Fatal("wrong authenticated peer triggered a folder cycle")
+	}
+}
+
+func TestInitiatorRejectsDelayedSessionAfterPeerKeyReplacement(t *testing.T) {
+	root, cfg := cycleTestConfig(t, true)
+	folder := filepath.Join(root, "notes")
+	cfg.Shared["notes"] = folder
+	cfg.Bindings["notes"] = []string{"phone"}
+	if err := guard.WriteMarker(folder, guard.Marker{Name: "notes"}); err != nil {
+		t.Fatal(err)
+	}
+	authenticatedFingerprint, err := peerFingerprint(cfg.Peers["phone"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement := cfg.Peers["phone"]
+	replacement.PublicKey = generatedPublicKey(t, filepath.Join(root, "replacement-key"))
+	cfg.Peers["phone"] = replacement
+	if err := config.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runInitiatorFolderCycle(context.Background(), "notes", "phone", authenticatedFingerprint); err == nil || !strings.Contains(err.Error(), "fingerprint") {
+		t.Fatalf("delayed request-cycle authorization = %v", err)
+	}
+}
+
+func TestCommitJoinedFolderRejectsExistingRemoteWithoutExpectedBinding(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
+	folder := filepath.Join(root, "notes")
+	if err := os.Mkdir(folder, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := guard.WriteMarker(folder, guard.Marker{Name: "notes"}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.New()
+	cfg.Peers["phone"] = config.Peer{Address: "phone", Status: config.PeerActive, PublicKey: generatedPublicKey(t, filepath.Join(root, "peer-key"))}
+	cfg.Remote["notes"] = folder
+	if err := config.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := commitJoinedFolder("notes", folder, "phone", cfg.Peers["phone"]); err == nil || !strings.Contains(err.Error(), "bind") {
+		t.Fatalf("existing malformed remote registration = %v", err)
+	}
+}
+
+func cycleTestConfig(t *testing.T, localInitiator bool) (string, config.Config) {
+	t.Helper()
+	base := t.TempDir()
+	firstRoot := filepath.Join(base, "first")
+	secondRoot := filepath.Join(base, "second")
+	firstKey := generatedPublicKey(t, firstRoot)
+	secondKey := generatedPublicKey(t, secondRoot)
+	firstID, err := connection.Fingerprint(firstKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondID, err := connection.Fingerprint(secondKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstID == secondID {
+		t.Fatal("distinct fixture keys produced the same fingerprint")
+	}
+	root, remoteKey := firstRoot, secondKey
+	localIsLower := firstID < secondID
+	if localIsLower != localInitiator {
+		root, remoteKey = secondRoot, firstKey
+	}
+	t.Setenv("HOME", root)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
+	if err := os.Mkdir(filepath.Join(root, "notes"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.New()
+	cfg.Peers["phone"] = config.Peer{Address: "phone", Status: config.PeerActive, PublicKey: remoteKey}
+	return root, cfg
+}
+
+func TestFreshJoinBindsBeforeAuthorizedListing(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
+	folder := filepath.Join(root, "notes")
+	if err := os.Mkdir(folder, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.New()
+	cfg.Peers["phone"] = config.Peer{Address: "phone", Status: config.PeerActive, PublicKey: generatedPublicKey(t, filepath.Join(root, "remote-key"))}
+	if err := config.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	originalFind, originalBind, originalUnbind, originalList := joinFindProvider, joinBindShare, joinUnbindShare, joinListFiles
+	t.Cleanup(func() {
+		joinFindProvider, joinBindShare, joinUnbindShare, joinListFiles = originalFind, originalBind, originalUnbind, originalList
+	})
+	bound := false
+	joinFindProvider = func(context.Context, config.Config, string) (string, transport.Endpoint, error) {
+		return "phone", transport.Endpoint{Name: "phone"}, nil
+	}
+	joinBindShare = func(context.Context, transport.Endpoint, string) (bool, error) {
+		bound = true
+		return true, nil
+	}
+	joinUnbindShare = func(context.Context, transport.Endpoint, string) error {
+		bound = false
+		return nil
+	}
+	joinListFiles = func(context.Context, transport.Endpoint, string) ([]transport.PeerFile, error) {
+		if !bound {
+			return nil, errors.New("listing reached before binding authorization")
+		}
+		return nil, nil
+	}
+	var stderr bytes.Buffer
+	if code := Join([]string{"notes", folder}, &stderr); code != joinExitOK {
+		t.Fatalf("Join = %d, stderr = %q", code, stderr.String())
+	}
+	loaded, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Remote["notes"] != folder || !reflect.DeepEqual(loaded.Bindings["notes"], []string{"phone"}) {
+		t.Fatalf("joined config = %#v", loaded)
+	}
+}
+
+func TestFreshJoinListingFailureCompensatesOnlyNewRemoteBinding(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
+	folder := filepath.Join(root, "notes")
+	if err := os.Mkdir(folder, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.New()
+	cfg.Peers["phone"] = config.Peer{Address: "phone", Status: config.PeerActive, PublicKey: generatedPublicKey(t, filepath.Join(root, "remote-key"))}
+	if err := config.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	originalFind, originalBind, originalUnbind, originalList := joinFindProvider, joinBindShare, joinUnbindShare, joinListFiles
+	t.Cleanup(func() {
+		joinFindProvider, joinBindShare, joinUnbindShare, joinListFiles = originalFind, originalBind, originalUnbind, originalList
+	})
+	joinFindProvider = func(context.Context, config.Config, string) (string, transport.Endpoint, error) {
+		return "phone", transport.Endpoint{Name: "phone"}, nil
+	}
+	joinBindShare = func(context.Context, transport.Endpoint, string) (bool, error) { return true, nil }
+	unbound := false
+	joinUnbindShare = func(context.Context, transport.Endpoint, string) error { unbound = true; return nil }
+	joinListFiles = func(context.Context, transport.Endpoint, string) ([]transport.PeerFile, error) {
+		return nil, errors.New("authorization verification failed")
+	}
+	var stderr bytes.Buffer
+	if code := Join([]string{"notes", folder}, &stderr); code == joinExitOK {
+		t.Fatal("Join succeeded after listing failure")
+	}
+	loaded, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !unbound || loaded.Remote["notes"] != "" || len(loaded.Bindings["notes"]) != 0 {
+		t.Fatalf("unbound = %v, config = %#v", unbound, loaded)
+	}
+	if _, err := os.Lstat(guard.MarkerPath(folder)); !os.IsNotExist(err) {
+		t.Fatalf("marker created before authorized listing: %v", err)
+	}
+}
+
+func TestFreshJoinPeerIdentityChangeCompensates(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
+	folder := filepath.Join(root, "notes")
+	if err := os.Mkdir(folder, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.New()
+	cfg.Peers["phone"] = config.Peer{Address: "phone", Status: config.PeerActive, PublicKey: generatedPublicKey(t, filepath.Join(root, "remote-key"))}
+	if err := config.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	originalFind, originalBind, originalUnbind, originalList := joinFindProvider, joinBindShare, joinUnbindShare, joinListFiles
+	t.Cleanup(func() {
+		joinFindProvider, joinBindShare, joinUnbindShare, joinListFiles = originalFind, originalBind, originalUnbind, originalList
+	})
+	joinFindProvider = func(context.Context, config.Config, string) (string, transport.Endpoint, error) {
+		return "phone", transport.Endpoint{Name: "phone"}, nil
+	}
+	joinBindShare = func(context.Context, transport.Endpoint, string) (bool, error) { return true, nil }
+	unbound := false
+	joinUnbindShare = func(context.Context, transport.Endpoint, string) error { unbound = true; return nil }
+	joinListFiles = func(context.Context, transport.Endpoint, string) ([]transport.PeerFile, error) {
+		changed, err := config.Load()
+		if err != nil {
+			return nil, err
+		}
+		peer := changed.Peers["phone"]
+		peer.Address = "replacement-address"
+		changed.Peers["phone"] = peer
+		return nil, config.Save(changed)
+	}
+	var stderr bytes.Buffer
+	if code := Join([]string{"notes", folder}, &stderr); code == joinExitOK {
+		t.Fatal("Join accepted changed RPC endpoint identity")
+	}
+	loaded, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !unbound || loaded.Remote["notes"] != "" || len(loaded.Bindings["notes"]) != 0 {
+		t.Fatalf("unbound = %v, config = %#v", unbound, loaded)
+	}
+	if _, err := os.Lstat(guard.MarkerPath(folder)); !os.IsNotExist(err) {
+		t.Fatalf("marker survived identity-change compensation: %v", err)
+	}
+}
+
+func TestJoinMarkerAndLocalBindingRegistrationAreIdempotent(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
+	folder := filepath.Join(root, "notes")
+	if err := os.Mkdir(folder, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	wantMarker := guard.Marker{Name: "notes", Ignore: []string{"private/**"}}
+	if err := guard.WriteMarker(folder, wantMarker); err != nil {
+		t.Fatal(err)
+	}
+	created, err := prepareJoinMarker(folder, "notes")
+	if err != nil || created {
+		t.Fatalf("prepare existing marker = %v, %v", created, err)
+	}
+	cfg := config.New()
+	cfg.Peers["phone"] = config.Peer{Address: "phone", Status: config.PeerActive, PublicKey: generatedPublicKey(t, filepath.Join(root, "peer-key"))}
+	if err := config.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := commitJoinedFolder("notes", folder, "phone", cfg.Peers["phone"]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := commitJoinedFolder("notes", folder, "phone", cfg.Peers["phone"]); err != nil {
+		t.Fatalf("idempotent registration: %v", err)
+	}
+	marker, err := guard.ReadMarker(folder)
+	if err != nil || !reflect.DeepEqual(marker, wantMarker) {
+		t.Fatalf("marker after rollback = %#v, %v", marker, err)
+	}
+	cfg, err = config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Remote["notes"] != folder || !reflect.DeepEqual(cfg.Bindings["notes"], []string{"phone"}) {
+		t.Fatalf("config after idempotent registration = %#v", cfg)
+	}
+}
+
 func TestInvalidConfigExitsInvalid(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("HOME", root)
@@ -92,10 +642,43 @@ func TestInvalidConfigExitsInvalid(t *testing.T) {
 	}
 }
 
+func TestNowAndAddPreserveInvalidConfigExitClassification(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
+	configPath, err := config.Path()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte("misspelled = true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	folder := filepath.Join(root, "notes")
+	if err := os.Mkdir(folder, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	if got := Now(nil, io.Discard, &stderr); got != nowExitInvalid {
+		t.Fatalf("now exit = %d, stderr = %q", got, stderr.String())
+	}
+	stderr.Reset()
+	if got := Add([]string{"notes", folder}, &stderr); got != addExitInvalid {
+		t.Fatalf("add exit = %d, stderr = %q", got, stderr.String())
+	}
+	if _, err := os.Stat(guard.MarkerPath(folder)); !os.IsNotExist(err) {
+		t.Fatalf("add mutated marker with invalid config: %v", err)
+	}
+}
+
 func TestConfigEditOpensConfigFile(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("HOME", root)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
 	marker := filepath.Join(root, "edited-path")
 	editor := filepath.Join(root, "editor.sh")
 	if err := os.WriteFile(editor, []byte("#!/bin/sh\ncat > \""+marker+"\" <<EOF\n$1\nEOF\n"), 0o700); err != nil {
@@ -108,16 +691,16 @@ func TestConfigEditOpensConfigFile(t *testing.T) {
 	if got := ConfigEdit(nil, &stderr); got != successExitCode {
 		t.Fatalf("config edit exit code = %d, stderr = %q", got, stderr.String())
 	}
-	configPath, err := config.Path()
-	if err != nil {
-		t.Fatal(err)
-	}
 	contents, err := os.ReadFile(marker)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.TrimSpace(string(contents)) != configPath {
-		t.Fatalf("editor received %q, want %q", strings.TrimSpace(string(contents)), configPath)
+	if got := filepath.Base(strings.TrimSpace(string(contents))); !strings.HasPrefix(got, ".config-edit-") {
+		t.Fatalf("editor received %q, want isolated edit snapshot", got)
+	}
+	configPath, err := config.Path()
+	if err != nil {
+		t.Fatal(err)
 	}
 	configContents, err := os.ReadFile(configPath)
 	if err != nil {
@@ -138,6 +721,32 @@ func TestConfigEditRejectsArguments(t *testing.T) {
 	}
 }
 
+func TestConfigEditSnapshotRefusesConcurrentConfigMutation(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
+	path, err := config.Path()
+	if err != nil {
+		t.Fatal(err)
+	}
+	original, err := snapshotConfigForEdit(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	concurrent := append(append([]byte(nil), original...), []byte("\n# concurrent mutation\n")...)
+	if err := config.Replace(concurrent); err != nil {
+		t.Fatal(err)
+	}
+	if err := installEditedConfig(path, original, append(original, []byte("\n# editor mutation\n")...)); err == nil || !strings.Contains(err.Error(), "changed while") {
+		t.Fatalf("installEditedConfig error = %v", err)
+	}
+	current, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(current, concurrent) {
+		t.Fatalf("current config = %q, %v", current, err)
+	}
+}
+
 func TestAddRejectsUnsafeName(t *testing.T) {
 	root := t.TempDir()
 	sharePath := filepath.Join(root, "project")
@@ -148,9 +757,8 @@ func TestAddRejectsUnsafeName(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
 	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
 
-	cfg := config.New()
 	var stderr bytes.Buffer
-	if got := add(cfg, []string{"My Project", sharePath}, &stderr); got != 1 {
+	if got := add([]string{"My Project", sharePath}, &stderr); got != 1 {
 		t.Fatalf("add exit code = %d, stderr = %q", got, stderr.String())
 	}
 	if !strings.Contains(stderr.String(), "folder name must contain only") {
@@ -158,7 +766,7 @@ func TestAddRejectsUnsafeName(t *testing.T) {
 	}
 
 	stderr.Reset()
-	if got := add(cfg, []string{"My_Project", sharePath}, &stderr); got != successExitCode {
+	if got := add([]string{"My_Project", sharePath}, &stderr); got != successExitCode {
 		t.Fatalf("add exit code = %d, stderr = %q", got, stderr.String())
 	}
 	loaded, err := config.Load()
@@ -202,6 +810,46 @@ func TestBaselineCommitAndStatus(t *testing.T) {
 	}
 }
 
+func TestBaselineCommitDoesNotBlindlyRewriteLegacyHistory(t *testing.T) {
+	root := t.TempDir()
+	sharePath := filepath.Join(root, "notes")
+	if err := os.Mkdir(sharePath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sharePath, "a.txt"), []byte("current"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", root)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
+	var stderr bytes.Buffer
+	if got := Add([]string{"notes", sharePath}, &stderr); got != successExitCode {
+		t.Fatalf("add exit code = %d, stderr = %q", got, stderr.String())
+	}
+	baselinePath, err := state.Path("notes")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(baselinePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	legacy := `{"version":1,"files":{"deleted":{"ino":7,"mtime":"2025-01-01T00:00:00Z","size":3,"hash":"abc"}}}`
+	if err := os.WriteFile(baselinePath, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stderr.Reset()
+	if got := BaselineCommit([]string{"notes"}, &stderr); got == successExitCode {
+		t.Fatal("baseline commit accepted migrated legacy history")
+	}
+	contents, err := os.ReadFile(baselinePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(contents) != legacy {
+		t.Fatal("baseline commit rewrote legacy history")
+	}
+}
+
 func TestListVerifiesRemoteProvider(t *testing.T) {
 	root := t.TempDir()
 	remotePath := filepath.Join(root, "notes")
@@ -212,8 +860,9 @@ func TestListVerifiesRemoteProvider(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := config.New()
-	cfg.Peers["phone"] = "phone"
+	cfg.Peers["phone"] = config.Peer{Address: "phone", Status: config.PeerPending}
 	cfg.Remote["notes"] = remotePath
+	cfg.Bindings["notes"] = []string{"phone"}
 
 	var stdout, stderr bytes.Buffer
 	got := listWithLister(cfg, nil, &stdout, &stderr, func(context.Context, string) ([]string, error) {
@@ -226,7 +875,7 @@ func TestListVerifiesRemoteProvider(t *testing.T) {
 
 func TestListQueriesConfiguredPeersWithoutLocalRemoteEntries(t *testing.T) {
 	cfg := config.New()
-	cfg.Peers["phone"] = "phone"
+	cfg.Peers["phone"] = config.Peer{Address: "phone", Status: config.PeerPending}
 	cfg.Shared["notes"] = "/missing/notes"
 	var stdout, stderr bytes.Buffer
 	got := listWithLister(cfg, nil, &stdout, &stderr, func(context.Context, string) ([]string, error) {
@@ -251,7 +900,7 @@ func TestListKeepsLocalEntriesWhenPeerIsUnreachable(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := config.New()
-	cfg.Peers["phone"] = "phone"
+	cfg.Peers["phone"] = config.Peer{Address: "phone", Status: config.PeerPending}
 	cfg.Shared["notes"] = sharedPath
 
 	var stdout, stderr bytes.Buffer
