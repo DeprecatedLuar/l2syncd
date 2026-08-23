@@ -14,6 +14,7 @@ import (
 	"l2syncd/internal/config"
 	"l2syncd/internal/engine"
 	"l2syncd/internal/guard"
+	"l2syncd/internal/lock"
 	"l2syncd/internal/preflight"
 	"l2syncd/internal/scan"
 	"l2syncd/internal/state"
@@ -37,30 +38,53 @@ func Now(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "l2sync: %v\n", err)
 		return nowExitInvalid
 	}
-	for name, path := range cfg.Remote {
-		if err := planRemote(context.Background(), cfg, name, path, stdout); err != nil {
-			fmt.Fprintf(stderr, "l2sync: now %q: %v\n", name, err)
-			if isTransportError(err) {
-				return nowExitUnreachable
-			}
-			return nowExitError
+	lockFile, err := lock.Acquire()
+	if err != nil {
+		fmt.Fprintf(stderr, "l2sync: %v\n", err)
+		return nowExitError
+	}
+	defer lock.Release(lockFile)
+	if err := RunCycle(context.Background(), cfg); err != nil {
+		fmt.Fprintf(stderr, "l2sync: now: %v\n", err)
+		if isTransportError(err) {
+			return nowExitUnreachable
 		}
+		return nowExitError
 	}
 	return nowExitOK
 }
 
-func planRemote(ctx context.Context, cfg config.Config, name, path string, stdout io.Writer) error {
+// RunCycle reconciles all configured remote folders once.
+func RunCycle(ctx context.Context, cfg config.Config) error {
+	for _, name := range sortedKeys(cfg.Shared) {
+		peer, address, err := findPeerForShared(ctx, cfg, name)
+		if err != nil {
+			return fmt.Errorf("%s: %w", name, err)
+		}
+		if err := planFolder(ctx, cfg, name, cfg.Shared[name], peer, address); err != nil {
+			return fmt.Errorf("%s: %w", name, err)
+		}
+	}
+	for _, name := range sortedKeys(cfg.Remote) {
+		provider, address, err := findProvider(ctx, cfg, name)
+		if err != nil {
+			return fmt.Errorf("%s: %w", name, err)
+		}
+		if err := planFolder(ctx, cfg, name, cfg.Remote[name], provider, address); err != nil {
+			return fmt.Errorf("%s: %w", name, err)
+		}
+	}
+	return nil
+}
+
+func planFolder(ctx context.Context, cfg config.Config, name, path, peer, address string) error {
 	marker, err := guard.ReadMarker(path)
 	if err != nil {
 		return fmt.Errorf("read marker: %w", err)
 	}
-	provider, address, err := findProvider(ctx, cfg, name)
-	if err != nil {
-		return err
-	}
 	remoteFiles, err := transport.ListFiles(ctx, address, name)
 	if err != nil {
-		return fmt.Errorf("peer %q listing: %w", provider, err)
+		return fmt.Errorf("peer %q listing: %w", peer, err)
 	}
 	localBaseline, err := loadBaseline(name)
 	if err != nil {
@@ -74,12 +98,12 @@ func planRemote(ctx context.Context, cfg config.Config, name, path string, stdou
 	for _, file := range remoteFiles {
 		remote.Files[file.Path] = state.File{Hash: file.Hash, Size: file.Size}
 	}
-	plan := engine.PlanStates("local", local.Snapshot, provider, remote, localBaseline)
+	plan := engine.PlanStates("local", local.Snapshot, peer, remote, localBaseline)
 	if plan.Halted {
 		return fmt.Errorf("halted: %s", plan.Reason)
 	}
 	for _, action := range plan.Actions {
-		if err := applyAction(ctx, action, name, path, provider, address, local.Snapshot, remote); err != nil {
+		if err := applyAction(ctx, action, name, path, peer, address, local.Snapshot, remote); err != nil {
 			return err
 		}
 	}
@@ -93,6 +117,22 @@ func planRemote(ctx context.Context, cfg config.Config, name, path string, stdou
 		}
 	}
 	return nil
+}
+
+func findPeerForShared(ctx context.Context, cfg config.Config, name string) (string, string, error) {
+	peers := sortedKeys(cfg.Peers)
+	if len(peers) != 1 {
+		return "", "", fmt.Errorf("shared folder %q requires exactly one configured peer", name)
+	}
+	peer := peers[0]
+	address, err := config.ResolvePeerAddress(cfg.Peers[peer])
+	if err != nil {
+		return "", "", fmt.Errorf("resolve peer %q: %w", peer, err)
+	}
+	if _, err := transport.ListFiles(ctx, address, name); err != nil {
+		return "", "", fmt.Errorf("peer %q does not serve folder %q: %w", peer, name, err)
+	}
+	return peer, address, nil
 }
 
 func applyAction(ctx context.Context, action engine.Action, share, root, provider, address string, local, remote state.Baseline) error {

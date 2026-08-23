@@ -44,7 +44,7 @@ func listWithLister(cfg config.Config, args []string, stdout, stderr io.Writer, 
 	peerNames := make([]string, 0)
 	if len(args) == 1 {
 		peerNames = append(peerNames, args[0])
-	} else if len(cfg.Remote) > 0 {
+	} else {
 		peerNames = sortedKeys(cfg.Peers)
 	}
 	for _, peerName := range peerNames {
@@ -82,10 +82,33 @@ func listWithLister(cfg config.Config, args []string, stdout, stderr io.Writer, 
 		fmt.Fprintf(stdout, "%s %s\n", prefix, name)
 	}
 
-	if len(args) == 1 {
-		peerName := args[0]
+	networkNames := make(map[string]struct{})
+	for _, peerName := range peerNames {
 		for _, name := range peerShares[peerName] {
-			fmt.Fprintf(stdout, "remote-share %s peer=%s\n", name, peerName)
+			networkNames[name] = struct{}{}
+		}
+	}
+	if len(args) == 0 {
+		for _, name := range sortedKeys(networkNames) {
+			if _, localShared := cfg.Shared[name]; localShared {
+				continue
+			}
+			if _, localRemote := cfg.Remote[name]; localRemote {
+				continue
+			}
+			fmt.Fprintf(stdout, "- %s\n", name)
+		}
+	} else {
+		for _, peerName := range peerNames {
+			for _, name := range peerShares[peerName] {
+				if _, localShared := cfg.Shared[name]; localShared {
+					continue
+				}
+				if _, localRemote := cfg.Remote[name]; localRemote {
+					continue
+				}
+				fmt.Fprintf(stdout, "remote-share %s peer=%s\n", name, peerName)
+			}
 		}
 	}
 	if networkFailure {
@@ -94,7 +117,7 @@ func listWithLister(cfg config.Config, args []string, stdout, stderr io.Writer, 
 	return listExitOK
 }
 
-// List prints locally registered folders.
+// List prints local registrations and folders offered by configured peers.
 func List(stdout, stderr io.Writer) int {
 	cfg, err := preflight.LoadConfig()
 	if err != nil {

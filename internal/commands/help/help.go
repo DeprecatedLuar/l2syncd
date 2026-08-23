@@ -18,7 +18,7 @@ func Run(args []string) {
 			gohelp.Item("config, conf", "Open the configuration file in an editor"),
 			gohelp.Item("add <name> <path>", "Register a shared folder"),
 			gohelp.Item("remove <name>", "Remove a registered folder"),
-			gohelp.Item("list, ls [peer]", "List registered folders"),
+			gohelp.Item("list, ls [peer]", "List local and network folders"),
 			gohelp.Item("status", "Show synchronization status"),
 			gohelp.Item("join", "Join a remote peer"),
 			gohelp.Item("run", "Run synchronization"),

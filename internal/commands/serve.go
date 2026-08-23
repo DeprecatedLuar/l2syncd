@@ -50,9 +50,9 @@ func Serve(stdin io.Reader, stdout, stderr io.Writer) int {
 	}
 	sort.Strings(shares)
 	fileLister := func(name string) ([]transport.PeerFile, error) {
-		path, exists := cfg.Shared[name]
+		path, exists := folderPath(cfg, name)
 		if !exists {
-			return nil, fmt.Errorf("shared folder %q is not offered", name)
+			return nil, fmt.Errorf("folder %q is not registered", name)
 		}
 		marker, markerErr := guard.ReadMarker(path)
 		if markerErr != nil {
@@ -63,7 +63,7 @@ func Serve(stdin io.Reader, stdout, stderr io.Writer) int {
 		}
 		listed, scanErr := scan.ListFiles(path, marker.Ignore)
 		if scanErr != nil {
-			return nil, fmt.Errorf("list shared folder %q: %w", name, scanErr)
+			return nil, fmt.Errorf("list folder %q: %w", name, scanErr)
 		}
 		files := make([]transport.PeerFile, 0, len(listed))
 		for _, file := range listed {
@@ -72,9 +72,9 @@ func Serve(stdin io.Reader, stdout, stderr io.Writer) int {
 		return files, nil
 	}
 	fileReader := func(name, relative string) (io.ReadCloser, error) {
-		path, exists := cfg.Shared[name]
+		path, exists := folderPath(cfg, name)
 		if !exists {
-			return nil, fmt.Errorf("shared folder %q is not offered", name)
+			return nil, fmt.Errorf("folder %q is not registered", name)
 		}
 		marker, markerErr := guard.ReadMarker(path)
 		if markerErr != nil || marker.Name != name {
@@ -85,14 +85,14 @@ func Serve(stdin io.Reader, stdout, stderr io.Writer) int {
 		}
 		file, openErr := os.Open(filepath.Join(path, filepath.FromSlash(relative)))
 		if openErr != nil {
-			return nil, fmt.Errorf("open shared file %q: %w", relative, openErr)
+			return nil, fmt.Errorf("open folder file %q: %w", relative, openErr)
 		}
 		return file, nil
 	}
 	fileWriter := func(name, relative string, contents io.Reader) error {
-		path, exists := cfg.Shared[name]
+		path, exists := folderPath(cfg, name)
 		if !exists {
-			return fmt.Errorf("shared folder %q is not offered", name)
+			return fmt.Errorf("folder %q is not registered", name)
 		}
 		marker, markerErr := guard.ReadMarker(path)
 		if markerErr != nil || marker.Name != name {
@@ -101,12 +101,12 @@ func Serve(stdin io.Reader, stdout, stderr io.Writer) int {
 		if err := apply.Write(path, relative, contents, ""); err != nil {
 			return err
 		}
-		return commitSharedBaseline(name, path, marker.Ignore)
+		return commitFolderBaseline(name, path, marker.Ignore)
 	}
 	fileDeleter := func(name, relative string) error {
-		path, exists := cfg.Shared[name]
+		path, exists := folderPath(cfg, name)
 		if !exists {
-			return fmt.Errorf("shared folder %q is not offered", name)
+			return fmt.Errorf("folder %q is not registered", name)
 		}
 		marker, markerErr := guard.ReadMarker(path)
 		if markerErr != nil || marker.Name != name {
@@ -115,12 +115,12 @@ func Serve(stdin io.Reader, stdout, stderr io.Writer) int {
 		if err := apply.Delete(path, relative); err != nil {
 			return err
 		}
-		return commitSharedBaseline(name, path, marker.Ignore)
+		return commitFolderBaseline(name, path, marker.Ignore)
 	}
 	conflictWriter := func(name, relative, loser string, contents io.Reader) error {
-		path, exists := cfg.Shared[name]
+		path, exists := folderPath(cfg, name)
 		if !exists {
-			return fmt.Errorf("shared folder %q is not offered", name)
+			return fmt.Errorf("folder %q is not registered", name)
 		}
 		marker, markerErr := guard.ReadMarker(path)
 		if markerErr != nil || marker.Name != name {
@@ -132,7 +132,7 @@ func Serve(stdin io.Reader, stdout, stderr io.Writer) int {
 		if err := apply.Write(path, relative, contents, ""); err != nil {
 			return err
 		}
-		return commitSharedBaseline(name, path, marker.Ignore)
+		return commitFolderBaseline(name, path, marker.Ignore)
 	}
 	if err := transport.ServePeerWithConflict(stdin, stdout, shares, fileLister, fileReader, fileWriter, fileDeleter, conflictWriter); err != nil {
 		fmt.Fprintf(stderr, "l2sync: serve peer request: %v\n", err)
@@ -141,20 +141,28 @@ func Serve(stdin io.Reader, stdout, stderr io.Writer) int {
 	return serveExitOK
 }
 
-func commitSharedBaseline(name, path string, ignore []string) error {
+func folderPath(cfg config.Config, name string) (string, bool) {
+	if path, exists := cfg.Shared[name]; exists {
+		return path, true
+	}
+	path, exists := cfg.Remote[name]
+	return path, exists
+}
+
+func commitFolderBaseline(name, path string, ignore []string) error {
 	baseline, err := state.Load(name)
 	if err != nil && err != state.ErrNotFound {
-		return fmt.Errorf("load shared baseline: %w", err)
+		return fmt.Errorf("load folder baseline: %w", err)
 	}
 	if err == state.ErrNotFound {
 		baseline = state.New()
 	}
 	result, err := scan.DetectWithIgnore(path, baseline, ignore)
 	if err != nil {
-		return fmt.Errorf("scan shared folder after mutation: %w", err)
+		return fmt.Errorf("scan folder after mutation: %w", err)
 	}
 	if err := state.Save(name, result.Snapshot); err != nil {
-		return fmt.Errorf("save shared baseline after mutation: %w", err)
+		return fmt.Errorf("save folder baseline after mutation: %w", err)
 	}
 	return nil
 }

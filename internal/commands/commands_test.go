@@ -224,6 +224,23 @@ func TestListVerifiesRemoteProvider(t *testing.T) {
 	}
 }
 
+func TestListQueriesConfiguredPeersWithoutLocalRemoteEntries(t *testing.T) {
+	cfg := config.New()
+	cfg.Peers["phone"] = "phone"
+	cfg.Shared["notes"] = "/missing/notes"
+	var stdout, stderr bytes.Buffer
+	got := listWithLister(cfg, nil, &stdout, &stderr, func(context.Context, string) ([]string, error) {
+		return []string{"photos"}, nil
+	})
+	if got != listExitOK {
+		t.Fatalf("list = code %d, stderr %q", got, stderr.String())
+	}
+	want := "- notes\n- photos\n"
+	if stdout.String() != want {
+		t.Fatalf("list stdout = %q, want %q", stdout.String(), want)
+	}
+}
+
 func TestListKeepsLocalEntriesWhenPeerIsUnreachable(t *testing.T) {
 	root := t.TempDir()
 	sharedPath := filepath.Join(root, "notes")
