@@ -28,13 +28,12 @@ func remove(cfg config.Config, args []string, stderr io.Writer) int {
 	}
 	name := args[0]
 	if _, exists := cfg.Shared[name]; !exists {
-		if remotePath, remote := cfg.Remote[name]; remote {
-			binding := cfg.Bindings[name]
-			if len(binding) != 1 {
+		if remoteFolder, remote := cfg.Remote[name]; remote {
+			if len(remoteFolder.Peers) != 1 {
 				fmt.Fprintf(stderr, "l2sync: remote folder %q has no valid peer binding\n", name)
 				return removeExitError
 			}
-			peerName := binding[0]
+			peerName := remoteFolder.Peers[0]
 			endpoint, err := peerEndpoint(context.Background(), cfg, peerName)
 			if err != nil {
 				fmt.Fprintf(stderr, "l2sync: prepare peer %q for folder removal: %v; local registration retained\n", peerName, err)
@@ -49,15 +48,14 @@ func remove(cfg config.Config, args []string, stderr io.Writer) int {
 				if current.Peers[peerName] != expectedPeer {
 					return fmt.Errorf("peer %q connection identity changed during folder removal", peerName)
 				}
-				if current.Remote[name] != remotePath {
+				currentFolder := current.Remote[name]
+				if currentFolder.Path != remoteFolder.Path {
 					return fmt.Errorf("folder %q changed concurrently after remote unbind", name)
 				}
-				currentBinding := current.Bindings[name]
-				if len(currentBinding) != 1 || currentBinding[0] != peerName {
+				if len(currentFolder.Peers) != 1 || currentFolder.Peers[0] != peerName {
 					return fmt.Errorf("folder %q binding changed concurrently after remote unbind", name)
 				}
 				delete(current.Remote, name)
-				delete(current.Bindings, name)
 				return nil
 			})
 			if commitErr != nil {
@@ -73,20 +71,20 @@ func remove(cfg config.Config, args []string, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "l2sync: share %q not found\n", name)
 		return removeExitError
 	}
-	if len(cfg.Bindings[name]) != 0 {
+	if len(cfg.Shared[name].Peers) != 0 {
 		fmt.Fprintf(stderr, "l2sync: shared folder %q is still bound; remove it from the consuming peer first\n", name)
 		return removeExitError
 	}
-	sharedPath := cfg.Shared[name]
+	sharedFolder := cfg.Shared[name]
 	installed, err := commitConfigLocked(func(current *config.Config) error {
-		if current.Shared[name] != sharedPath {
+		currentFolder := current.Shared[name]
+		if currentFolder.Path != sharedFolder.Path {
 			return fmt.Errorf("shared folder %q changed concurrently", name)
 		}
-		if len(current.Bindings[name]) != 0 {
+		if len(currentFolder.Peers) != 0 {
 			return fmt.Errorf("shared folder %q became bound concurrently", name)
 		}
 		delete(current.Shared, name)
-		delete(current.Bindings, name)
 		return nil
 	})
 	if err != nil {

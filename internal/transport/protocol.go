@@ -76,7 +76,8 @@ var errUnexpectedEnd = errors.New("peer listing ended without an end-of-stream m
 // Remote application errors, such as a rejected marker, are deliberately not
 // transport errors.
 type Error struct {
-	err error
+	err  error
+	auth bool
 }
 
 func (err *Error) Error() string { return err.err.Error() }
@@ -87,6 +88,21 @@ func (err *Error) Unwrap() error { return err.err }
 func IsError(err error) bool {
 	var transportErr *Error
 	return errors.As(err, &transportErr)
+}
+
+// IsAuthError reports whether err represents an SSH public-key rejection
+// specifically, as opposed to any other reachability failure (timeout, DNS,
+// connection refused). A rejected key means the peer's authorized_keys entry
+// is gone or invalid — most commonly because the peer ran "connection rm".
+func IsAuthError(err error) bool {
+	var transportErr *Error
+	return errors.As(err, &transportErr) && transportErr.auth
+}
+
+// NewAuthErrorForTest builds an error satisfying IsAuthError, for tests of
+// code that branches on peer key rejection without exercising real SSH.
+func NewAuthErrorForTest(message string) error {
+	return &Error{err: errors.New(message), auth: true}
 }
 
 type message struct {
@@ -121,7 +137,6 @@ type Endpoint struct {
 type Handshake struct {
 	ExpectedPeerKey string
 	LocalPublicKey  string
-	OnSuccess       func() error
 }
 
 // PeerFile is one regular file reported by a peer listing.
@@ -537,11 +552,6 @@ func Serve(reader io.Reader, writer io.Writer, callbacks Callbacks, handshake *H
 		if err := (frameWriter{w: writer}).write(message{Type: messageHelloReply, Key: localKey}); err != nil {
 			return err
 		}
-		if handshake.OnSuccess != nil {
-			if err := handshake.OnSuccess(); err != nil {
-				return fmt.Errorf("complete peer handshake: %w", err)
-			}
-		}
 	}
 	request, err := requestReader.read()
 	if err != nil {
@@ -954,10 +964,11 @@ func classifySSHFailure(address string, commandErr, contextErr error, stderr []b
 		return fmt.Errorf("peer %q rejected request: %w", address, commandErr)
 	}
 	detail := sanitizeSSHStderr(stderr)
+	auth := strings.Contains(detail, "Permission denied")
 	if detail != "" {
-		return &Error{err: fmt.Errorf("connect to peer %q: %w: %s", address, commandErr, detail)}
+		return &Error{err: fmt.Errorf("connect to peer %q: %w: %s", address, commandErr, detail), auth: auth}
 	}
-	return &Error{err: fmt.Errorf("connect to peer %q: %w", address, commandErr)}
+	return &Error{err: fmt.Errorf("connect to peer %q: %w", address, commandErr), auth: auth}
 }
 
 func sshProcess(ctx context.Context, address, privateKey string, bulk bool) (*exec.Cmd, func(), error) {
@@ -1045,12 +1056,11 @@ func sanitizedSSHConfig(ctx context.Context, address string) (string, func(), er
 	return name, cleanup, nil
 }
 
-var strippedSSHOptions = map[string]bool{
-	"host":         true,
-	"identityfile": true, "certificatefile": true, "identityagent": true,
-	"pkcs11provider": true, "securitykeyprovider": true, "addkeystoagent": true,
-	"localcommand": true, "remotecommand": true, "permitlocalcommand": true,
-	"forkafterauthentication": true, "sessiontype": true, "requesttty": true,
+var allowedSSHOptions = map[string]bool{
+	"hostname":  true,
+	"port":      true,
+	"user":      true,
+	"proxyjump": true,
 }
 
 func sanitizeEffectiveSSHConfig(effective []byte) ([]byte, error) {
@@ -1064,12 +1074,7 @@ func sanitizeEffectiveSSHConfig(effective []byte) ([]byte, error) {
 		if !found || key == "" || value == "" {
 			return nil, fmt.Errorf("cannot represent resolved SSH option %q", line)
 		}
-		for _, character := range key {
-			if character < 'a' || character > 'z' {
-				return nil, fmt.Errorf("invalid resolved SSH option name %q", key)
-			}
-		}
-		if strippedSSHOptions[key] {
+		if !allowedSSHOptions[key] {
 			continue
 		}
 		if strings.ContainsAny(value, "\r\n\x00") {

@@ -61,7 +61,7 @@ func add(args []string, stderr io.Writer) int {
 		if err != nil {
 			return fmt.Errorf("write folder marker: %w", err)
 		}
-		current.Shared[name] = path
+		current.Shared[name] = config.Folder{Path: path}
 		saveErr := saveConfig(*current)
 		installed := saveErr == nil || config.WasInstalled(saveErr)
 		if saveErr != nil {

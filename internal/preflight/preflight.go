@@ -45,12 +45,6 @@ func Validate(cfg config.Config) error {
 		if err := peername.Validate(name); err != nil {
 			return fmt.Errorf("peer %q: %w", name, err)
 		}
-		if peer.Status != config.PeerPending && peer.Status != config.PeerActive && peer.Status != config.PeerRevoked {
-			return fmt.Errorf("peer %q has invalid status %q", name, peer.Status)
-		}
-		if (peer.Status == config.PeerActive || peer.Status == config.PeerRevoked) && peer.PublicKey == "" {
-			return fmt.Errorf("active peer %q has no public key", name)
-		}
 		if peer.PublicKey != "" {
 			normalized, err := connection.NormalizePublicKey(peer.PublicKey)
 			if err != nil {
@@ -65,51 +59,37 @@ func Validate(cfg config.Config) error {
 			return fmt.Errorf("resolve peer %q: %w", name, err)
 		}
 	}
-	for folder, peers := range cfg.Bindings {
-		if err := sharename.Validate(folder); err != nil {
-			return fmt.Errorf("binding folder %q: %w", folder, err)
-		}
-		if len(peers) != 1 {
-			return fmt.Errorf("folder %q must bind exactly one peer", folder)
-		}
-		peer, exists := cfg.Peers[peers[0]]
-		if !exists {
-			return fmt.Errorf("folder %q binds unknown peer %q", folder, peers[0])
-		}
-		if peer.Status == config.PeerRevoked {
-			return fmt.Errorf("folder %q binds revoked peer %q", folder, peers[0])
-		}
-		if _, shared := cfg.Shared[folder]; !shared {
-			if _, remote := cfg.Remote[folder]; !remote {
-				return fmt.Errorf("binding names unregistered folder %q", folder)
-			}
-		}
-	}
-	for name, path := range cfg.Shared {
+	for name, folder := range cfg.Shared {
 		if err := sharename.Validate(name); err != nil {
 			return fmt.Errorf("shared folder %q: %w", name, err)
 		}
 		if _, exists := cfg.Remote[name]; exists {
 			return fmt.Errorf("folder %q is registered as both shared and remote", name)
 		}
-		if err := validateFolder(name, path); err != nil {
+		if err := validateFolder(name, folder.Path); err != nil {
 			return fmt.Errorf("shared folder %q: %w", name, err)
 		}
+		if len(folder.Peers) > 1 {
+			return fmt.Errorf("folder %q must bind exactly one peer", name)
+		}
+		if len(folder.Peers) == 1 {
+			if _, exists := cfg.Peers[folder.Peers[0]]; !exists {
+				return fmt.Errorf("folder %q binds unknown peer %q", name, folder.Peers[0])
+			}
+		}
 	}
-	for name, path := range cfg.Remote {
+	for name, folder := range cfg.Remote {
 		if err := sharename.Validate(name); err != nil {
 			return fmt.Errorf("remote folder %q: %w", name, err)
 		}
-		if err := validateFolder(name, path); err != nil {
+		if err := validateFolder(name, folder.Path); err != nil {
 			return fmt.Errorf("remote folder %q: %w", name, err)
 		}
-		bound := cfg.Bindings[name]
-		if len(bound) != 1 {
+		if len(folder.Peers) != 1 {
 			return fmt.Errorf("remote folder %q must bind exactly one peer", name)
 		}
-		peer, exists := cfg.Peers[bound[0]]
-		if !exists || peer.Status != config.PeerPending && peer.Status != config.PeerActive {
-			return fmt.Errorf("remote folder %q binds unavailable peer %q", name, bound[0])
+		if _, exists := cfg.Peers[folder.Peers[0]]; !exists {
+			return fmt.Errorf("remote folder %q binds unavailable peer %q", name, folder.Peers[0])
 		}
 	}
 	return nil

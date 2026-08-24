@@ -153,24 +153,123 @@ func TestWatchRootComparisonDistinguishesBindingFromRegistrationChanges(t *testi
 	}
 }
 
+func TestEventMarksDirty(t *testing.T) {
+	configPath := filepath.Join(string(filepath.Separator), "home", "user", ".config", "l2sync", "config.toml")
+	configDir := filepath.Dir(configPath)
+	shareRoot := filepath.Join(string(filepath.Separator), "home", "user", "notes")
+
+	cases := []struct {
+		name  string
+		event fsnotify.Event
+		want  bool
+	}{
+		{
+			name:  "trash write",
+			event: fsnotify.Event{Name: filepath.Join(shareRoot, ".l2sync-trash", "2026-08-24", "notes.txt"), Op: fsnotify.Write},
+			want:  false,
+		},
+		{
+			name:  "conflict artifact create",
+			event: fsnotify.Event{Name: filepath.Join(shareRoot, "notes.txt.l2sync-conflict-20260824"), Op: fsnotify.Create},
+			want:  false,
+		},
+		{
+			name:  "l2sync marker write",
+			event: fsnotify.Event{Name: filepath.Join(shareRoot, ".l2sync"), Op: fsnotify.Write},
+			want:  false,
+		},
+		{
+			name:  "config temp file create",
+			event: fsnotify.Event{Name: filepath.Join(configDir, ".config-abc.toml"), Op: fsnotify.Create},
+			want:  false,
+		},
+		{
+			name:  "config temp file rename",
+			event: fsnotify.Event{Name: filepath.Join(configDir, ".config-abc.toml"), Op: fsnotify.Rename},
+			want:  false,
+		},
+		{
+			name:  "ordinary share write",
+			event: fsnotify.Event{Name: filepath.Join(shareRoot, "report.txt"), Op: fsnotify.Write},
+			want:  true,
+		},
+		{
+			name:  "real config write",
+			event: fsnotify.Event{Name: configPath, Op: fsnotify.Write},
+			want:  true,
+		},
+		{
+			name:  "chmod only",
+			event: fsnotify.Event{Name: filepath.Join(shareRoot, "report.txt"), Op: fsnotify.Chmod},
+			want:  false,
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			if got := eventMarksDirty(testCase.event, configPath); got != testCase.want {
+				t.Fatalf("eventMarksDirty(%+v) = %v, want %v", testCase.event, got, testCase.want)
+			}
+		})
+	}
+}
+
+func TestAddTreeExcludesTrashDirectory(t *testing.T) {
+	root := t.TempDir()
+	sub := filepath.Join(root, "sub")
+	trash := filepath.Join(root, ".l2sync-trash", "2026-08-24")
+	if err := os.MkdirAll(sub, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(trash, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer watcher.Close()
+
+	if err := addTree(watcher, root); err != nil {
+		t.Fatal(err)
+	}
+
+	watched := make(map[string]bool)
+	for _, path := range watcher.WatchList() {
+		watched[path] = true
+	}
+	if !watched[root] {
+		t.Fatalf("watch list %v missing root %q", watcher.WatchList(), root)
+	}
+	if !watched[sub] {
+		t.Fatalf("watch list %v missing sub %q", watcher.WatchList(), sub)
+	}
+	if watched[filepath.Join(root, ".l2sync-trash")] {
+		t.Fatalf("watch list %v includes .l2sync-trash", watcher.WatchList())
+	}
+	if watched[trash] {
+		t.Fatalf("watch list %v includes trash date directory", watcher.WatchList())
+	}
+}
+
 func TestCycleConfigurationIgnoresUnchangedRewritesAndUnboundPeers(t *testing.T) {
 	current := config.New()
-	current.Peers["phone"] = config.Peer{Address: "phone", Status: config.PeerActive, PublicKey: "key"}
-	current.Shared["notes"] = "/notes"
-	current.Bindings["notes"] = []string{"phone"}
+	current.Peers["phone"] = config.Peer{Address: "phone", PublicKey: "key"}
+	current.Shared["notes"] = config.Folder{Path: "/notes", Peers: []string{"phone"}}
 	if !sameCycleConfiguration(current, config.Clone(current)) {
 		t.Fatal("semantic no-op config rewrite scheduled a cycle")
 	}
 	unboundChange := config.Clone(current)
-	unboundChange.Peers["other"] = config.Peer{Address: "other", Status: config.PeerPending}
+	unboundChange.Peers["other"] = config.Peer{Address: "other"}
 	if !sameCycleConfiguration(current, unboundChange) {
 		t.Fatal("unbound address-book change scheduled a cycle")
 	}
 	boundChange := config.Clone(current)
 	peer := boundChange.Peers["phone"]
-	peer.Status = config.PeerPending
+	peer.PublicKey = ""
 	boundChange.Peers["phone"] = peer
 	if sameCycleConfiguration(current, boundChange) {
-		t.Fatal("bound peer status change did not schedule a cycle")
+		t.Fatal("bound peer key change did not schedule a cycle")
 	}
 }

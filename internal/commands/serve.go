@@ -57,10 +57,6 @@ func Serve(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "l2sync: peer %q has no configured public key\n", peerName)
 		return serveExitError
 	}
-	if peer.Status != config.PeerPending && peer.Status != config.PeerActive {
-		fmt.Fprintf(stderr, "l2sync: peer %q has disallowed status %q\n", peerName, peer.Status)
-		return serveExitError
-	}
 	configuredFingerprint, err := connection.Fingerprint(peer.PublicKey)
 	if err != nil || forcedFingerprint != configuredFingerprint {
 		fmt.Fprintf(stderr, "l2sync: forced-command fingerprint does not match peer %q\n", peerName)
@@ -95,26 +91,25 @@ func Serve(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	callbacks.UnbindShare = func(name string) error {
 		return updateConfigLocked(func(current *config.Config) error {
 			configured, exists := current.Peers[peerName]
-			if !exists || configured.Status != config.PeerActive {
-				return fmt.Errorf("peer %q is not active", peerName)
+			if !exists || configured.PublicKey == "" {
+				return fmt.Errorf("peer %q has no configured public key", peerName)
 			}
 			if err := requireAuthenticatedFingerprint(configured, forcedFingerprint); err != nil {
 				return fmt.Errorf("peer %q authorization changed: %w", peerName, err)
 			}
-			bound := current.Bindings[name]
-			if len(bound) == 0 {
+			folder, exists := current.Shared[name]
+			if !exists || len(folder.Peers) == 0 {
 				return nil
 			}
-			if len(bound) != 1 || bound[0] != peerName {
+			if len(folder.Peers) != 1 || folder.Peers[0] != peerName {
 				return fmt.Errorf("folder %q is not bound to peer %q", name, peerName)
 			}
-			delete(current.Bindings, name)
+			folder.Peers = nil
+			current.Shared[name] = folder
 			return nil
 		})
 	}
-	handshake := transport.Handshake{ExpectedPeerKey: peer.PublicKey, LocalPublicKey: localKey, OnSuccess: func() error {
-		return activateServedPeer(peerName, peer.PublicKey)
-	}}
+	handshake := transport.Handshake{ExpectedPeerKey: peer.PublicKey, LocalPublicKey: localKey}
 	if err := transport.Serve(stdin, stdout, callbacks, &handshake); err != nil {
 		fmt.Fprintf(stderr, "l2sync: serve peer request: %v\n", err)
 		return serveFailureExit(err)
@@ -122,52 +117,30 @@ func Serve(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	return serveExitOK
 }
 
-func activateServedPeer(peerName, expectedPublicKey string) error {
-	return updateConfigLocked(func(current *config.Config) error {
-		configured, exists := current.Peers[peerName]
-		if !exists {
-			return fmt.Errorf("peer %q is no longer configured", peerName)
-		}
-		if configured.PublicKey != expectedPublicKey {
-			return fmt.Errorf("peer %q public key changed during handshake", peerName)
-		}
-		if configured.Status == config.PeerActive {
-			return nil
-		}
-		if configured.Status != config.PeerPending {
-			return fmt.Errorf("peer %q has disallowed status %q", peerName, configured.Status)
-		}
-		configured.Status = config.PeerActive
-		current.Peers[peerName] = configured
-		return nil
-	})
-}
-
 func bindSharedFolder(peerName, authenticatedFingerprint, name string) (created bool, err error) {
 	err = updateConfigLocked(func(current *config.Config) error {
 		configured, exists := current.Peers[peerName]
-		if !exists {
-			return fmt.Errorf("peer %q is no longer configured", peerName)
-		}
-		if configured.Status != config.PeerActive {
-			return fmt.Errorf("peer %q is not active", peerName)
+		if !exists || configured.PublicKey == "" {
+			return fmt.Errorf("peer %q has no configured public key", peerName)
 		}
 		if err := requireAuthenticatedFingerprint(configured, authenticatedFingerprint); err != nil {
 			return fmt.Errorf("peer %q authorization changed: %w", peerName, err)
 		}
-		if _, exists := current.Shared[name]; !exists {
+		folder, exists := current.Shared[name]
+		if !exists {
 			return fmt.Errorf("folder %q is not shared", name)
 		}
-		if bound := current.Bindings[name]; len(bound) != 0 {
-			if len(bound) != 1 {
+		if len(folder.Peers) != 0 {
+			if len(folder.Peers) != 1 {
 				return fmt.Errorf("folder %q has malformed peer binding", name)
 			}
-			if bound[0] != peerName {
-				return fmt.Errorf("folder %q is already bound to peer %q", name, bound[0])
+			if folder.Peers[0] != peerName {
+				return fmt.Errorf("folder %q is already bound to peer %q", name, folder.Peers[0])
 			}
 			return nil
 		}
-		current.Bindings[name] = []string{peerName}
+		folder.Peers = []string{peerName}
+		current.Shared[name] = folder
 		created = true
 		return nil
 	})
@@ -293,8 +266,8 @@ func newReloadingShareLister(peer, authenticatedFingerprint string) func() ([]st
 			return nil, fmt.Errorf("reload validated config for share discovery: %w", err)
 		}
 		configured, exists := cfg.Peers[peer]
-		if !exists || configured.Status != config.PeerActive {
-			return nil, fmt.Errorf("peer %q is not active", peer)
+		if !exists || configured.PublicKey == "" {
+			return nil, fmt.Errorf("peer %q has no configured public key", peer)
 		}
 		if err := requireAuthenticatedFingerprint(configured, authenticatedFingerprint); err != nil {
 			return nil, fmt.Errorf("peer %q authorization changed: %w", peer, err)
@@ -321,19 +294,20 @@ func newReloadingFolderResolver(peer, authenticatedFingerprint string) folderRes
 
 func resolveFolder(cfg config.Config, peer, authenticatedFingerprint, name string) (resolvedFolder, error) {
 	configured, exists := cfg.Peers[peer]
-	if !exists || configured.Status != config.PeerActive {
-		return resolvedFolder{}, fmt.Errorf("peer %q is not active", peer)
+	if !exists || configured.PublicKey == "" {
+		return resolvedFolder{}, fmt.Errorf("peer %q has no configured public key", peer)
 	}
 	if err := requireAuthenticatedFingerprint(configured, authenticatedFingerprint); err != nil {
 		return resolvedFolder{}, fmt.Errorf("peer %q authorization changed: %w", peer, err)
 	}
-	if !bindingAuthorizes(cfg, name, peer) {
+	if bound, ok := cfg.BoundPeer(name); !ok || bound != peer {
 		return resolvedFolder{}, fmt.Errorf("folder %q is not bound to peer %q", name, peer)
 	}
-	path, exists := folderPath(cfg, name)
+	folder, exists := cfg.Lookup(name)
 	if !exists {
 		return resolvedFolder{}, fmt.Errorf("folder %q is not registered", name)
 	}
+	path := folder.Path
 	marker, err := guard.ReadMarker(path)
 	if err != nil {
 		return resolvedFolder{}, fmt.Errorf("folder %q marker: %w", name, err)
@@ -353,11 +327,6 @@ func requireAuthenticatedFingerprint(peer config.Peer, authenticatedFingerprint 
 		return errors.New("authenticated fingerprint no longer matches configured public key")
 	}
 	return nil
-}
-
-func bindingAuthorizes(cfg config.Config, name, peer string) bool {
-	bound := cfg.Bindings[name]
-	return len(bound) == 1 && bound[0] == peer
 }
 
 func mutateServedFolder(name string, resolve folderResolver, mutation func(resolvedFolder) error) (err error) {
@@ -390,14 +359,6 @@ func mutateServedFolderWithin(name string, resolve folderResolver, wait time.Dur
 		return err
 	}
 	return mutation(folder)
-}
-
-func folderPath(cfg config.Config, name string) (string, bool) {
-	if path, exists := cfg.Shared[name]; exists {
-		return path, true
-	}
-	path, exists := cfg.Remote[name]
-	return path, exists
 }
 
 func commitFolderBaseline(name, path string, ignore []string) error {

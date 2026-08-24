@@ -69,9 +69,8 @@ func listWithLister(cfg config.Config, args []string, stdout, stderr io.Writer, 
 
 	for _, name := range sortedEntryNames(cfg) {
 		verified := localEntryVerified(cfg, name)
-		if verified && cfg.Remote[name] != "" {
-			binding := cfg.Bindings[name]
-			verified = len(binding) == 1 && !peerFailed[binding[0]] && contains(peerShares[binding[0]], name)
+		if folder, isRemote := cfg.Remote[name]; verified && isRemote {
+			verified = len(folder.Peers) == 1 && !peerFailed[folder.Peers[0]] && contains(peerShares[folder.Peers[0]], name)
 		}
 		prefix := "-"
 		if verified {
@@ -161,10 +160,10 @@ func sortedEntryNames(cfg config.Config) []string {
 }
 
 func localEntryVerified(cfg config.Config, name string) bool {
-	path, shared := cfg.Shared[name]
-	if !shared {
-		path = cfg.Remote[name]
+	folder, exists := cfg.Lookup(name)
+	if !exists {
+		return false
 	}
-	marker, err := guard.ReadMarker(path)
+	marker, err := guard.ReadMarker(folder.Path)
 	return err == nil && marker.Name == name
 }

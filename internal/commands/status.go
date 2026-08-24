@@ -28,7 +28,7 @@ func Status(stdout, stderr io.Writer) int {
 		return statusExitInvalid
 	}
 	for _, name := range sortedKeys(cfg.Shared) {
-		if err := printStatus(stdout, name, cfg.Shared[name]); err != nil {
+		if err := printStatus(stdout, name, cfg.Shared[name].Path); err != nil {
 			fmt.Fprintf(stderr, "l2sync: status %q: %v\n", name, err)
 			return statusExitError
 		}
@@ -58,7 +58,7 @@ func BaselineCommit(args []string, stderr io.Writer) int {
 		return statusExitError
 	}
 	err := withConfigLocked(context.Background(), func(cfg *config.Config) error {
-		path, found := cfg.Shared[args[0]]
+		folder, found := cfg.Shared[args[0]]
 		if !found {
 			return fmt.Errorf("share %q not found", args[0])
 		}
@@ -69,11 +69,11 @@ func BaselineCommit(args []string, stderr io.Writer) int {
 		if baseline.HasUnknownMetadata() {
 			return errors.New("baseline version 1 must be migrated by a successful sync cycle before manual baseline commit")
 		}
-		marker, err := guard.ReadMarker(path)
+		marker, err := guard.ReadMarker(folder.Path)
 		if err != nil {
 			return fmt.Errorf("read marker: %w", err)
 		}
-		return commitFolderBaseline(args[0], path, marker.Ignore)
+		return commitFolderBaseline(args[0], folder.Path, marker.Ignore)
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "l2sync: commit baseline: %v\n", err)

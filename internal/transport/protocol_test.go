@@ -357,6 +357,41 @@ func TestSSHArgumentsReuseControlConnectionExceptForBulkTransfers(t *testing.T) 
 	}
 }
 
+func TestSanitizeEffectiveSSHConfigAllowsOnlyKnownKeys(t *testing.T) {
+	effective := "hostname 10.0.0.5\nport 2222\nuser phone\nproxyjump jump-host\n" +
+		"forwardx11 no\nforwardx11trusted no\nforwardx11timeout 1200\n" +
+		"proxycommand nc %h %p\nlocalcommand echo hi\n"
+	result, err := sanitizeEffectiveSSHConfig([]byte(effective))
+	if err != nil {
+		t.Fatalf("sanitizeEffectiveSSHConfig returned error: %v", err)
+	}
+	got := string(result)
+	for _, want := range []string{"hostname 10.0.0.5", "port 2222", "user phone", "proxyjump jump-host"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("sanitized config = %q, want it to contain %q", got, want)
+		}
+	}
+	for _, unwanted := range []string{"forwardx11", "proxycommand", "localcommand"} {
+		if strings.Contains(got, unwanted) {
+			t.Fatalf("sanitized config = %q, must not contain %q", got, unwanted)
+		}
+	}
+}
+
+func TestSanitizeEffectiveSSHConfigRejectsInjectionInValue(t *testing.T) {
+	_, err := sanitizeEffectiveSSHConfig([]byte("hostname evil\x00host\n"))
+	if err == nil {
+		t.Fatal("sanitizeEffectiveSSHConfig accepted a value containing a NUL byte")
+	}
+}
+
+func TestSanitizeEffectiveSSHConfigRejectsMalformedLine(t *testing.T) {
+	_, err := sanitizeEffectiveSSHConfig([]byte("justakey\n"))
+	if err == nil {
+		t.Fatal("sanitizeEffectiveSSHConfig accepted a line without a value")
+	}
+}
+
 func TestControlSocketSelectionDisablesMultiplexingForLongOrUnsafeRuntimePath(t *testing.T) {
 	valid, err := os.MkdirTemp("/tmp", "l2r-")
 	if err != nil {
@@ -408,13 +443,9 @@ func TestServeRequiresAndValidatesPinnedHello(t *testing.T) {
 	if err := writer.write(message{Type: messageListShares}); err != nil {
 		t.Fatal(err)
 	}
-	called := false
 	var response bytes.Buffer
-	if err := Serve(&request, &response, Callbacks{ListShares: func() ([]string, error) { return []string{"notes"}, nil }}, &Handshake{ExpectedPeerKey: key, LocalPublicKey: key, OnSuccess: func() error { called = true; return nil }}); err != nil {
+	if err := Serve(&request, &response, Callbacks{ListShares: func() ([]string, error) { return []string{"notes"}, nil }}, &Handshake{ExpectedPeerKey: key, LocalPublicKey: key}); err != nil {
 		t.Fatal(err)
-	}
-	if !called {
-		t.Fatal("handshake success callback was not called")
 	}
 	reader := frameReader{r: bufio.NewReader(&response)}
 	if reply, err := reader.read(); err != nil || reply.Type != messageHelloReply {
@@ -528,6 +559,13 @@ func TestSSHFailureClassificationSeparatesRemoteRejectionFromTransport(t *testin
 	}
 	if !strings.Contains(transportErr.Error(), "unix_listener: path too long") {
 		t.Fatalf("SSH transport error omitted bounded stderr: %v", transportErr)
+	}
+	if IsAuthError(transportErr) {
+		t.Fatalf("non-auth SSH transport failure misclassified as auth error: %v", transportErr)
+	}
+	rejectedErr := classifySSHFailure("phone", exitError(t, 255), nil, []byte("Permission denied (publickey).\n"))
+	if !IsError(rejectedErr) || !IsAuthError(rejectedErr) {
+		t.Fatalf("SSH key rejection not classified as auth error: %v", rejectedErr)
 	}
 	deadlineErr := classifySSHFailure("phone", errors.New("killed"), context.DeadlineExceeded, nil)
 	if !IsError(deadlineErr) {

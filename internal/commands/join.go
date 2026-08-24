@@ -81,33 +81,33 @@ func Join(args []string, stderr io.Writer) (exitCode int) {
 		return joinExitError
 	}
 	if existing, exists := cfg.Remote[name]; exists {
-		if existing != path {
-			fmt.Fprintf(stderr, "l2sync: folder %q already exists at %q\n", name, existing)
+		if existing.Path != path {
+			fmt.Fprintf(stderr, "l2sync: folder %q already exists at %q\n", name, existing.Path)
 			return joinExitError
 		}
-		bound := cfg.Bindings[name]
-		if len(bound) != 1 {
+		if len(existing.Peers) != 1 {
 			fmt.Fprintf(stderr, "l2sync: folder %q has no recoverable peer binding\n", name)
 			return joinExitError
 		}
-		endpoint, endpointErr := peerEndpoint(context.Background(), cfg, bound[0])
+		boundPeer := existing.Peers[0]
+		endpoint, endpointErr := peerEndpoint(context.Background(), cfg, boundPeer)
 		if endpointErr != nil {
 			fmt.Fprintf(stderr, "l2sync: resume folder %q binding: %v\n", name, endpointErr)
 			return joinExitUnreachable
 		}
-		expectedPeer := cfg.Peers[bound[0]]
+		expectedPeer := cfg.Peers[boundPeer]
 		created, bindErr := joinBindShare(context.Background(), endpoint, name)
 		if bindErr != nil {
-			fmt.Fprintf(stderr, "l2sync: resume folder %q binding to peer %q: %v\n", name, bound[0], bindErr)
+			fmt.Fprintf(stderr, "l2sync: resume folder %q binding to peer %q: %v\n", name, boundPeer, bindErr)
 			return joinExitUnreachable
 		}
 		validated := false
 		validateErr := withConfigLocked(context.Background(), func(current *config.Config) error {
-			if current.Peers[bound[0]] != expectedPeer || current.Remote[name] != path {
-				return fmt.Errorf("folder %q or peer %q changed during resumed join", name, bound[0])
+			currentFolder := current.Remote[name]
+			if current.Peers[boundPeer] != expectedPeer || currentFolder.Path != path {
+				return fmt.Errorf("folder %q or peer %q changed during resumed join", name, boundPeer)
 			}
-			currentBinding := current.Bindings[name]
-			if len(currentBinding) != 1 || currentBinding[0] != bound[0] {
+			if len(currentFolder.Peers) != 1 || currentFolder.Peers[0] != boundPeer {
 				return fmt.Errorf("folder %q binding changed during resumed join", name)
 			}
 			validated = true
@@ -121,10 +121,6 @@ func Join(args []string, stderr io.Writer) (exitCode int) {
 			return joinExitError
 		}
 		return joinExitOK
-	}
-	if peers := cfg.Bindings[name]; len(peers) != 0 {
-		fmt.Fprintf(stderr, "l2sync: folder %q is already bound to peer %q\n", name, peers[0])
-		return joinExitError
 	}
 	peerName, endpoint, err := joinFindProvider(context.Background(), cfg, name)
 	if err != nil {
@@ -183,8 +179,8 @@ func prepareJoinMarker(path, name string) (bool, error) {
 func commitJoinedFolder(name, path, peerName string, expectedPeer config.Peer) (installed bool, err error) {
 	err = withConfigLocked(context.Background(), func(current *config.Config) error {
 		peer, exists := current.Peers[peerName]
-		if !exists || peer.Status != config.PeerActive {
-			return fmt.Errorf("peer %q is not active for binding", peerName)
+		if !exists || peer.PublicKey == "" {
+			return fmt.Errorf("peer %q has no configured public key for binding", peerName)
 		}
 		if peer != expectedPeer {
 			return fmt.Errorf("peer %q connection identity changed during join", peerName)
@@ -192,15 +188,15 @@ func commitJoinedFolder(name, path, peerName string, expectedPeer config.Peer) (
 		if _, exists := current.Shared[name]; exists {
 			return fmt.Errorf("folder %q already exists as shared", name)
 		}
-		if existing, exists := current.Remote[name]; exists && existing != path {
-			return fmt.Errorf("folder %q is already registered at %q", name, existing)
+		existing, remoteExists := current.Remote[name]
+		if remoteExists && existing.Path != path {
+			return fmt.Errorf("folder %q is already registered at %q", name, existing.Path)
 		}
-		bound := current.Bindings[name]
+		bound := existing.Peers
 		boundToOtherPeer := len(bound) != 0 && (len(bound) != 1 || bound[0] != peerName)
 		if boundToOtherPeer {
 			return fmt.Errorf("folder %q is already bound to another peer", name)
 		}
-		_, remoteExists := current.Remote[name]
 		missingMatchingBinding := remoteExists && (len(bound) != 1 || bound[0] != peerName)
 		if missingMatchingBinding {
 			return fmt.Errorf("existing remote folder %q has no matching peer binding", name)
@@ -209,9 +205,8 @@ func commitJoinedFolder(name, path, peerName string, expectedPeer config.Peer) (
 		if err != nil {
 			return fmt.Errorf("write folder marker: %w", err)
 		}
-		if _, exists := current.Remote[name]; !exists {
-			current.Remote[name] = path
-			current.Bindings[name] = []string{peerName}
+		if !remoteExists {
+			current.Remote[name] = config.Folder{Path: path, Peers: []string{peerName}}
 		}
 		saveErr := saveConfig(*current)
 		installed = saveErr == nil || config.WasInstalled(saveErr)

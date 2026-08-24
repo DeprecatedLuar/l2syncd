@@ -17,9 +17,9 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
 
 	want := New()
-	want.Peers["phone"] = Peer{Address: "phone", Status: PeerPending}
-	want.Shared["notes"] = "/tmp/notes"
-	want.Remote["photos"] = "/tmp/photos"
+	want.Peers["phone"] = Peer{Address: "phone"}
+	want.Shared["notes"] = Folder{Path: "/tmp/notes", Peers: []string{"phone"}}
+	want.Remote["photos"] = Folder{Path: "/tmp/photos"}
 	if err := Save(want); err != nil {
 		t.Fatalf("Save() error = %v", err)
 	}
@@ -85,39 +85,11 @@ func TestResolvePeerAddressFallsBackToRawAddress(t *testing.T) {
 	}
 }
 
-func TestLoadLegacyPeerAsPendingWithoutRewrite(t *testing.T) {
-	root := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", root)
-	path, err := Path()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	original := []byte("[peers]\nphone = \"phone\"\n")
-	if err := os.WriteFile(path, original, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := Load()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := cfg.Peers["phone"]; got.Address != "phone" || got.Status != PeerPending || got.PublicKey != "" {
-		t.Fatalf("legacy peer = %#v", got)
-	}
-	contents, err := os.ReadFile(path)
-	if err != nil || string(contents) != string(original) {
-		t.Fatalf("config rewritten = %q, %v", contents, err)
-	}
-}
-
 func TestLoadRejectsMalformedStructuredPeers(t *testing.T) {
 	for name, document := range map[string]string{
-		"missing status":        "[peers.phone]\naddress = \"phone\"\n",
-		"wrong address type":    "[peers.phone]\naddress = 7\nstatus = \"pending\"\n",
-		"wrong public key type": "[peers.phone]\naddress = \"phone\"\nstatus = \"pending\"\npublic_key = 7\n",
-		"unknown field":         "[peers.phone]\naddress = \"phone\"\nstatus = \"pending\"\nfingerprint = \"derived\"\n",
+		"wrong address type":    "[peers.phone]\naddress = 7\n",
+		"wrong public key type": "[peers.phone]\naddress = \"phone\"\npublic_key = 7\n",
+		"unknown field":         "[peers.phone]\naddress = \"phone\"\nfingerprint = \"derived\"\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			root := t.TempDir()
@@ -139,7 +111,7 @@ func TestLoadRejectsMalformedStructuredPeers(t *testing.T) {
 	}
 }
 
-func TestLoadMixedLegacyAndStructuredPeers(t *testing.T) {
+func TestLoadRejectsUnknownFolderField(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", root)
 	path, err := Path()
@@ -149,16 +121,41 @@ func TestLoadMixedLegacyAndStructuredPeers(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	document := "[peers]\nlegacy = \"legacy-host\"\n[peers.phone]\naddress = \"phone\"\nstatus = \"pending\"\n"
+	document := "[shared.notes]\npath = \"/tmp/notes\"\nrole = \"origin\"\n"
 	if err := os.WriteFile(path, []byte(document), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := Load()
-	if err != nil {
-		t.Fatal(err)
+	if _, err := Load(); err == nil {
+		t.Fatalf("Load accepted %s", document)
 	}
-	if cfg.Peers["legacy"].Status != PeerPending || cfg.Peers["phone"].Address != "phone" {
-		t.Fatalf("mixed peers = %#v", cfg.Peers)
+}
+
+func TestSaveLoadRoundTripPreservesUnboundSharedFolder(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+
+	want := New()
+	want.Shared["notes"] = Folder{Path: "/tmp/notes"}
+	if err := Save(want); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	got, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if folder := got.Shared["notes"]; folder.Path != "/tmp/notes" || len(folder.Peers) != 0 {
+		t.Fatalf("unbound shared folder = %#v", folder)
+	}
+}
+
+func TestEqualDetectsBindingChange(t *testing.T) {
+	left := New()
+	left.Shared["notes"] = Folder{Path: "/tmp/notes", Peers: []string{"phone"}}
+	right := New()
+	right.Shared["notes"] = Folder{Path: "/tmp/notes"}
+	if Equal(left, right) {
+		t.Fatal("Equal() = true for configs differing only in folder binding")
 	}
 }
 

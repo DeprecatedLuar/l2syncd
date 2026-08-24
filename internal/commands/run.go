@@ -18,6 +18,7 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 	"l2syncd/internal/config"
+	"l2syncd/internal/guard"
 	"l2syncd/internal/lock"
 	"l2syncd/internal/preflight"
 	"l2syncd/internal/state"
@@ -157,6 +158,9 @@ func Run(args []string, stderr io.Writer) (exitCode int) {
 				logger.Error("filesystem watcher event stream closed")
 				return runExitError
 			}
+			// Every "marked tree dirty" log below is a deliberate, temporary
+			// diagnostic for an unresolved question about peer-originated
+			// writes reaching this watcher; it is not permanent behavior.
 			if filepath.Clean(event.Name) == filepath.Clean(configPath) && event.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Remove|fsnotify.Rename) != 0 {
 				latest, loadErr := preflight.LoadConfig()
 				if loadErr != nil {
@@ -173,11 +177,13 @@ func Run(args []string, stderr io.Writer) (exitCode int) {
 				if !cycleChanged {
 					continue
 				}
+				logger.Info("filesystem event marked tree dirty", "path", event.Name, "op", event.Op.String())
 				dirty = true
 				resetTimer(debounce, runDebounce)
 				continue
 			}
-			if event.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Remove|fsnotify.Rename) != 0 {
+			if eventMarksDirty(event, configPath) {
+				logger.Info("filesystem event marked tree dirty", "path", event.Name, "op", event.Op.String())
 				dirty = true
 				resetTimer(debounce, runDebounce)
 			}
@@ -224,13 +230,18 @@ func Run(args []string, stderr io.Writer) (exitCode int) {
 	}
 }
 
+// sameCycleConfiguration compares only the bindings that decide whether a
+// cycle runs (folder path changes are handled separately by
+// sameWatchRoots, which triggers a daemon restart).
 func sameCycleConfiguration(left, right config.Config) bool {
-	if len(left.Bindings) != len(right.Bindings) {
+	leftBindings := cycleBindings(left)
+	rightBindings := cycleBindings(right)
+	if len(leftBindings) != len(rightBindings) {
 		return false
 	}
 	boundPeers := make(map[string]struct{})
-	for name, peers := range left.Bindings {
-		other, exists := right.Bindings[name]
+	for name, peers := range leftBindings {
+		other, exists := rightBindings[name]
 		if !exists || len(peers) != len(other) {
 			return false
 		}
@@ -249,6 +260,21 @@ func sameCycleConfiguration(left, right config.Config) bool {
 		}
 	}
 	return true
+}
+
+func cycleBindings(cfg config.Config) map[string][]string {
+	bindings := make(map[string][]string)
+	for name, folder := range cfg.Shared {
+		if len(folder.Peers) != 0 {
+			bindings[name] = folder.Peers
+		}
+	}
+	for name, folder := range cfg.Remote {
+		if len(folder.Peers) != 0 {
+			bindings[name] = folder.Peers
+		}
+	}
+	return bindings
 }
 
 func sameWatchRoots(left, right []watchRoot) bool {
@@ -308,6 +334,9 @@ func addTree(watcher *fsnotify.Watcher, root string) error {
 		if !entry.IsDir() {
 			return nil
 		}
+		if path != root && guard.DefaultIgnore(entry.Name()) {
+			return filepath.SkipDir
+		}
 		if err := watcher.Add(path); err != nil {
 			return fmt.Errorf("watch directory %q: %w", path, err)
 		}
@@ -315,13 +344,28 @@ func addTree(watcher *fsnotify.Watcher, root string) error {
 	})
 }
 
+// eventMarksDirty reports whether a filesystem event should mark the sync
+// tree dirty and schedule a reconciliation cycle. It excludes events under
+// any ignored path component (internal trash and conflict artifacts,
+// notably) and config-directory temp files that are not the config file
+// itself.
+func eventMarksDirty(event fsnotify.Event, configPath string) bool {
+	if event.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Remove|fsnotify.Rename) == 0 {
+		return false
+	}
+	if filepath.Dir(event.Name) == filepath.Dir(configPath) && filepath.Clean(event.Name) != filepath.Clean(configPath) {
+		return false
+	}
+	return !guard.DefaultIgnorePath(event.Name)
+}
+
 func configuredWatchRoots(cfg config.Config) []watchRoot {
 	roots := make([]watchRoot, 0, len(cfg.Shared)+len(cfg.Remote))
-	for name, path := range cfg.Shared {
-		roots = append(roots, watchRoot{name: name, path: path})
+	for name, folder := range cfg.Shared {
+		roots = append(roots, watchRoot{name: name, path: folder.Path})
 	}
-	for name, path := range cfg.Remote {
-		roots = append(roots, watchRoot{name: name, path: path})
+	for name, folder := range cfg.Remote {
+		roots = append(roots, watchRoot{name: name, path: folder.Path})
 	}
 	sort.Slice(roots, func(left, right int) bool { return roots[left].name < roots[right].name })
 	return roots

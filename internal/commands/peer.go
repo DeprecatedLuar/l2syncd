@@ -17,36 +17,26 @@ func peerEndpoint(ctx context.Context, cfg config.Config, name string) (transpor
 	if !exists {
 		return transport.Endpoint{}, fmt.Errorf("peer %q not found", name)
 	}
-	if peer.Status == config.PeerPending {
-		endpoint, err := endpointForPeer(name, peer, func(publicKey string) error {
-			if peer.PublicKey != "" {
-				normalized, normalizeErr := connection.NormalizePublicKey(peer.PublicKey)
-				if normalizeErr != nil || normalized != publicKey {
-					return fmt.Errorf("peer %q public key differs from pending key", name)
-				}
-			}
-			if err := rejectDuplicatePeerKey(cfg, name, publicKey); err != nil {
-				return err
-			}
-			peer.PublicKey = publicKey
-			peer.Status = config.PeerActive
-			cfg.Peers[name] = peer
-			return storePeerLocked(name, peer)
-		})
-		if err != nil {
-			return transport.Endpoint{}, err
-		}
-		if err := connectionExchange(ctx, endpoint); err != nil {
-			return transport.Endpoint{}, fmt.Errorf("complete pending peer %q handshake: %w", name, err)
-		}
-		endpoint.PublicKey = peer.PublicKey
-		endpoint.AcceptPublicKey = nil
-		return endpoint, nil
+	if peer.PublicKey != "" {
+		return endpointForPeer(name, peer, nil)
 	}
-	if peer.Status != config.PeerActive || peer.PublicKey == "" {
-		return transport.Endpoint{}, fmt.Errorf("peer %q has incomplete credentials", name)
+	endpoint, err := endpointForPeer(name, peer, func(publicKey string) error {
+		if err := rejectDuplicatePeerKey(cfg, name, publicKey); err != nil {
+			return err
+		}
+		peer.PublicKey = publicKey
+		cfg.Peers[name] = peer
+		return storePeerLocked(name, peer)
+	})
+	if err != nil {
+		return transport.Endpoint{}, err
 	}
-	return endpointForPeer(name, peer, nil)
+	if err := connectionExchange(ctx, endpoint); err != nil {
+		return transport.Endpoint{}, fmt.Errorf("complete first contact with peer %q: %w", name, err)
+	}
+	endpoint.PublicKey = peer.PublicKey
+	endpoint.AcceptPublicKey = nil
+	return endpoint, nil
 }
 
 func endpointForPeer(name string, peer config.Peer, accept func(string) error) (transport.Endpoint, error) {

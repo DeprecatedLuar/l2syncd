@@ -10,7 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 	"syscall"
 	"time"
 
@@ -82,7 +81,7 @@ func ListFiles(root string, patterns []string) ([]ListedFile, error) {
 			}
 			return nil
 		}
-		if ignoredByDefault(relative) || ignore.Match(relative, entry.IsDir()) {
+		if guard.DefaultIgnorePath(relative) || ignore.Match(relative, entry.IsDir()) {
 			if entry.IsDir() {
 				return filepath.SkipDir
 			}
@@ -175,7 +174,7 @@ func DetectWithIgnore(root string, baseline state.Baseline, patterns []string) (
 			skipped = append(skipped, relative)
 			return nil
 		}
-		if ignoredByDefault(relative) || ignore.Match(relative, entry.IsDir()) {
+		if guard.DefaultIgnorePath(relative) || ignore.Match(relative, entry.IsDir()) {
 			if entry.IsDir() {
 				return filepath.SkipDir
 			}
@@ -238,7 +237,7 @@ func DetectWithIgnore(root string, baseline state.Baseline, patterns []string) (
 		return Result{}, fmt.Errorf("walk share %q: %w", root, err)
 	}
 	for path := range baseline.Files {
-		if ignoredByDefault(path) || ignore.Match(path, false) {
+		if guard.DefaultIgnorePath(path) || ignore.Match(path, false) {
 			continue
 		}
 		if _, found := snapshot.Files[path]; !found {
@@ -248,15 +247,6 @@ func DetectWithIgnore(root string, baseline state.Baseline, patterns []string) (
 	sort.Slice(changes, func(i, j int) bool { return changes[i].Path < changes[j].Path })
 	sort.Strings(skipped)
 	return Result{Changes: changes, Snapshot: snapshot, Skipped: skipped}, nil
-}
-
-func ignoredByDefault(relative string) bool {
-	for _, part := range strings.Split(relative, "/") {
-		if guard.DefaultIgnore(part) {
-			return true
-		}
-	}
-	return false
 }
 
 func openedFileState(file *os.File) (state.File, os.FileInfo, error) {

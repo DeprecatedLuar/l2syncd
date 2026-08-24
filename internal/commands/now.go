@@ -83,8 +83,7 @@ func RunCycle(ctx context.Context) (summary CycleSummary, err error) {
 		if !present {
 			continue
 		}
-		binding := cfg.Bindings[name]
-		if len(binding) != 1 {
+		if _, ok := cfg.BoundPeer(name); !ok {
 			return summary, fmt.Errorf("folder %q requires exactly one peer binding", name)
 		}
 		remoteIdentity, err := peerFingerprint(cfg.Peers[peerName])
@@ -124,21 +123,17 @@ func loadActiveCycleFolder(ctx context.Context, name string) (config.Config, str
 		if !contains(cycleFolderNames(cfg), name) {
 			return cfg, "", transport.Endpoint{}, false, nil
 		}
-		binding := cfg.Bindings[name]
-		if len(binding) != 1 {
+		peerName, ok := cfg.BoundPeer(name)
+		if !ok {
 			return config.Config{}, "", transport.Endpoint{}, false, fmt.Errorf("folder %q requires exactly one peer binding", name)
 		}
-		peerName := binding[0]
 		peer := cfg.Peers[peerName]
 		endpoint, err := peerEndpoint(ctx, cfg, peerName)
 		if err != nil {
 			return config.Config{}, "", transport.Endpoint{}, false, err
 		}
-		if peer.Status == config.PeerPending {
+		if peer.PublicKey == "" {
 			continue
-		}
-		if peer.Status != config.PeerActive {
-			return config.Config{}, "", transport.Endpoint{}, false, fmt.Errorf("peer %q is not active", peerName)
 		}
 		return cfg, peerName, endpoint, true, nil
 	}
@@ -147,8 +142,8 @@ func loadActiveCycleFolder(ctx context.Context, name string) (config.Config, str
 
 func cycleFolderNames(cfg config.Config) []string {
 	names := make(map[string]struct{})
-	for name := range cfg.Shared {
-		if len(cfg.Bindings[name]) == 1 {
+	for name, folder := range cfg.Shared {
+		if len(folder.Peers) == 1 {
 			names[name] = struct{}{}
 		}
 	}
@@ -182,13 +177,12 @@ func runInitiatorFolderCycle(ctx context.Context, name, expectedPeer, authentica
 	if err != nil {
 		return 0, err
 	}
-	binding := cfg.Bindings[name]
-	if len(binding) != 1 || binding[0] != expectedPeer {
+	if bound, ok := cfg.BoundPeer(name); !ok || bound != expectedPeer {
 		return 0, fmt.Errorf("folder %q is not bound to authenticated peer %q", name, expectedPeer)
 	}
 	configured, exists := cfg.Peers[expectedPeer]
-	if !exists || configured.Status != config.PeerActive {
-		return 0, fmt.Errorf("peer %q is not active", expectedPeer)
+	if !exists || configured.PublicKey == "" {
+		return 0, fmt.Errorf("peer %q has no configured public key", expectedPeer)
 	}
 	if err := requireAuthenticatedFingerprint(configured, authenticatedFingerprint); err != nil {
 		return 0, fmt.Errorf("peer %q authorization changed: %w", expectedPeer, err)
@@ -212,14 +206,14 @@ func runInitiatorFolderCycle(ctx context.Context, name, expectedPeer, authentica
 }
 
 func planBoundFolder(ctx context.Context, cfg config.Config, name, expectedPeer string) (int, error) {
-	if path, exists := cfg.Shared[name]; exists {
+	if folder, exists := cfg.Shared[name]; exists {
 		peer, endpoint, err := findPeerForShared(ctx, cfg, name)
 		if err != nil {
 			return 0, err
 		}
-		return planFolder(ctx, cfg, name, path, peer, endpoint)
+		return planFolder(ctx, cfg, name, folder.Path, peer, endpoint)
 	}
-	path, exists := cfg.Remote[name]
+	folder, exists := cfg.Remote[name]
 	if !exists {
 		return 0, fmt.Errorf("folder %q is not registered", name)
 	}
@@ -227,7 +221,7 @@ func planBoundFolder(ctx context.Context, cfg config.Config, name, expectedPeer 
 	if err != nil {
 		return 0, err
 	}
-	return planFolder(ctx, cfg, name, path, provider, endpoint)
+	return planFolder(ctx, cfg, name, folder.Path, provider, endpoint)
 }
 
 func planFolder(ctx context.Context, cfg config.Config, name, path, peer string, endpoint transport.Endpoint) (int, error) {
@@ -384,11 +378,10 @@ func applyDirectoryDelete(ctx context.Context, action engine.Action, share, root
 }
 
 func findPeerForShared(ctx context.Context, cfg config.Config, name string) (string, transport.Endpoint, error) {
-	peers := cfg.Bindings[name]
-	if len(peers) != 1 {
+	peer, ok := cfg.BoundPeer(name)
+	if !ok {
 		return "", transport.Endpoint{}, fmt.Errorf("shared folder %q requires exactly one peer binding", name)
 	}
-	peer := peers[0]
 	endpoint, err := peerEndpoint(ctx, cfg, peer)
 	if err != nil {
 		return "", transport.Endpoint{}, err
@@ -532,8 +525,8 @@ func findProvider(ctx context.Context, cfg config.Config, name string) (string, 
 	providers := make([]string, 0, 1)
 	endpoints := make(map[string]transport.Endpoint)
 	peerNames := sortedKeys(cfg.Peers)
-	if binding := cfg.Bindings[name]; len(binding) == 1 {
-		peerNames = binding
+	if bound, ok := cfg.BoundPeer(name); ok {
+		peerNames = []string{bound}
 	}
 	for _, peerName := range peerNames {
 		endpoint, err := peerEndpoint(ctx, cfg, peerName)

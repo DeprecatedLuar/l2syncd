@@ -46,7 +46,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return commands.Join(args[1:], stderr)
 	case "serve":
 		return commands.Serve(args[1:], os.Stdin, stdout, stderr)
-	case "connection":
+	case "connection", "connections":
 		return commands.Connection(args[1:], stdout, stderr)
 	case "status":
 		return commands.Status(stdout, stderr)

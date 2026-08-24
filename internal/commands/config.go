@@ -3,6 +3,7 @@
 package commands
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"fmt"
@@ -10,36 +11,38 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 
 	"l2syncd/internal/config"
 	"l2syncd/internal/preflight"
 )
 
 const (
-	configEditExitOK    = 0
-	configEditExitError = 1
-	configEditFileMode  = 0o600
-	defaultEditor       = "vi"
-	defaultConfig       = `# l2sync configuration
+	configEditExitOK          = 0
+	configEditExitError       = 1
+	configEditFileMode        = 0o600
+	defaultEditor             = "vi"
+	reopenEditorPrompt        = "reopen editor to fix? [Y/n] "
+	reopenEditorAnswerYPrefix = "y"
+	editPreservedMessage      = "l2sync: edit preserved at %s\n"
+	defaultConfig             = `# l2sync configuration
 #
 # Addresses may refer to an alias in ~/.ssh/config or be a raw SSH address.
 # Remove the leading '#' from an example section and customize its values.
 
 # [peers.example]
 # address = "example-host"
-# status = "pending"
 # public_key = "ssh-ed25519 AAAA..."
 
-# [bindings]
-# example = ["peer-name"]
-
 # Folders offered to peers.
-# [shared]
-# example = "/path/to/share"
+# [shared.example]
+# path = "/path/to/share"
+# peers = ["peer-name"]
 
 # Folders consumed from a peer.
-# [remote]
-# example = "/path/to/local/folder"
+# [remote.example]
+# path = "/path/to/local/folder"
+# peers = ["peer-name"]
 `
 )
 
@@ -66,7 +69,12 @@ func ConfigEdit(args []string, stderr io.Writer) int {
 		return configEditExitError
 	}
 	editPath := editFile.Name()
-	defer os.Remove(editPath)
+	keepEditedFile := false
+	defer func() {
+		if !keepEditedFile {
+			os.Remove(editPath)
+		}
+	}()
 	if err := editFile.Chmod(configEditFileMode); err != nil {
 		editFile.Close()
 		fmt.Fprintf(stderr, "l2sync: secure editable config snapshot: %v\n", err)
@@ -89,19 +97,33 @@ func ConfigEdit(args []string, stderr io.Writer) int {
 	if editor == "" {
 		editor = defaultEditor
 	}
-	command := exec.Command("sh", "-c", editor+" \"$1\"", "l2sync", editPath)
-	command.Stdin = os.Stdin
-	command.Stdout = os.Stdout
-	command.Stderr = os.Stderr
-	if err := command.Run(); err != nil {
-		fmt.Fprintf(stderr, "l2sync: open config in editor: %v\n", err)
-		return configEditExitError
-	}
-	if cfg, loadErr := config.LoadFile(editPath); loadErr != nil {
-		fmt.Fprintf(stderr, "l2sync: edited config is invalid: %v\n", loadErr)
-		return configEditExitError
-	} else if checkErr := preflight.Validate(cfg); checkErr != nil {
-		fmt.Fprintf(stderr, "l2sync: edited config is invalid: %v\n", checkErr)
+	for {
+		command := exec.Command("sh", "-c", editor+" \"$1\"", "l2sync", editPath)
+		command.Stdin = os.Stdin
+		command.Stdout = os.Stdout
+		command.Stderr = os.Stderr
+		if err := command.Run(); err != nil {
+			fmt.Fprintf(stderr, "l2sync: open config in editor: %v\n", err)
+			return configEditExitError
+		}
+
+		validateErr := error(nil)
+		cfg, loadErr := config.LoadFile(editPath)
+		if loadErr != nil {
+			validateErr = loadErr
+		} else {
+			validateErr = preflight.Validate(cfg)
+		}
+		if validateErr == nil {
+			break
+		}
+
+		fmt.Fprintf(stderr, "l2sync: edited config is invalid: %v\n", validateErr)
+		if promptReopenEditor(stderr) {
+			continue
+		}
+		keepEditedFile = true
+		fmt.Fprintf(stderr, editPreservedMessage, editPath)
 		return configEditExitError
 	}
 	edited, err := os.ReadFile(editPath)
@@ -116,11 +138,31 @@ func ConfigEdit(args []string, stderr io.Writer) int {
 	return configEditExitOK
 }
 
+// promptReopenEditor asks whether to reopen the editor after an invalid
+// edit. It never prompts when stdin is not a terminal: a non-interactive
+// invocation has no one to answer, so looping would hang it instead of
+// returning control to the caller.
+func promptReopenEditor(stderr io.Writer) bool {
+	info, statErr := os.Stdin.Stat()
+	if statErr != nil || info.Mode()&os.ModeCharDevice == 0 {
+		return false
+	}
+	fmt.Fprint(stderr, reopenEditorPrompt)
+	line, readErr := bufio.NewReader(os.Stdin).ReadString('\n')
+	answer := strings.TrimSpace(line)
+	// A closed or exhausted stdin cannot answer. Treating that as consent
+	// would reopen the editor forever with nobody able to decline.
+	if readErr != nil && answer == "" {
+		return false
+	}
+	return answer == "" || strings.HasPrefix(strings.ToLower(answer), reopenEditorAnswerYPrefix)
+}
+
 func snapshotConfigForEdit(path string) (contents []byte, err error) {
 	if err := ensureConfigFile(path); err != nil {
 		return nil, err
 	}
-	err = withConfigLocked(context.Background(), func(*config.Config) error {
+	err = withConfigFileLocked(context.Background(), func() error {
 		var readErr error
 		contents, readErr = os.ReadFile(path)
 		return readErr
@@ -129,7 +171,7 @@ func snapshotConfigForEdit(path string) (contents []byte, err error) {
 }
 
 func installEditedConfig(path string, original, edited []byte) (err error) {
-	return withConfigLocked(context.Background(), func(*config.Config) error {
+	return withConfigFileLocked(context.Background(), func() error {
 		current, err := os.ReadFile(path)
 		if err != nil {
 			return fmt.Errorf("read current config: %w", err)

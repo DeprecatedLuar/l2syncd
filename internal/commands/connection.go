@@ -3,7 +3,7 @@
 package commands
 
 import (
-	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -12,8 +12,12 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"sort"
 	"strings"
+	"text/tabwriter"
 	"unicode"
+
+	"golang.org/x/term"
 
 	"l2syncd/internal/config"
 	connectionpkg "l2syncd/internal/connection"
@@ -28,19 +32,39 @@ const (
 	connectionBinary    = "l2sync"
 )
 
-var (
-	connectionProbe    = probeExistingAccess
-	connectionInstall  = installRemoteGrant
-	connectionExchange = transport.Exchange
-	connectionConfirm  = confirmInstall
-	loginShell         = currentLoginShell
+const (
+	connectionStatusPending   = "~"
+	connectionStatusHealthy   = "+"
+	connectionStatusRevoked   = "x"
+	connectionStatusUnhealthy = "-"
+
+	ansiDim   = "\x1b[2m"
+	ansiBlue  = "\x1b[38;2;138;180;248m"
+	ansiReset = "\x1b[0m"
 )
 
-// Connection dispatches peer credential management commands.
+// connectionStatusRank orders connection ls rows: pending first, then
+// healthy, then revoked, then unhealthy.
+var connectionStatusRank = map[string]int{
+	connectionStatusPending:   0,
+	connectionStatusHealthy:   1,
+	connectionStatusRevoked:   2,
+	connectionStatusUnhealthy: 3,
+}
+
+var (
+	connectionProbe      = probeExistingAccess
+	connectionInstall    = installRemoteGrant
+	connectionExchange   = transport.Exchange
+	connectionListShares = transport.ListShares
+	loginShell           = currentLoginShell
+)
+
+// Connection dispatches peer credential management commands. With no
+// subcommand it defaults to listing, same as "connection ls".
 func Connection(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
-		fmt.Fprintln(stderr, "usage: l2sync connection <add|ls|rm|edit>")
-		return connectionExitError
+		return connectionList(nil, stdout, stderr)
 	}
 	switch args[0] {
 	case "add":
@@ -69,15 +93,11 @@ func connectionAdd(args []string, stdin io.Reader, stdout, stderr io.Writer) int
 		return connectionExitError
 	}
 	if existing, found := cfg.Peers[name]; found {
-		if existing.Status == config.PeerRevoked {
-			fmt.Fprintf(stderr, "l2sync: peer %q removal is incomplete; retry connection rm before re-adding\n", name)
-			return connectionExitError
-		}
 		if existing.Address != address || suppliedKey != "" && existing.PublicKey != "" && existing.PublicKey != suppliedKey {
 			fmt.Fprintf(stderr, "l2sync: peer %q already exists with different connection data\n", name)
 			return connectionExitError
 		}
-		if suppliedKey == "" && existing.Status == config.PeerActive {
+		if suppliedKey == "" && existing.PublicKey != "" {
 			if err := storePeerLocked(name, existing); err != nil {
 				fmt.Fprintf(stderr, "l2sync: verify active peer: %v\n", err)
 				return connectionExitError
@@ -98,11 +118,7 @@ func connectionAdd(args []string, stdin io.Reader, stdout, stderr io.Writer) int
 			fmt.Fprintln(stderr, "l2sync: peer public key is this installation's key")
 			return connectionExitError
 		}
-		status := config.PeerPending
-		if existing, exists := cfg.Peers[name]; exists && existing.Status == config.PeerActive {
-			status = config.PeerActive
-		}
-		cfg.Peers[name] = config.Peer{Address: address, Status: status, PublicKey: suppliedKey}
+		cfg.Peers[name] = config.Peer{Address: address, PublicKey: suppliedKey}
 		if err := storePeerLocked(name, cfg.Peers[name]); err != nil {
 			fmt.Fprintf(stderr, "l2sync: save pending peer: %v\n", err)
 			return connectionExitError
@@ -128,25 +144,20 @@ func connectionAdd(args []string, stdin io.Reader, stdout, stderr io.Writer) int
 	}
 	available := connectionProbe(context.Background(), resolved) == nil
 	if !available {
-		cfg.Peers[name] = config.Peer{Address: address, Status: config.PeerPending}
+		cfg.Peers[name] = config.Peer{Address: address}
 		if err := storePeerLocked(name, cfg.Peers[name]); err != nil {
 			fmt.Fprintf(stderr, "l2sync: save pending peer: %v\n", err)
 			return connectionExitError
 		}
 		localName, localAddress := installationAddress()
-		fmt.Fprintf(stdout, "No existing SSH access to %s.\nSend this to whoever runs that machine:\n\n  l2sync connection add %s %s --key %q\n\nPeer %q saved as pending.\n", resolved, localName, localAddress, localKey, name)
+		command := fmt.Sprintf("l2sync connection add %s %s --key %q", localName, localAddress, localKey)
+		if isTerminalWriter(stdout) {
+			command = ansiBlue + command + ansiReset
+		}
+		fmt.Fprintf(stdout, "%s isn't reachable via SSH yet. Have someone run this there:\n\n  %s\n\n", resolved, command)
 		return connectionExitOK
 	}
-	confirmed, err := connectionConfirm(stdin, stdout, name)
-	if err != nil {
-		fmt.Fprintf(stderr, "l2sync: read confirmation: %v\n", err)
-		return connectionExitError
-	}
-	if !confirmed {
-		fmt.Fprintln(stderr, "l2sync: key installation cancelled")
-		return connectionExitError
-	}
-	peer := config.Peer{Address: address, Status: config.PeerPending}
+	peer := config.Peer{Address: address}
 	cfg.Peers[name] = peer
 	if err := storePeerLocked(name, peer); err != nil {
 		fmt.Fprintf(stderr, "l2sync: save pending peer: %v\n", err)
@@ -162,7 +173,6 @@ func connectionAdd(args []string, stdin io.Reader, stdout, stderr io.Writer) int
 			return err
 		}
 		peer.PublicKey = publicKey
-		peer.Status = config.PeerActive
 		cfg.Peers[name] = peer
 		return storePeerLocked(name, peer)
 	})
@@ -201,17 +211,14 @@ func storePeerLocked(name string, peer config.Peer) error {
 			return err
 		}
 		if existing, exists := current.Peers[name]; exists {
-			if existing.Status == config.PeerRevoked {
-				return fmt.Errorf("peer %q is revoked", name)
-			}
 			if existing.Address != peer.Address {
 				return fmt.Errorf("peer %q address changed concurrently", name)
 			}
 			if existing.PublicKey != "" && peer.PublicKey != "" && existing.PublicKey != peer.PublicKey {
 				return fmt.Errorf("peer %q public key changed concurrently", name)
 			}
-			if existing.Status == config.PeerActive && peer.Status != config.PeerActive {
-				return fmt.Errorf("peer %q cannot transition from active to %s", name, peer.Status)
+			if existing.PublicKey != "" && peer.PublicKey == "" {
+				return fmt.Errorf("peer %q cannot lose its pinned public key", name)
 			}
 		}
 		current.Peers[name] = peer
@@ -229,12 +236,68 @@ func connectionList(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "l2sync: %v\n", err)
 		return connectionExitError
 	}
-	names := sortedKeys(cfg.Peers)
-	for _, name := range names {
+
+	type row struct {
+		name, symbol string
+		peer         config.Peer
+	}
+	rows := make([]row, 0, len(cfg.Peers))
+	for _, name := range sortedKeys(cfg.Peers) {
 		peer := cfg.Peers[name]
-		fmt.Fprintf(stdout, "%s\t%s\t%s\n", name, peer.Status, peer.Address)
+		rows = append(rows, row{name: name, symbol: connectionStatusSymbol(cfg, name, peer), peer: peer})
+	}
+	if len(rows) == 0 {
+		return connectionExitOK
+	}
+	sort.SliceStable(rows, func(i, j int) bool {
+		return connectionStatusRank[rows[i].symbol] < connectionStatusRank[rows[j].symbol]
+	})
+
+	var buffer bytes.Buffer
+	writer := tabwriter.NewWriter(&buffer, 0, 4, 2, ' ', 0)
+	for _, r := range rows {
+		fmt.Fprintf(writer, "%s %s\t%s\n", r.symbol, r.name, r.peer.Address)
+	}
+	writer.Flush()
+
+	dim := isTerminalWriter(stdout)
+	for i, line := range strings.Split(strings.TrimSuffix(buffer.String(), "\n"), "\n") {
+		if dim && (rows[i].symbol == connectionStatusUnhealthy || rows[i].symbol == connectionStatusRevoked) {
+			line = ansiDim + line + ansiReset
+		}
+		fmt.Fprintln(stdout, line)
 	}
 	return connectionExitOK
+}
+
+// isTerminalWriter reports whether writer is a terminal, so ANSI styling is
+// only emitted for interactive output and not for redirected/piped output.
+func isTerminalWriter(writer io.Writer) bool {
+	file, ok := writer.(*os.File)
+	return ok && term.IsTerminal(int(file.Fd()))
+}
+
+// connectionStatusSymbol reports a peer's connection state: a peer with no
+// pinned key is never probed (that could silently trigger a first-contact
+// handshake mid-listing) and reported pending; a pinned peer is live-checked
+// by requesting its share list — an SSH public-key rejection is reported as
+// revoked (the peer very likely ran "connection rm" on us) rather than
+// merely unreachable.
+func connectionStatusSymbol(cfg config.Config, name string, peer config.Peer) string {
+	if peer.PublicKey == "" {
+		return connectionStatusPending
+	}
+	endpoint, err := peerEndpoint(context.Background(), cfg, name)
+	if err != nil {
+		return connectionStatusUnhealthy
+	}
+	if _, err := connectionListShares(context.Background(), endpoint); err != nil {
+		if transport.IsAuthError(err) {
+			return connectionStatusRevoked
+		}
+		return connectionStatusUnhealthy
+	}
+	return connectionStatusHealthy
 }
 
 func connectionRemove(args []string, stderr io.Writer) int {
@@ -253,63 +316,53 @@ func connectionRemove(args []string, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "l2sync: peer %q not found\n", name)
 		return connectionExitError
 	}
-	for folder, peers := range cfg.Bindings {
-		if len(peers) == 1 && peers[0] == name {
-			fmt.Fprintf(stderr, "l2sync: peer %q is still bound to folder %q\n", name, folder)
+	if folder, bound := boundFolder(cfg, name); bound {
+		fmt.Fprintf(stderr, "l2sync: peer %q is still bound to folder %q\n", name, folder)
+		return connectionExitError
+	}
+	if peer.PublicKey != "" {
+		paths, err := connectionpkg.DefaultPaths()
+		if err != nil {
+			fmt.Fprintf(stderr, "l2sync: resolve authorized_keys: %v\n", err)
+			return connectionExitError
+		}
+		if err := connectionpkg.RemoveGrant(paths.AuthorizedKeys, name, peer.PublicKey); err != nil {
+			fmt.Fprintf(stderr, "l2sync: remove restricted grant: %v; retry connection rm\n", err)
 			return connectionExitError
 		}
 	}
 	if err := updateConfigLocked(func(current *config.Config) error {
 		latest, exists := current.Peers[name]
 		if !exists {
-			return fmt.Errorf("peer %q was removed concurrently", name)
+			return nil
 		}
 		if latest.PublicKey != peer.PublicKey || latest.Address != peer.Address {
 			return fmt.Errorf("peer %q changed during removal", name)
 		}
-		for folder, peers := range current.Bindings {
-			if len(peers) == 1 && peers[0] == name {
-				return fmt.Errorf("peer %q is still bound to folder %q", name, folder)
-			}
-		}
-		latest.Status = config.PeerRevoked
-		current.Peers[name] = latest
-		return nil
-	}); err != nil {
-		fmt.Fprintf(stderr, "l2sync: revoke peer entry: %v\n", err)
-		return connectionExitError
-	}
-	paths, err := connectionpkg.DefaultPaths()
-	if err != nil {
-		fmt.Fprintf(stderr, "l2sync: peer revoked, but resolve authorized_keys: %v\n", err)
-		return connectionExitError
-	}
-	if peer.PublicKey == "" {
-		return removeRevokedPeer(name, peer, stderr)
-	}
-	if err := connectionpkg.RemoveGrant(paths.AuthorizedKeys, name, peer.PublicKey); err != nil {
-		fmt.Fprintf(stderr, "l2sync: peer revoked, but remove restricted grant: %v; retry connection rm\n", err)
-		return connectionExitError
-	}
-	return removeRevokedPeer(name, peer, stderr)
-}
-
-func removeRevokedPeer(name string, peer config.Peer, stderr io.Writer) int {
-	if err := updateConfigLocked(func(current *config.Config) error {
-		latest, exists := current.Peers[name]
-		if !exists {
-			return nil
-		}
-		if latest.Status != config.PeerRevoked || latest.PublicKey != peer.PublicKey || latest.Address != peer.Address {
-			return fmt.Errorf("peer %q changed after revocation", name)
+		if folder, bound := boundFolder(*current, name); bound {
+			return fmt.Errorf("peer %q is still bound to folder %q", name, folder)
 		}
 		delete(current.Peers, name)
 		return nil
 	}); err != nil {
-		fmt.Fprintf(stderr, "l2sync: restricted grant removed, but remove revoked peer entry: %v\n", err)
+		fmt.Fprintf(stderr, "l2sync: restricted grant removed, but remove peer entry: %v\n", err)
 		return connectionExitError
 	}
 	return connectionExitOK
+}
+
+func boundFolder(cfg config.Config, peerName string) (string, bool) {
+	for name, folder := range cfg.Shared {
+		if len(folder.Peers) == 1 && folder.Peers[0] == peerName {
+			return name, true
+		}
+	}
+	for name, folder := range cfg.Remote {
+		if len(folder.Peers) == 1 && folder.Peers[0] == peerName {
+			return name, true
+		}
+	}
+	return "", false
 }
 
 func parseConnectionAdd(args []string, stdin io.Reader) (string, string, string, error) {
@@ -398,16 +451,6 @@ func installRemoteGrant(ctx context.Context, destination, localName, localAddres
 		return fmt.Errorf("remote connection add: %w: %s", err, strings.TrimSpace(string(output)))
 	}
 	return nil
-}
-
-func confirmInstall(input io.Reader, output io.Writer, name string) (bool, error) {
-	fmt.Fprintf(output, "Install l2sync sync key on %s? [y/N] ", name)
-	line, err := bufio.NewReader(input).ReadString('\n')
-	if err != nil && !errors.Is(err, io.EOF) {
-		return false, err
-	}
-	line = strings.ToLower(strings.TrimSpace(line))
-	return line == "y" || line == "yes", nil
 }
 
 func installationAddress() (string, string) {

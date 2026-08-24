@@ -80,3 +80,15 @@ func DefaultIgnore(name string) bool {
 		return strings.HasSuffix(name, ".swp") || strings.HasPrefix(name, ".#") || strings.Contains(name, ".l2sync-conflict-")
 	}
 }
+
+// DefaultIgnorePath reports whether any component of a slash-separated path is
+// always ignored. The scan layer and the watch layer share this predicate so a
+// path the scanner skips can never mark the tree dirty.
+func DefaultIgnorePath(path string) bool {
+	for part := range strings.SplitSeq(path, "/") {
+		if DefaultIgnore(part) {
+			return true
+		}
+	}
+	return false
+}

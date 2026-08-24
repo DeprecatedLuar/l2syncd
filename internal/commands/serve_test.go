@@ -31,8 +31,7 @@ func TestServeResolverRevalidatesMarkerForEveryOperation(t *testing.T) {
 	cfg := config.New()
 	phone, fingerprint := testPeerIdentity(t, "phone")
 	cfg.Peers["phone"] = phone
-	cfg.Shared["notes"] = root
-	cfg.Bindings["notes"] = []string{"phone"}
+	cfg.Shared["notes"] = config.Folder{Path: root, Peers: []string{"phone"}}
 	callbacks := serveCallbacks(newFolderResolver(cfg, "phone", fingerprint))
 	if _, err := callbacks.ListFiles("notes"); err != nil {
 		t.Fatal(err)
@@ -58,18 +57,21 @@ func TestServeAuthorizationUsesBindingForSharedAndRemote(t *testing.T) {
 			cfg.Peers["phone"] = phone
 			cfg.Peers["other"] = other
 			if registration == "shared" {
-				cfg.Shared["notes"] = root
+				cfg.Shared["notes"] = config.Folder{Path: root, Peers: []string{"phone"}}
 			} else {
-				cfg.Remote["notes"] = root
+				cfg.Remote["notes"] = config.Folder{Path: root, Peers: []string{"phone"}}
 			}
-			cfg.Bindings["notes"] = []string{"phone"}
 			if folder, err := newFolderResolver(cfg, "phone", phoneFingerprint)("notes"); err != nil || folder.root != root {
 				t.Fatalf("authorized folder = %#v, %v", folder, err)
 			}
 			if _, err := newFolderResolver(cfg, "other", otherFingerprint)("notes"); err == nil {
 				t.Fatal("wrong peer resolved bound folder")
 			}
-			delete(cfg.Bindings, "notes")
+			if registration == "shared" {
+				cfg.Shared["notes"] = config.Folder{Path: root}
+			} else {
+				cfg.Remote["notes"] = config.Folder{Path: root}
+			}
 			if _, err := newFolderResolver(cfg, "phone", phoneFingerprint)("notes"); err == nil {
 				t.Fatal("peer resolved unbound folder")
 			}
@@ -77,7 +79,7 @@ func TestServeAuthorizationUsesBindingForSharedAndRemote(t *testing.T) {
 	}
 }
 
-func TestReloadingResolverRejectsDelayedSessionAfterIdentityOrStatusChange(t *testing.T) {
+func TestReloadingResolverRejectsDelayedSessionAfterIdentityOrKeyRemoval(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("HOME", root)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
@@ -93,8 +95,7 @@ func TestReloadingResolverRejectsDelayedSessionAfterIdentityOrStatusChange(t *te
 	peer, authenticatedFingerprint := testPeerIdentity(t, "phone")
 	cfg := config.New()
 	cfg.Peers["phone"] = peer
-	cfg.Shared["notes"] = folder
-	cfg.Bindings["notes"] = []string{"phone"}
+	cfg.Shared["notes"] = config.Folder{Path: folder, Peers: []string{"phone"}}
 	if err := config.Save(cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -113,13 +114,13 @@ func TestReloadingResolverRejectsDelayedSessionAfterIdentityOrStatusChange(t *te
 		t.Fatalf("delayed old-key session authorization = %v", err)
 	}
 
-	peer.Status = config.PeerPending
+	peer.PublicKey = ""
 	cfg.Peers["phone"] = peer
 	if err := config.Save(cfg); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := resolve("notes"); err == nil || !strings.Contains(err.Error(), "not active") {
-		t.Fatalf("delayed pending session authorization = %v", err)
+	if _, err := resolve("notes"); err == nil || !strings.Contains(err.Error(), "no configured public key") {
+		t.Fatalf("delayed keyless session authorization = %v", err)
 	}
 }
 
@@ -139,7 +140,7 @@ func TestReloadingShareListerReflectsCurrentValidatedAuthorizationAndOffers(t *t
 		if err := guard.WriteMarker(folder, guard.Marker{Name: name}); err != nil {
 			t.Fatal(err)
 		}
-		cfg.Shared[name] = folder
+		cfg.Shared[name] = config.Folder{Path: folder}
 	}
 	if err := config.Save(cfg); err != nil {
 		t.Fatal(err)
@@ -164,13 +165,13 @@ func TestReloadingShareListerReflectsCurrentValidatedAuthorizationAndOffers(t *t
 	if _, err := list(); err == nil || !strings.Contains(err.Error(), "fingerprint") {
 		t.Fatalf("old-key discovery session = %v", err)
 	}
-	peer.Status = config.PeerPending
+	peer.PublicKey = ""
 	cfg.Peers["phone"] = peer
 	if err := config.Save(cfg); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := list(); err == nil || !strings.Contains(err.Error(), "not active") {
-		t.Fatalf("pending discovery session = %v", err)
+	if _, err := list(); err == nil || !strings.Contains(err.Error(), "no configured public key") {
+		t.Fatalf("keyless discovery session = %v", err)
 	}
 }
 
@@ -187,10 +188,9 @@ func TestBindShareRejectsMalformedExistingBinding(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := config.New()
-	cfg.Peers["phone"] = config.Peer{Address: "phone", Status: config.PeerActive, PublicKey: generatedPublicKey(t, filepath.Join(root, "phone-key"))}
-	cfg.Peers["other"] = config.Peer{Address: "other", Status: config.PeerActive, PublicKey: generatedPublicKey(t, filepath.Join(root, "other-key"))}
-	cfg.Shared["notes"] = folder
-	cfg.Bindings["notes"] = []string{"phone", "other"}
+	cfg.Peers["phone"] = config.Peer{Address: "phone", PublicKey: generatedPublicKey(t, filepath.Join(root, "phone-key"))}
+	cfg.Peers["other"] = config.Peer{Address: "other", PublicKey: generatedPublicKey(t, filepath.Join(root, "other-key"))}
+	cfg.Shared["notes"] = config.Folder{Path: folder, Peers: []string{"phone", "other"}}
 	if err := config.Save(cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -205,8 +205,39 @@ func TestBindShareRejectsMalformedExistingBinding(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := loaded.Bindings["notes"]; len(got) != 2 {
+	if got := loaded.Shared["notes"].Peers; len(got) != 2 {
 		t.Fatalf("binding after rejected bind = %#v", got)
+	}
+}
+
+// TestBindSharedFolderRefusesRemoteFolder guards the no-transitive-re-export
+// rule: bindSharedFolder must only ever bind a folder registered in Shared,
+// never one registered in Remote, now that both tables share one Folder
+// struct and Shared-membership is the only thing enforcing this.
+func TestBindSharedFolderRefusesRemoteFolder(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
+	folder := filepath.Join(root, "notes")
+	if err := os.Mkdir(folder, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := guard.WriteMarker(folder, guard.Marker{Name: "notes"}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.New()
+	cfg.Peers["phone"] = config.Peer{Address: "phone", PublicKey: generatedPublicKey(t, filepath.Join(root, "phone-key"))}
+	cfg.Remote["notes"] = config.Folder{Path: folder}
+	if err := config.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	fingerprint, err := connection.Fingerprint(cfg.Peers["phone"].PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := bindSharedFolder("phone", fingerprint, "notes"); err == nil {
+		t.Fatal("bindSharedFolder bound a remote (joined) folder")
 	}
 }
 
@@ -227,104 +258,22 @@ func TestServeRefusesUnknownForcedCommandPeer(t *testing.T) {
 	}
 }
 
-func TestServeRefusesUnknownPeerStatusBeforeProtocol(t *testing.T) {
+func TestServeRefusesPeerWithoutPublicKey(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("HOME", root)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
 	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
-	key := generatedPublicKey(t, filepath.Join(root, "peer"))
-	fingerprint, err := connection.Fingerprint(key)
-	if err != nil {
-		t.Fatal(err)
-	}
 	cfg := config.New()
-	cfg.Peers["phone"] = config.Peer{Address: "phone", Status: "corrupt", PublicKey: key}
+	cfg.Peers["phone"] = config.Peer{Address: "phone"}
 	if err := config.Save(cfg); err != nil {
 		t.Fatal(err)
 	}
 	var stderr bytes.Buffer
-	if code := Serve([]string{"--peer", "phone", "--fingerprint", fingerprint}, strings.NewReader(""), io.Discard, &stderr); code == serveExitOK {
-		t.Fatal("Serve accepted unknown peer status")
+	if code := Serve([]string{"--peer", "phone", "--fingerprint", strings.Repeat("0", 64)}, strings.NewReader(""), io.Discard, &stderr); code == serveExitOK {
+		t.Fatal("Serve accepted a peer with no configured public key")
 	}
-	if !strings.Contains(stderr.String(), "invalid status") {
+	if !strings.Contains(stderr.String(), "no configured public key") {
 		t.Fatalf("stderr = %q", stderr.String())
-	}
-}
-
-func TestRepeatedActiveHelloDoesNotRewriteConfig(t *testing.T) {
-	root := t.TempDir()
-	t.Setenv("HOME", root)
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
-	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
-	peer, _ := testPeerIdentity(t, "phone")
-	cfg := config.New()
-	cfg.Peers["phone"] = peer
-	if err := config.Save(cfg); err != nil {
-		t.Fatal(err)
-	}
-	originalSave := saveConfig
-	writes := 0
-	saveConfig = func(cfg config.Config) error {
-		writes++
-		return originalSave(cfg)
-	}
-	t.Cleanup(func() { saveConfig = originalSave })
-	for range 2 {
-		if err := activateServedPeer("phone", peer.PublicKey); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if writes != 0 {
-		t.Fatalf("repeated active hello config writes = %d", writes)
-	}
-}
-
-func TestPeerActivationProducesOneRelevantConfigTriggerThenQuiesces(t *testing.T) {
-	root := t.TempDir()
-	t.Setenv("HOME", root)
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
-	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
-	peer, _ := testPeerIdentity(t, "phone")
-	peer.Status = config.PeerPending
-	folder := filepath.Join(root, "notes")
-	if err := os.Mkdir(folder, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := guard.WriteMarker(folder, guard.Marker{Name: "notes"}); err != nil {
-		t.Fatal(err)
-	}
-	before := config.New()
-	before.Peers["phone"] = peer
-	before.Shared["notes"] = folder
-	before.Bindings["notes"] = []string{"phone"}
-	if err := config.Save(before); err != nil {
-		t.Fatal(err)
-	}
-	originalSave := saveConfig
-	writes := 0
-	saveConfig = func(cfg config.Config) error {
-		writes++
-		return originalSave(cfg)
-	}
-	t.Cleanup(func() { saveConfig = originalSave })
-	if err := activateServedPeer("phone", peer.PublicKey); err != nil {
-		t.Fatal(err)
-	}
-	if err := activateServedPeer("phone", peer.PublicKey); err != nil {
-		t.Fatal(err)
-	}
-	after, err := config.Load()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if writes != 1 {
-		t.Fatalf("pending-to-active hello config writes = %d, want one", writes)
-	}
-	if sameCycleConfiguration(before, after) {
-		t.Fatal("activation did not produce one relevant daemon trigger")
-	}
-	if !sameCycleConfiguration(after, config.Clone(after)) {
-		t.Fatal("repeated active hello did not quiesce semantically")
 	}
 }
 
@@ -342,8 +291,7 @@ func TestServedMutationWaitsForLiveOwnerThenCommitsBaseline(t *testing.T) {
 	cfg := config.New()
 	phone, fingerprint := testPeerIdentity(t, "phone")
 	cfg.Peers["phone"] = phone
-	cfg.Shared["notes"] = root
-	cfg.Bindings["notes"] = []string{"phone"}
+	cfg.Shared["notes"] = config.Folder{Path: root, Peers: []string{"phone"}}
 	callbacks := serveCallbacks(newFolderResolver(cfg, "phone", fingerprint))
 	owner, err := lock.Acquire()
 	if err != nil {
@@ -389,7 +337,7 @@ func testPeerIdentity(t *testing.T, name string) (config.Peer, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return config.Peer{Address: name, Status: config.PeerActive, PublicKey: key}, fingerprint
+	return config.Peer{Address: name, PublicKey: key}, fingerprint
 }
 
 func TestServedMutationReturnsLockTimeout(t *testing.T) {

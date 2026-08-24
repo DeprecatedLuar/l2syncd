@@ -9,7 +9,6 @@ import (
 	"testing"
 
 	"l2syncd/internal/config"
-	"l2syncd/internal/connection"
 	"l2syncd/internal/guard"
 )
 
@@ -36,7 +35,7 @@ func TestCheckRejectsEmptyPeerAddress(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
 
 	cfg := config.New()
-	cfg.Peers["phone"] = config.Peer{Status: config.PeerPending}
+	cfg.Peers["phone"] = config.Peer{}
 	if err := Check(cfg); err == nil {
 		t.Fatal("Check() error = nil, want empty peer address error")
 	}
@@ -44,38 +43,53 @@ func TestCheckRejectsEmptyPeerAddress(t *testing.T) {
 
 func TestValidateRejectsMultiplePeerBinding(t *testing.T) {
 	cfg := config.New()
-	cfg.Peers["one"] = config.Peer{Address: "one", Status: config.PeerPending}
-	cfg.Peers["two"] = config.Peer{Address: "two", Status: config.PeerPending}
-	cfg.Shared["notes"] = t.TempDir()
-	if err := guard.WriteMarker(cfg.Shared["notes"], guard.Marker{Name: "notes"}); err != nil {
+	cfg.Peers["one"] = config.Peer{Address: "one"}
+	cfg.Peers["two"] = config.Peer{Address: "two"}
+	root := t.TempDir()
+	if err := guard.WriteMarker(root, guard.Marker{Name: "notes"}); err != nil {
 		t.Fatal(err)
 	}
-	cfg.Bindings["notes"] = []string{"one", "two"}
+	cfg.Shared["notes"] = config.Folder{Path: root, Peers: []string{"one", "two"}}
 	if err := Validate(cfg); err == nil || !strings.Contains(err.Error(), "exactly one peer") {
 		t.Fatalf("Validate error = %v", err)
 	}
 }
 
-func TestValidateRejectsBindingToRevokedPeer(t *testing.T) {
-	root := t.TempDir()
-	t.Setenv("HOME", root)
-	paths, err := connection.DefaultPaths()
-	if err != nil {
-		t.Fatal(err)
-	}
-	key, err := connection.EnsureKey(paths)
-	if err != nil {
-		t.Fatal(err)
-	}
+func TestValidateRejectsMultiplePeerBindingOnRemoteFolder(t *testing.T) {
 	cfg := config.New()
-	cfg.Peers["phone"] = config.Peer{Address: "phone", Status: config.PeerRevoked, PublicKey: key}
-	cfg.Shared["notes"] = t.TempDir()
-	if err := guard.WriteMarker(cfg.Shared["notes"], guard.Marker{Name: "notes"}); err != nil {
+	cfg.Peers["one"] = config.Peer{Address: "one"}
+	cfg.Peers["two"] = config.Peer{Address: "two"}
+	root := t.TempDir()
+	if err := guard.WriteMarker(root, guard.Marker{Name: "notes"}); err != nil {
 		t.Fatal(err)
 	}
-	cfg.Bindings["notes"] = []string{"phone"}
-	if validateErr := Validate(cfg); validateErr == nil || !strings.Contains(validateErr.Error(), "revoked") {
-		t.Fatalf("Validate error = %v", validateErr)
+	cfg.Remote["notes"] = config.Folder{Path: root, Peers: []string{"one", "two"}}
+	if err := Validate(cfg); err == nil || !strings.Contains(err.Error(), "exactly one peer") {
+		t.Fatalf("Validate error = %v", err)
+	}
+}
+
+func TestValidateAcceptsUnboundSharedFolder(t *testing.T) {
+	cfg := config.New()
+	root := t.TempDir()
+	if err := guard.WriteMarker(root, guard.Marker{Name: "notes"}); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Shared["notes"] = config.Folder{Path: root}
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("Validate() error = %v, want unbound shared folder accepted", err)
+	}
+}
+
+func TestValidateRejectsUnboundRemoteFolder(t *testing.T) {
+	cfg := config.New()
+	root := t.TempDir()
+	if err := guard.WriteMarker(root, guard.Marker{Name: "notes"}); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Remote["notes"] = config.Folder{Path: root}
+	if err := Validate(cfg); err == nil || !strings.Contains(err.Error(), "exactly one peer") {
+		t.Fatalf("Validate error = %v", err)
 	}
 }
 
@@ -84,9 +98,8 @@ func TestValidateRejectsNonCanonicalConfiguredFolderNames(t *testing.T) {
 		name string
 		set  func(*config.Config)
 	}{
-		{name: "shared", set: func(cfg *config.Config) { cfg.Shared["Work Notes"] = "/unused" }},
-		{name: "remote", set: func(cfg *config.Config) { cfg.Remote["../notes"] = "/unused" }},
-		{name: "binding", set: func(cfg *config.Config) { cfg.Bindings["Notes"] = []string{"phone"} }},
+		{name: "shared", set: func(cfg *config.Config) { cfg.Shared["Work Notes"] = config.Folder{Path: "/unused"} }},
+		{name: "remote", set: func(cfg *config.Config) { cfg.Remote["../notes"] = config.Folder{Path: "/unused"} }},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -105,19 +118,17 @@ func TestValidateRequiresExactlyOneUsableBindingForRemoteFolder(t *testing.T) {
 		t.Fatal(err)
 	}
 	tests := []struct {
-		name   string
-		status string
-		bind   []string
+		name string
+		bind []string
 	}{
-		{name: "missing", status: config.PeerActive},
-		{name: "revoked", status: config.PeerRevoked, bind: []string{"phone"}},
+		{name: "missing"},
+		{name: "unknown peer", bind: []string{"ghost"}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			cfg := config.New()
-			cfg.Peers["phone"] = config.Peer{Address: "phone", Status: test.status, PublicKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINa41as+a6N57asFGGQUcElHbuSpntT7uZFWQMgphLxE"}
-			cfg.Remote["notes"] = root
-			cfg.Bindings["notes"] = test.bind
+			cfg.Peers["phone"] = config.Peer{Address: "phone", PublicKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINa41as+a6N57asFGGQUcElHbuSpntT7uZFWQMgphLxE"}
+			cfg.Remote["notes"] = config.Folder{Path: root, Peers: test.bind}
 			if err := Validate(cfg); err == nil {
 				t.Fatal("Validate accepted unusable remote binding")
 			}

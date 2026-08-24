@@ -50,7 +50,7 @@ func TestConnectionAddInboundStoresStructuredPendingPeerAndWarnsForBash(t *testi
 		t.Fatal(err)
 	}
 	peer := cfg.Peers["phone"]
-	if peer.Address != "phone-host" || peer.Status != config.PeerPending || peer.PublicKey != remoteKey {
+	if peer.Address != "phone-host" || peer.PublicKey != remoteKey {
 		t.Fatalf("peer = %#v", peer)
 	}
 	configBytes, err := os.ReadFile(filepath.Join(root, "config", "l2sync", "config.toml"))
@@ -112,7 +112,7 @@ func TestConnectionAddWithoutAccessRecordsPendingAndPrintsInvite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if peer := cfg.Peers["friend"]; peer.Status != config.PeerPending || peer.PublicKey != "" {
+	if peer := cfg.Peers["friend"]; peer.PublicKey != "" {
 		t.Fatalf("pending peer = %#v", peer)
 	}
 }
@@ -124,9 +124,8 @@ func TestConnectionAddWithAccessActivatesPinnedPeer(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
 	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
 	originalProbe, originalInstall := connectionProbe, connectionInstall
-	originalExchange, originalConfirm := connectionExchange, connectionConfirm
+	originalExchange := connectionExchange
 	connectionProbe = func(context.Context, string) error { return nil }
-	connectionConfirm = func(io.Reader, io.Writer, string) (bool, error) { return true, nil }
 	installed := false
 	connectionInstall = func(_ context.Context, destination, name, address, key string) error {
 		installed = destination == "login@example.test" && name != "" && address != "" && strings.HasPrefix(key, "ssh-ed25519 ")
@@ -137,10 +136,10 @@ func TestConnectionAddWithAccessActivatesPinnedPeer(t *testing.T) {
 	}
 	t.Cleanup(func() {
 		connectionProbe, connectionInstall = originalProbe, originalInstall
-		connectionExchange, connectionConfirm = originalExchange, originalConfirm
+		connectionExchange = originalExchange
 	})
 	var stdout, stderr bytes.Buffer
-	if code := connectionAdd([]string{"vps", "login@example.test"}, strings.NewReader("y\n"), &stdout, &stderr); code != connectionExitOK {
+	if code := connectionAdd([]string{"vps", "login@example.test"}, strings.NewReader(""), &stdout, &stderr); code != connectionExitOK {
 		t.Fatalf("connectionAdd = %d, stderr %q", code, stderr.String())
 	}
 	if !installed {
@@ -150,7 +149,7 @@ func TestConnectionAddWithAccessActivatesPinnedPeer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if peer := cfg.Peers["vps"]; peer.Status != config.PeerActive || peer.PublicKey != remoteKey {
+	if peer := cfg.Peers["vps"]; peer.PublicKey != remoteKey {
 		t.Fatalf("active peer = %#v", peer)
 	}
 }
@@ -161,9 +160,8 @@ func TestConnectionRemoveRefusesBoundPeer(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
 	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
 	cfg := config.New()
-	cfg.Peers["phone"] = config.Peer{Address: "phone", Status: config.PeerPending}
-	cfg.Bindings["notes"] = []string{"phone"}
-	cfg.Shared["notes"] = "/unused"
+	cfg.Peers["phone"] = config.Peer{Address: "phone"}
+	cfg.Shared["notes"] = config.Folder{Path: "/unused", Peers: []string{"phone"}}
 	if err := config.Save(cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -180,7 +178,7 @@ func TestPeerEndpointCompletesPendingHandshakeBeforeNormalUse(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
 	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
 	cfg := config.New()
-	cfg.Peers["phone"] = config.Peer{Address: "phone", Status: config.PeerPending}
+	cfg.Peers["phone"] = config.Peer{Address: "phone"}
 	if err := config.Save(cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -200,32 +198,32 @@ func TestPeerEndpointCompletesPendingHandshakeBeforeNormalUse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if peer := loaded.Peers["phone"]; peer.Status != config.PeerActive || peer.PublicKey != remoteKey {
+	if peer := loaded.Peers["phone"]; peer.PublicKey != remoteKey {
 		t.Fatalf("completed peer = %#v", peer)
 	}
 }
 
-func TestStorePeerCannotResurrectRevokedPeer(t *testing.T) {
+func TestStorePeerRefusesUnpinningPeer(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("HOME", root)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
 	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
 	key := generatedPublicKey(t, filepath.Join(root, "remote"))
 	cfg := config.New()
-	cfg.Peers["phone"] = config.Peer{Address: "phone", Status: config.PeerRevoked, PublicKey: key}
+	cfg.Peers["phone"] = config.Peer{Address: "phone", PublicKey: key}
 	if err := config.Save(cfg); err != nil {
 		t.Fatal(err)
 	}
-	err := storePeerLocked("phone", config.Peer{Address: "phone", Status: config.PeerActive, PublicKey: key})
-	if err == nil || !strings.Contains(err.Error(), "revoked") {
+	err := storePeerLocked("phone", config.Peer{Address: "phone"})
+	if err == nil || !strings.Contains(err.Error(), "pinned public key") {
 		t.Fatalf("storePeerLocked error = %v", err)
 	}
 	loaded, err := config.Load()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if loaded.Peers["phone"].Status != config.PeerRevoked {
-		t.Fatalf("peer was resurrected: %#v", loaded.Peers["phone"])
+	if loaded.Peers["phone"].PublicKey != key {
+		t.Fatalf("peer was unpinned: %#v", loaded.Peers["phone"])
 	}
 }
 
@@ -243,7 +241,7 @@ func TestConnectionRemoveCompletesRevocationAndGrantRemoval(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := config.New()
-	cfg.Peers["phone"] = config.Peer{Address: "phone", Status: config.PeerActive, PublicKey: key}
+	cfg.Peers["phone"] = config.Peer{Address: "phone", PublicKey: key}
 	if err := config.Save(cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -261,5 +259,141 @@ func TestConnectionRemoveCompletesRevocationAndGrantRemoval(t *testing.T) {
 	authorized, err := os.ReadFile(paths.AuthorizedKeys)
 	if err != nil || strings.Contains(string(authorized), "l2sync:phone") {
 		t.Fatalf("authorized_keys = %q, %v", authorized, err)
+	}
+}
+
+// TestConnectionRemoveIsIdempotentAfterInterruptedGrantRemoval covers the
+// replacement for the deleted revoked-tombstone: an interrupted "connection
+// rm" leaves a peer entry whose grant is already gone, and re-running "rm"
+// must still succeed and remove the entry.
+func TestConnectionRemoveIsIdempotentAfterInterruptedGrantRemoval(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
+	key := generatedPublicKey(t, filepath.Join(root, "remote"))
+	paths, err := connectionpkg.DefaultPaths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := connectionpkg.AddGrant(paths.AuthorizedKeys, "phone", key); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.New()
+	cfg.Peers["phone"] = config.Peer{Address: "phone", PublicKey: key}
+	if err := config.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a crash between the grant being removed and the config entry
+	// being deleted.
+	if err := connectionpkg.RemoveGrant(paths.AuthorizedKeys, "phone", key); err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	if code := connectionRemove([]string{"phone"}, &stderr); code != connectionExitOK {
+		t.Fatalf("connectionRemove after interrupted grant removal = %d, stderr %q", code, stderr.String())
+	}
+	loaded, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := loaded.Peers["phone"]; exists {
+		t.Fatalf("peer remains after idempotent removal: %#v", loaded.Peers["phone"])
+	}
+}
+
+// TestConnectionAddSucceedsAfterInterruptedRemove covers the case the
+// deleted revoked-peer resurrection guard used to block: re-adding a peer
+// whose removal was interrupted must now succeed.
+func TestConnectionAddSucceedsAfterInterruptedRemove(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
+	key := generatedPublicKey(t, filepath.Join(root, "remote"))
+	paths, err := connectionpkg.DefaultPaths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := connectionpkg.AddGrant(paths.AuthorizedKeys, "phone", key); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.New()
+	cfg.Peers["phone"] = config.Peer{Address: "phone", PublicKey: key}
+	if err := config.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	if code := connectionRemove([]string{"phone"}, &stderr); code != connectionExitOK {
+		t.Fatalf("connectionRemove = %d, stderr %q", code, stderr.String())
+	}
+	var stdout bytes.Buffer
+	if code := connectionAdd([]string{"phone", "phone-host", "--key", key}, strings.NewReader(""), &stdout, &stderr); code != connectionExitOK {
+		t.Fatalf("connectionAdd after removal = %d, stderr %q", code, stderr.String())
+	}
+}
+
+func TestConnectionListGroupsPendingThenHealthyThenUnhealthy(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
+	cfg := config.New()
+	cfg.Peers["qingyou"] = config.Peer{Address: "mayday@100.75.16.121:22", PublicKey: "ssh-ed25519 AAAA1"}
+	cfg.Peers["paraloid"] = config.Peer{Address: "luar@100.73.155.103:22", PublicKey: "ssh-ed25519 AAAA2"}
+	cfg.Peers["aezt"] = config.Peer{Address: "user@10.244.121.182:22"}
+	cfg.Peers["ae"] = config.Peer{Address: "user@100.97.51.22:22", PublicKey: "ssh-ed25519 AAAA3"}
+	cfg.Peers["nuremberg"] = config.Peer{Address: "user@100.64.0.9:22", PublicKey: "ssh-ed25519 AAAA4"}
+	if err := config.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	originalShares := connectionListShares
+	connectionListShares = func(_ context.Context, endpoint transport.Endpoint) ([]string, error) {
+		switch endpoint.Name {
+		case "ae":
+			return nil, errors.New("unreachable")
+		case "nuremberg":
+			return nil, transport.NewAuthErrorForTest("permission denied")
+		}
+		return nil, nil
+	}
+	t.Cleanup(func() { connectionListShares = originalShares })
+
+	var stdout bytes.Buffer
+	if code := connectionList(nil, &stdout, io.Discard); code != connectionExitOK {
+		t.Fatalf("connectionList = %d", code)
+	}
+	want := "~ aezt       user@10.244.121.182:22\n" +
+		"+ paraloid   luar@100.73.155.103:22\n" +
+		"+ qingyou    mayday@100.75.16.121:22\n" +
+		"x nuremberg  user@100.64.0.9:22\n" +
+		"- ae         user@100.97.51.22:22\n"
+	if got := stdout.String(); got != want {
+		t.Fatalf("connectionList output =\n%q\nwant\n%q", got, want)
+	}
+	if strings.Contains(stdout.String(), "\x1b[") {
+		t.Fatalf("connectionList emitted ANSI codes for a non-terminal writer: %q", stdout.String())
+	}
+}
+
+func TestConnectionBareDispatchListsSameAsLs(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
+	cfg := config.New()
+	cfg.Peers["phone"] = config.Peer{Address: "phone"}
+	if err := config.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	var bare, ls bytes.Buffer
+	if code := Connection(nil, &bare, io.Discard); code != connectionExitOK {
+		t.Fatalf("Connection(nil) = %d", code)
+	}
+	if code := Connection([]string{"ls"}, &ls, io.Discard); code != connectionExitOK {
+		t.Fatalf("Connection(ls) = %d", code)
+	}
+	if bare.String() != ls.String() {
+		t.Fatalf("bare dispatch = %q, ls = %q", bare.String(), ls.String())
 	}
 }

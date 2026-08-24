@@ -35,6 +35,25 @@ func withConfigLocked(ctx context.Context, operation func(*config.Config) error)
 	return operation(&cfg)
 }
 
+// withConfigFileLocked acquires the same instance lock as withConfigLocked
+// but does not load or validate the configuration. The config-edit path
+// needs raw file access: `l2sync config` must be able to open (and save a
+// repair of) a configuration that fails preflight.Validate, since that
+// command is how the user fixes it. Every other caller must keep going
+// through withConfigLocked so mutations always see a validated snapshot.
+func withConfigFileLocked(ctx context.Context, operation func() error) (err error) {
+	lockFile, err := lock.AcquireWait(ctx, lock.DefaultWait)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if releaseErr := lock.Release(lockFile); releaseErr != nil {
+			err = errors.Join(err, releaseErr)
+		}
+	}()
+	return operation()
+}
+
 func loadConfigForTransaction() (config.Config, error) {
 	cfg, err := config.Load()
 	if errors.Is(err, config.ErrNotFound) {

@@ -21,6 +21,7 @@ import (
 	"l2syncd/internal/guard"
 	"l2syncd/internal/lock"
 	"l2syncd/internal/metadata"
+	"l2syncd/internal/preflight"
 	"l2syncd/internal/state"
 	"l2syncd/internal/transport"
 )
@@ -140,9 +141,8 @@ func TestRemoveRemoteUnbindsProviderBeforeLocalRegistration(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := config.New()
-	cfg.Peers["phone"] = config.Peer{Address: "phone", Status: config.PeerActive, PublicKey: generatedPublicKey(t, filepath.Join(root, "peer-key"))}
-	cfg.Remote["notes"] = folder
-	cfg.Bindings["notes"] = []string{"phone"}
+	cfg.Peers["phone"] = config.Peer{Address: "phone", PublicKey: generatedPublicKey(t, filepath.Join(root, "peer-key"))}
+	cfg.Remote["notes"] = config.Folder{Path: folder, Peers: []string{"phone"}}
 	if err := config.Save(cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -164,7 +164,7 @@ func TestRemoveRemoteUnbindsProviderBeforeLocalRegistration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !unbound || loaded.Remote["notes"] != "" || len(loaded.Bindings["notes"]) != 0 {
+	if _, remains := loaded.Remote["notes"]; !unbound || remains {
 		t.Fatalf("unbound = %v, config = %#v", unbound, loaded)
 	}
 }
@@ -182,9 +182,8 @@ func TestRemoveRemoteOfflineRetainsRetryableLocalRegistration(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := config.New()
-	cfg.Peers["phone"] = config.Peer{Address: "phone", Status: config.PeerActive, PublicKey: generatedPublicKey(t, filepath.Join(root, "peer-key"))}
-	cfg.Remote["notes"] = folder
-	cfg.Bindings["notes"] = []string{"phone"}
+	cfg.Peers["phone"] = config.Peer{Address: "phone", PublicKey: generatedPublicKey(t, filepath.Join(root, "peer-key"))}
+	cfg.Remote["notes"] = config.Folder{Path: folder, Peers: []string{"phone"}}
 	if err := config.Save(cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -199,7 +198,7 @@ func TestRemoveRemoteOfflineRetainsRetryableLocalRegistration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if loaded.Remote["notes"] != folder || !reflect.DeepEqual(loaded.Bindings["notes"], []string{"phone"}) {
+	if remaining := loaded.Remote["notes"]; remaining.Path != folder || !reflect.DeepEqual(remaining.Peers, []string{"phone"}) {
 		t.Fatalf("offline removal changed retryable config: %#v", loaded)
 	}
 }
@@ -215,9 +214,8 @@ func TestDeterministicConflictSuffixUsesLosingFingerprint(t *testing.T) {
 
 func TestCycleSharedNamesSkipsUnboundOffers(t *testing.T) {
 	cfg := config.New()
-	cfg.Shared["bound"] = "/bound"
-	cfg.Shared["offer-only"] = "/offer"
-	cfg.Bindings["bound"] = []string{"phone"}
+	cfg.Shared["bound"] = config.Folder{Path: "/bound", Peers: []string{"phone"}}
+	cfg.Shared["offer-only"] = config.Folder{Path: "/offer"}
 	if got := cycleFolderNames(cfg); !reflect.DeepEqual(got, []string{"bound"}) {
 		t.Fatalf("cycle shared folders = %#v, want only bound offer", got)
 	}
@@ -238,8 +236,7 @@ func TestCycleInitiatorOrderingIsSymmetricAndRejectsEqualIdentity(t *testing.T) 
 func TestNonInitiatorRequestsActualCycleResultWithoutMutationLock(t *testing.T) {
 	root, cfg := cycleTestConfig(t, false)
 	folder := filepath.Join(root, "notes")
-	cfg.Shared["notes"] = folder
-	cfg.Bindings["notes"] = []string{"phone"}
+	cfg.Shared["notes"] = config.Folder{Path: folder, Peers: []string{"phone"}}
 	if err := guard.WriteMarker(folder, guard.Marker{Name: "notes"}); err != nil {
 		t.Fatal(err)
 	}
@@ -282,8 +279,7 @@ func TestNonInitiatorRequestsActualCycleResultWithoutMutationLock(t *testing.T) 
 func TestInitiatorSerializesSimultaneousTriggersAndRejectsWrongPeer(t *testing.T) {
 	root, cfg := cycleTestConfig(t, true)
 	folder := filepath.Join(root, "notes")
-	cfg.Shared["notes"] = folder
-	cfg.Bindings["notes"] = []string{"phone"}
+	cfg.Shared["notes"] = config.Folder{Path: folder, Peers: []string{"phone"}}
 	if err := guard.WriteMarker(folder, guard.Marker{Name: "notes"}); err != nil {
 		t.Fatal(err)
 	}
@@ -357,8 +353,7 @@ func TestInitiatorSerializesSimultaneousTriggersAndRejectsWrongPeer(t *testing.T
 func TestInitiatorRejectsDelayedSessionAfterPeerKeyReplacement(t *testing.T) {
 	root, cfg := cycleTestConfig(t, true)
 	folder := filepath.Join(root, "notes")
-	cfg.Shared["notes"] = folder
-	cfg.Bindings["notes"] = []string{"phone"}
+	cfg.Shared["notes"] = config.Folder{Path: folder, Peers: []string{"phone"}}
 	if err := guard.WriteMarker(folder, guard.Marker{Name: "notes"}); err != nil {
 		t.Fatal(err)
 	}
@@ -390,8 +385,8 @@ func TestCommitJoinedFolderRejectsExistingRemoteWithoutExpectedBinding(t *testin
 		t.Fatal(err)
 	}
 	cfg := config.New()
-	cfg.Peers["phone"] = config.Peer{Address: "phone", Status: config.PeerActive, PublicKey: generatedPublicKey(t, filepath.Join(root, "peer-key"))}
-	cfg.Remote["notes"] = folder
+	cfg.Peers["phone"] = config.Peer{Address: "phone", PublicKey: generatedPublicKey(t, filepath.Join(root, "peer-key"))}
+	cfg.Remote["notes"] = config.Folder{Path: folder}
 	if err := config.Save(cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -430,7 +425,7 @@ func cycleTestConfig(t *testing.T, localInitiator bool) (string, config.Config) 
 		t.Fatal(err)
 	}
 	cfg := config.New()
-	cfg.Peers["phone"] = config.Peer{Address: "phone", Status: config.PeerActive, PublicKey: remoteKey}
+	cfg.Peers["phone"] = config.Peer{Address: "phone", PublicKey: remoteKey}
 	return root, cfg
 }
 
@@ -444,7 +439,7 @@ func TestFreshJoinBindsBeforeAuthorizedListing(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := config.New()
-	cfg.Peers["phone"] = config.Peer{Address: "phone", Status: config.PeerActive, PublicKey: generatedPublicKey(t, filepath.Join(root, "remote-key"))}
+	cfg.Peers["phone"] = config.Peer{Address: "phone", PublicKey: generatedPublicKey(t, filepath.Join(root, "remote-key"))}
 	if err := config.Save(cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -478,7 +473,7 @@ func TestFreshJoinBindsBeforeAuthorizedListing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if loaded.Remote["notes"] != folder || !reflect.DeepEqual(loaded.Bindings["notes"], []string{"phone"}) {
+	if joined := loaded.Remote["notes"]; joined.Path != folder || !reflect.DeepEqual(joined.Peers, []string{"phone"}) {
 		t.Fatalf("joined config = %#v", loaded)
 	}
 }
@@ -493,7 +488,7 @@ func TestFreshJoinListingFailureCompensatesOnlyNewRemoteBinding(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := config.New()
-	cfg.Peers["phone"] = config.Peer{Address: "phone", Status: config.PeerActive, PublicKey: generatedPublicKey(t, filepath.Join(root, "remote-key"))}
+	cfg.Peers["phone"] = config.Peer{Address: "phone", PublicKey: generatedPublicKey(t, filepath.Join(root, "remote-key"))}
 	if err := config.Save(cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -518,7 +513,7 @@ func TestFreshJoinListingFailureCompensatesOnlyNewRemoteBinding(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !unbound || loaded.Remote["notes"] != "" || len(loaded.Bindings["notes"]) != 0 {
+	if _, remains := loaded.Remote["notes"]; !unbound || remains {
 		t.Fatalf("unbound = %v, config = %#v", unbound, loaded)
 	}
 	if _, err := os.Lstat(guard.MarkerPath(folder)); !os.IsNotExist(err) {
@@ -536,7 +531,7 @@ func TestFreshJoinPeerIdentityChangeCompensates(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := config.New()
-	cfg.Peers["phone"] = config.Peer{Address: "phone", Status: config.PeerActive, PublicKey: generatedPublicKey(t, filepath.Join(root, "remote-key"))}
+	cfg.Peers["phone"] = config.Peer{Address: "phone", PublicKey: generatedPublicKey(t, filepath.Join(root, "remote-key"))}
 	if err := config.Save(cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -568,7 +563,7 @@ func TestFreshJoinPeerIdentityChangeCompensates(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !unbound || loaded.Remote["notes"] != "" || len(loaded.Bindings["notes"]) != 0 {
+	if _, remains := loaded.Remote["notes"]; !unbound || remains {
 		t.Fatalf("unbound = %v, config = %#v", unbound, loaded)
 	}
 	if _, err := os.Lstat(guard.MarkerPath(folder)); !os.IsNotExist(err) {
@@ -594,7 +589,7 @@ func TestJoinMarkerAndLocalBindingRegistrationAreIdempotent(t *testing.T) {
 		t.Fatalf("prepare existing marker = %v, %v", created, err)
 	}
 	cfg := config.New()
-	cfg.Peers["phone"] = config.Peer{Address: "phone", Status: config.PeerActive, PublicKey: generatedPublicKey(t, filepath.Join(root, "peer-key"))}
+	cfg.Peers["phone"] = config.Peer{Address: "phone", PublicKey: generatedPublicKey(t, filepath.Join(root, "peer-key"))}
 	if err := config.Save(cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -612,7 +607,7 @@ func TestJoinMarkerAndLocalBindingRegistrationAreIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Remote["notes"] != folder || !reflect.DeepEqual(cfg.Bindings["notes"], []string{"phone"}) {
+	if joined := cfg.Remote["notes"]; joined.Path != folder || !reflect.DeepEqual(joined.Peers, []string{"phone"}) {
 		t.Fatalf("config after idempotent registration = %#v", cfg)
 	}
 }
@@ -747,6 +742,149 @@ func TestConfigEditSnapshotRefusesConcurrentConfigMutation(t *testing.T) {
 	}
 }
 
+func TestConfigEditOpensInvalidConfigForRepair(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
+
+	remotePath := filepath.Join(root, "testsync")
+	if err := os.Mkdir(remotePath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := guard.WriteMarker(remotePath, guard.Marker{Name: "testsync"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reproduces the reported bug: a remote entry with no matching binding
+	// fails preflight.Validate with `remote folder "testsync" must bind
+	// exactly one peer`.
+	cfg := config.New()
+	cfg.Peers["phone"] = config.Peer{Address: "phone"}
+	cfg.Remote["testsync"] = config.Folder{Path: remotePath}
+	if err := config.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	fixed := "[peers.phone]\naddress = \"phone\"\n\n[remote.testsync]\npath = \"" + remotePath + "\"\npeers = [\"phone\"]\n"
+	editor := filepath.Join(root, "editor.sh")
+	script := "#!/bin/sh\ncat > \"$1\" <<'EOF'\n" + fixed + "EOF\n"
+	if err := os.WriteFile(editor, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("VISUAL", editor)
+
+	var stderr bytes.Buffer
+	if got := ConfigEdit(nil, &stderr); got != successExitCode {
+		t.Fatalf("config edit exit code = %d, stderr = %q", got, stderr.String())
+	}
+
+	configPath, err := config.Path()
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := config.LoadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := preflight.Validate(loaded); err != nil {
+		t.Fatalf("installed config still invalid: %v", err)
+	}
+}
+
+func TestConfigEditNonInteractiveInvalidEditPreservesEditedFile(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
+
+	// Force the non-interactive path deterministically: a regular file is
+	// never a character device, unlike a real terminal (or /dev/null).
+	stdinFile, err := os.CreateTemp(root, "stdin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stdinFile.Close()
+	oldStdin := os.Stdin
+	os.Stdin = stdinFile
+	defer func() { os.Stdin = oldStdin }()
+
+	editor := filepath.Join(root, "editor.sh")
+	script := "#!/bin/sh\ncat > \"$1\" <<'EOF'\nnot valid toml [[[\nEOF\n"
+	if err := os.WriteFile(editor, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("VISUAL", editor)
+
+	var stderr bytes.Buffer
+	if got := ConfigEdit(nil, &stderr); got != configEditExitError {
+		t.Fatalf("config edit exit code = %d, want %d, stderr = %q", got, configEditExitError, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "edited config is invalid") {
+		t.Fatalf("stderr = %q, want validation error", stderr.String())
+	}
+
+	configPath, err := config.Path()
+	if err != nil {
+		t.Fatal(err)
+	}
+	matches, err := filepath.Glob(filepath.Join(filepath.Dir(configPath), ".config-edit-*.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 1 {
+		t.Fatalf("preserved edit files = %v, want exactly one", matches)
+	}
+	if !strings.Contains(stderr.String(), matches[0]) {
+		t.Fatalf("stderr = %q, want preserved path %q", stderr.String(), matches[0])
+	}
+	contents, err := os.ReadFile(matches[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(contents), "not valid toml") {
+		t.Fatalf("preserved contents = %q, want the user's edit", contents)
+	}
+}
+
+func TestConfigEditValidEditInstallsAndCleansUpTempFile(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
+
+	editor := filepath.Join(root, "editor.sh")
+	script := "#!/bin/sh\ncat > \"$1\" <<'EOF'\n# edited\nEOF\n"
+	if err := os.WriteFile(editor, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("VISUAL", editor)
+
+	var stderr bytes.Buffer
+	if got := ConfigEdit(nil, &stderr); got != successExitCode {
+		t.Fatalf("config edit exit code = %d, stderr = %q", got, stderr.String())
+	}
+
+	configPath, err := config.Path()
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(contents), "# edited") {
+		t.Fatalf("config = %q, want edited contents installed", contents)
+	}
+	matches, err := filepath.Glob(filepath.Join(filepath.Dir(configPath), ".config-edit-*.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("leftover edit temp files = %v, want none", matches)
+	}
+}
+
 func TestAddRejectsUnsafeName(t *testing.T) {
 	root := t.TempDir()
 	sharePath := filepath.Join(root, "project")
@@ -860,9 +998,8 @@ func TestListVerifiesRemoteProvider(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := config.New()
-	cfg.Peers["phone"] = config.Peer{Address: "phone", Status: config.PeerPending}
-	cfg.Remote["notes"] = remotePath
-	cfg.Bindings["notes"] = []string{"phone"}
+	cfg.Peers["phone"] = config.Peer{Address: "phone"}
+	cfg.Remote["notes"] = config.Folder{Path: remotePath, Peers: []string{"phone"}}
 
 	var stdout, stderr bytes.Buffer
 	got := listWithLister(cfg, nil, &stdout, &stderr, func(context.Context, string) ([]string, error) {
@@ -875,8 +1012,8 @@ func TestListVerifiesRemoteProvider(t *testing.T) {
 
 func TestListQueriesConfiguredPeersWithoutLocalRemoteEntries(t *testing.T) {
 	cfg := config.New()
-	cfg.Peers["phone"] = config.Peer{Address: "phone", Status: config.PeerPending}
-	cfg.Shared["notes"] = "/missing/notes"
+	cfg.Peers["phone"] = config.Peer{Address: "phone"}
+	cfg.Shared["notes"] = config.Folder{Path: "/missing/notes"}
 	var stdout, stderr bytes.Buffer
 	got := listWithLister(cfg, nil, &stdout, &stderr, func(context.Context, string) ([]string, error) {
 		return []string{"photos"}, nil
@@ -900,8 +1037,8 @@ func TestListKeepsLocalEntriesWhenPeerIsUnreachable(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := config.New()
-	cfg.Peers["phone"] = config.Peer{Address: "phone", Status: config.PeerPending}
-	cfg.Shared["notes"] = sharedPath
+	cfg.Peers["phone"] = config.Peer{Address: "phone"}
+	cfg.Shared["notes"] = config.Folder{Path: sharedPath}
 
 	var stdout, stderr bytes.Buffer
 	got := listWithLister(cfg, []string{"phone"}, &stdout, &stderr, func(context.Context, string) ([]string, error) {
