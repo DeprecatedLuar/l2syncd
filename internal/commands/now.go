@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -17,6 +19,7 @@ import (
 	"l2syncd/internal/engine"
 	"l2syncd/internal/guard"
 	"l2syncd/internal/lock"
+	"l2syncd/internal/logging"
 	"l2syncd/internal/preflight"
 	"l2syncd/internal/scan"
 	"l2syncd/internal/sharepath"
@@ -32,7 +35,18 @@ const (
 	nowExitLocked      = 4
 )
 
+// nowLogger reports initiator-side cycle activity: role resolution, the
+// plan computed for each folder, and whether that folder's baseline commit
+// actually succeeded. Used regardless of whether the cycle was triggered by
+// `l2sync now` or by the daemon's cycle loop in run.go; both entrypoints
+// point it (and commitLogger) at the shared per-machine log file via
+// logging.NewLogger before invoking RunCycle. This default only covers
+// callers that reach RunCycle without going through either entrypoint.
+var nowLogger = slog.New(slog.NewTextHandler(os.Stderr, nil)).With("pid", os.Getpid(), "component", "now")
+
 func Now(args []string, stdout, stderr io.Writer) int {
+	nowLogger = logging.NewLogger(stderr, "now")
+	commitLogger = logging.NewLogger(stderr, "commit")
 	if len(args) != 0 {
 		fmt.Fprintln(stderr, "usage: l2sync now")
 		return nowExitError
@@ -53,10 +67,27 @@ func Now(args []string, stdout, stderr io.Writer) int {
 	return nowExitOK
 }
 
+// FolderOutcome reports the observable per-folder result of one
+// reconciliation cycle, so a folder whose mutation landed without a
+// baseline commit is visible individually rather than only folded into the
+// cycle's aggregate counts. Committed reflects whether the folder's cycle
+// returned without error: for the local initiator this is a direct proxy
+// for commitFolderBaseline succeeding (see planFolder); for a non-initiator
+// requesting the peer run its own cycle, it reflects the request completing
+// without a transport error and does not itself observe the peer's commit
+// (see serve.go's own commit logging for that side).
+type FolderOutcome struct {
+	Name             string
+	InitiatedLocally bool
+	Actions          int
+	Committed        bool
+}
+
 // CycleSummary reports the useful work completed by one reconciliation cycle.
 type CycleSummary struct {
-	Folders int
-	Actions int
+	Folders  int
+	Actions  int
+	Outcomes []FolderOutcome
 }
 
 var (
@@ -94,15 +125,26 @@ func RunCycle(ctx context.Context) (summary CycleSummary, err error) {
 		if err != nil {
 			return summary, fmt.Errorf("folder %q: %w", name, err)
 		}
+		nowLogger.Info("cycle role resolved", "folder", name, "peer", peerName,
+			"local_fingerprint", localIdentity, "remote_fingerprint", remoteIdentity,
+			"initiates_locally", initiates)
 		var actions int
 		if initiates {
 			actions, err = runInitiatorFolderCycle(ctx, name, peerName, remoteIdentity)
 		} else {
 			actions, err = requestPeerCycle(ctx, endpoint, name)
 		}
+		summary.Outcomes = append(summary.Outcomes, FolderOutcome{
+			Name:             name,
+			InitiatedLocally: initiates,
+			Actions:          actions,
+			Committed:        err == nil,
+		})
 		if err != nil {
+			nowLogger.Error("folder cycle failed", "folder", name, "initiated_locally", initiates, "actions", actions, "error", err)
 			return summary, fmt.Errorf("%s: %w", name, err)
 		}
+		nowLogger.Info("folder cycle completed", "folder", name, "initiated_locally", initiates, "actions", actions)
 		summary.Folders++
 		summary.Actions += actions
 	}
@@ -259,8 +301,11 @@ func planFolder(ctx context.Context, cfg config.Config, name, path, peer string,
 	}
 	plan := engine.PlanStates(localIdentity, local.Snapshot, remoteIdentity, remote, localBaseline)
 	if plan.Halted {
+		nowLogger.Error("plan halted", "folder", name, "peer", peer, "reason", plan.Reason)
 		return 0, fmt.Errorf("halted: %s", plan.Reason)
 	}
+	nowLogger.Info("folder plan computed", "folder", name, "peer", peer,
+		"actions", len(plan.Actions), "directory_actions", len(plan.DirectoryActions))
 	reused, err := prepareContentReuse(ctx, plan.Actions, name, path, remoteIdentity, endpoint, localBaseline, local.Snapshot, remote)
 	if err != nil {
 		return 0, err
@@ -287,8 +332,12 @@ func planFolder(ctx context.Context, cfg config.Config, name, path, peer string,
 		return 0, err
 	}
 	if err := commitFolderBaseline(name, path, marker.Ignore); err != nil {
+		nowLogger.Error("initiator mutation applied WITHOUT baseline commit", "folder", name, "peer", peer,
+			"actions", len(plan.Actions), "directory_actions", len(plan.DirectoryActions), "error", err)
 		return 0, err
 	}
+	nowLogger.Info("initiator baseline commit outcome", "folder", name, "peer", peer, "outcome", "success",
+		"actions", len(plan.Actions), "directory_actions", len(plan.DirectoryActions))
 	return len(plan.Actions) + len(plan.DirectoryActions), nil
 }
 

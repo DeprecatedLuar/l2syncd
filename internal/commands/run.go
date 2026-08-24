@@ -20,6 +20,7 @@ import (
 	"l2syncd/internal/config"
 	"l2syncd/internal/guard"
 	"l2syncd/internal/lock"
+	"l2syncd/internal/logging"
 	"l2syncd/internal/preflight"
 	"l2syncd/internal/state"
 )
@@ -56,7 +57,14 @@ func Run(args []string, stderr io.Writer) (exitCode int) {
 		fmt.Fprintln(stderr, "usage: l2sync run")
 		return runExitError
 	}
-	logger := slog.New(slog.NewTextHandler(stderr, nil)).With("component", "daemon")
+	logger := logging.NewLogger(stderr, "daemon")
+	// RunCycle (invoked below via executeCycle) and the baseline commit it
+	// performs log through the shared now/commit loggers regardless of
+	// whether they were reached from `l2sync now` or the daemon's cycle
+	// loop; point them at this process's stderr and the shared log file
+	// so daemon cycles land in the same file as serve-side mutations.
+	nowLogger = logging.NewLogger(stderr, "now")
+	commitLogger = logging.NewLogger(stderr, "commit")
 	lockFile, err := lock.AcquireDaemon()
 	if err != nil {
 		logger.Error("acquire daemon lock", "error", err)
@@ -293,6 +301,15 @@ func executeCycle(ctx context.Context, logger *slog.Logger, retry *time.Timer, d
 	started := time.Now()
 	logger.Info("sync cycle started", "trigger", trigger)
 	summary, err := cycle(ctx)
+	for _, outcome := range summary.Outcomes {
+		logger.Info("folder cycle outcome",
+			"trigger", trigger,
+			"folder", outcome.Name,
+			"initiated_locally", outcome.InitiatedLocally,
+			"actions", outcome.Actions,
+			"committed", outcome.Committed,
+		)
+	}
 	if err != nil {
 		logger.Error("sync cycle failed",
 			"trigger", trigger,

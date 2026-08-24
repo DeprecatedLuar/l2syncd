@@ -10,6 +10,7 @@ import (
 
 	"l2syncd/internal/config"
 	"l2syncd/internal/guard"
+	"l2syncd/internal/logging"
 	"l2syncd/internal/preflight"
 	"l2syncd/internal/scan"
 	"l2syncd/internal/state"
@@ -53,6 +54,7 @@ func Status(stdout, stderr io.Writer) int {
 }
 
 func BaselineCommit(args []string, stderr io.Writer) int {
+	commitLogger = logging.NewLogger(stderr, "commit")
 	if len(args) != 1 {
 		fmt.Fprintln(stderr, "usage: l2sync baseline commit <share>")
 		return statusExitError

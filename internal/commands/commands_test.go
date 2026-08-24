@@ -264,7 +264,7 @@ func TestNonInitiatorRequestsActualCycleResultWithoutMutationLock(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if summary != (CycleSummary{Folders: 1, Actions: 7}) {
+	if summary.Folders != 1 || summary.Actions != 7 {
 		t.Fatalf("summary = %#v", summary)
 	}
 	requestPeerCycle = func(context.Context, transport.Endpoint, string) (int, error) {
