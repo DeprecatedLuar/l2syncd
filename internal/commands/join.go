@@ -142,11 +142,16 @@ func Join(args []string, stderr io.Writer) (exitCode int) {
 		}
 		return errors.Join(cause, joinUnbindShare(context.Background(), endpoint, name))
 	}
-	if _, err := joinListFiles(context.Background(), endpoint, name); err != nil {
+	_, providerID, err := joinListFiles(context.Background(), endpoint, name, "")
+	if err != nil {
 		fmt.Fprintf(stderr, "l2sync: verify newly bound folder %q on peer %q: %v\n", name, peerName, compensateRemote(err))
 		return joinExitUnreachable
 	}
-	installed, err := commitJoinedFolder(name, path, peerName, expectedPeer)
+	if providerID == "" {
+		fmt.Fprintf(stderr, "l2sync: peer %q returned no folder identity for %q: %v\n", peerName, name, compensateRemote(errors.New("empty folder identity")))
+		return joinExitUnreachable
+	}
+	installed, err := commitJoinedFolder(name, path, peerName, expectedPeer, providerID)
 	if err != nil {
 		if !installed {
 			err = compensateRemote(err)
@@ -157,7 +162,14 @@ func Join(args []string, stderr io.Writer) (exitCode int) {
 	return joinExitOK
 }
 
-func prepareJoinMarker(path, name string) (bool, error) {
+// prepareJoinMarker installs or validates the local marker for a folder being
+// registered at path under name. id is the folder's authoritative identity:
+// for add, a freshly generated id to use only if no marker exists yet
+// (add never overrides an existing marker's id, mirroring the existing
+// name-reuse behavior); for join, the provider's id, which an existing local
+// marker must already match -- a mismatch is a hard error naming both, never
+// resolved by preference (concept.md 5.9).
+func prepareJoinMarker(path, name, id string) (bool, error) {
 	if _, err := os.Lstat(guard.MarkerPath(path)); err == nil {
 		marker, readErr := guard.ReadMarker(path)
 		if readErr != nil {
@@ -166,17 +178,27 @@ func prepareJoinMarker(path, name string) (bool, error) {
 		if marker.Name != name {
 			return false, fmt.Errorf("existing marker names folder %q, want %q", marker.Name, name)
 		}
+		if id != "" && marker.ID != id {
+			return false, fmt.Errorf("existing marker id %q does not match provider id %q", marker.ID, id)
+		}
 		return false, nil
 	} else if !os.IsNotExist(err) {
 		return false, err
 	}
-	if err := guard.WriteMarker(path, guard.Marker{Name: name}); err != nil {
+	if id == "" {
+		var genErr error
+		id, genErr = guard.NewMarkerID()
+		if genErr != nil {
+			return false, genErr
+		}
+	}
+	if err := guard.WriteMarker(path, guard.Marker{ID: id, Name: name}); err != nil {
 		return false, err
 	}
 	return true, nil
 }
 
-func commitJoinedFolder(name, path, peerName string, expectedPeer config.Peer) (installed bool, err error) {
+func commitJoinedFolder(name, path, peerName string, expectedPeer config.Peer, providerID string) (installed bool, err error) {
 	err = withConfigLocked(context.Background(), func(current *config.Config) error {
 		peer, exists := current.Peers[peerName]
 		if !exists || peer.PublicKey == "" {
@@ -201,7 +223,7 @@ func commitJoinedFolder(name, path, peerName string, expectedPeer config.Peer) (
 		if missingMatchingBinding {
 			return fmt.Errorf("existing remote folder %q has no matching peer binding", name)
 		}
-		markerCreated, err := prepareJoinMarker(path, name)
+		markerCreated, err := prepareJoinMarker(path, name, providerID)
 		if err != nil {
 			return fmt.Errorf("write folder marker: %w", err)
 		}

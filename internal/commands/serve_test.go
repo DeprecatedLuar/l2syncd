@@ -25,7 +25,7 @@ import (
 
 func TestServeResolverRevalidatesMarkerForEveryOperation(t *testing.T) {
 	root := t.TempDir()
-	if err := guard.WriteMarker(root, guard.Marker{Name: "notes"}); err != nil {
+	if err := guard.WriteMarker(root, newTestMarker(t, "notes")); err != nil {
 		t.Fatal(err)
 	}
 	cfg := config.New()
@@ -33,14 +33,47 @@ func TestServeResolverRevalidatesMarkerForEveryOperation(t *testing.T) {
 	cfg.Peers["phone"] = phone
 	cfg.Shared["notes"] = config.Folder{Path: root, Peers: []string{"phone"}}
 	callbacks := serveCallbacks(newFolderResolver(cfg, "phone", fingerprint))
-	if _, err := callbacks.ListFiles("notes"); err != nil {
+	if _, _, err := callbacks.ListFiles("notes", ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Remove(filepath.Join(root, ".l2sync")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := callbacks.ListFiles("notes"); err == nil || !strings.Contains(err.Error(), "marker") {
+	if _, _, err := callbacks.ListFiles("notes", ""); err == nil || !strings.Contains(err.Error(), "marker") {
 		t.Fatalf("second listing error = %v, want marker failure", err)
+	}
+}
+
+func TestListFilesCallbackRejectsFolderIdentityMismatch(t *testing.T) {
+	root := t.TempDir()
+	marker := newTestMarker(t, "notes")
+	if err := guard.WriteMarker(root, marker); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.New()
+	phone, fingerprint := testPeerIdentity(t, "phone")
+	cfg.Peers["phone"] = phone
+	cfg.Shared["notes"] = config.Folder{Path: root, Peers: []string{"phone"}}
+	callbacks := serveCallbacks(newFolderResolver(cfg, "phone", fingerprint))
+
+	requesterID, err := guard.NewMarkerID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = callbacks.ListFiles("notes", requesterID)
+	if err == nil {
+		t.Fatal("ListFiles callback accepted a mismatched folder identity")
+	}
+	if !strings.Contains(err.Error(), requesterID) || !strings.Contains(err.Error(), marker.ID) {
+		t.Fatalf("ListFiles callback error = %v, want both ids named", err)
+	}
+
+	_, id, err := callbacks.ListFiles("notes", marker.ID)
+	if err != nil {
+		t.Fatalf("ListFiles callback with matching id = %v", err)
+	}
+	if id != marker.ID {
+		t.Fatalf("ListFiles callback id = %q, want %q", id, marker.ID)
 	}
 }
 
@@ -48,7 +81,7 @@ func TestServeAuthorizationUsesBindingForSharedAndRemote(t *testing.T) {
 	for _, registration := range []string{"shared", "remote"} {
 		t.Run(registration, func(t *testing.T) {
 			root := t.TempDir()
-			if err := guard.WriteMarker(root, guard.Marker{Name: "notes"}); err != nil {
+			if err := guard.WriteMarker(root, newTestMarker(t, "notes")); err != nil {
 				t.Fatal(err)
 			}
 			cfg := config.New()
@@ -89,7 +122,7 @@ func TestReloadingResolverRejectsDelayedSessionAfterIdentityOrKeyRemoval(t *test
 	if err := os.Mkdir(folder, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := guard.WriteMarker(folder, guard.Marker{Name: "notes"}); err != nil {
+	if err := guard.WriteMarker(folder, newTestMarker(t, "notes")); err != nil {
 		t.Fatal(err)
 	}
 	peer, authenticatedFingerprint := testPeerIdentity(t, "phone")
@@ -137,7 +170,7 @@ func TestReloadingShareListerReflectsCurrentValidatedAuthorizationAndOffers(t *t
 		if err := os.Mkdir(folder, 0o700); err != nil {
 			t.Fatal(err)
 		}
-		if err := guard.WriteMarker(folder, guard.Marker{Name: name}); err != nil {
+		if err := guard.WriteMarker(folder, newTestMarker(t, name)); err != nil {
 			t.Fatal(err)
 		}
 		cfg.Shared[name] = config.Folder{Path: folder}
@@ -184,7 +217,7 @@ func TestBindShareRejectsMalformedExistingBinding(t *testing.T) {
 	if err := os.Mkdir(folder, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := guard.WriteMarker(folder, guard.Marker{Name: "notes"}); err != nil {
+	if err := guard.WriteMarker(folder, newTestMarker(t, "notes")); err != nil {
 		t.Fatal(err)
 	}
 	cfg := config.New()
@@ -223,7 +256,7 @@ func TestBindSharedFolderRefusesRemoteFolder(t *testing.T) {
 	if err := os.Mkdir(folder, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := guard.WriteMarker(folder, guard.Marker{Name: "notes"}); err != nil {
+	if err := guard.WriteMarker(folder, newTestMarker(t, "notes")); err != nil {
 		t.Fatal(err)
 	}
 	cfg := config.New()
@@ -283,7 +316,7 @@ func TestServedMutationWaitsForLiveOwnerThenCommitsBaseline(t *testing.T) {
 	if err := os.Mkdir(root, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := guard.WriteMarker(root, guard.Marker{Name: "notes"}); err != nil {
+	if err := guard.WriteMarker(root, newTestMarker(t, "notes")); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("HOME", home)
@@ -293,7 +326,7 @@ func TestServedMutationWaitsForLiveOwnerThenCommitsBaseline(t *testing.T) {
 	cfg.Peers["phone"] = phone
 	cfg.Shared["notes"] = config.Folder{Path: root, Peers: []string{"phone"}}
 	callbacks := serveCallbacks(newFolderResolver(cfg, "phone", fingerprint))
-	owner, err := lock.Acquire()
+	owner, err := lock.Acquire("notes")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -344,7 +377,7 @@ func TestServedMutationReturnsLockTimeout(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("XDG_STATE_HOME", filepath.Join(home, "state"))
-	owner, err := lock.Acquire()
+	owner, err := lock.Acquire("notes")
 	if err != nil {
 		t.Fatal(err)
 	}

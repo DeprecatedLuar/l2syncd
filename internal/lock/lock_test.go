@@ -23,12 +23,12 @@ func TestAcquireRejectsContention(t *testing.T) {
 	t.Setenv("HOME", root)
 	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
 
-	first, err := Acquire()
+	first, err := Acquire("notes")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer Release(first)
-	second, err := Acquire()
+	second, err := Acquire("notes")
 	if !errors.Is(err, ErrContended) {
 		t.Fatalf("second acquire error = %v, want contention", err)
 	}
@@ -37,19 +37,56 @@ func TestAcquireRejectsContention(t *testing.T) {
 	}
 }
 
+func TestDifferentFoldersDoNotContend(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
+
+	notes, err := Acquire("notes")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer Release(notes)
+	photos, err := Acquire("photos")
+	if err != nil {
+		t.Fatalf("unrelated folder contended: %v", err)
+	}
+	if err := Release(photos); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAcquireRejectsInvalidFolderName(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
+
+	if _, err := Acquire("Bad Name!"); err == nil {
+		t.Fatal("invalid folder name was accepted")
+	}
+	entries, err := os.ReadDir(filepath.Join(root, "state"))
+	if err == nil {
+		for _, entry := range entries {
+			if filepath.Ext(entry.Name()) == ".lock" {
+				t.Fatalf("invalid folder name created lock file %q", entry.Name())
+			}
+		}
+	}
+}
+
 func TestReleaseAllowsReacquire(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("HOME", root)
 	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
 
-	first, err := Acquire()
+	first, err := Acquire("notes")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := Release(first); err != nil {
 		t.Fatal(err)
 	}
-	second, err := Acquire()
+	second, err := Acquire("notes")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,13 +99,13 @@ func TestAcquireWaitTimesOutWithoutStealingLiveOwner(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("HOME", root)
 	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
-	owner, err := Acquire()
+	owner, err := Acquire("notes")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer Release(owner)
 
-	if _, err := AcquireWait(context.Background(), 20*time.Millisecond); !errors.Is(err, ErrTimeout) {
+	if _, err := AcquireWait(context.Background(), 20*time.Millisecond, "notes"); !errors.Is(err, ErrTimeout) {
 		t.Fatalf("AcquireWait error = %v, want timeout", err)
 	}
 }
@@ -82,7 +119,7 @@ func TestDaemonLockDoesNotBlockMutationLock(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer Release(daemon)
-	mutation, err := Acquire()
+	mutation, err := Acquire("notes")
 	if err != nil {
 		t.Fatalf("mutation lock while daemon lock held: %v", err)
 	}
@@ -91,9 +128,27 @@ func TestDaemonLockDoesNotBlockMutationLock(t *testing.T) {
 	}
 }
 
+func TestConfigLockIsIndependentOfMutationLock(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
+	mutation, err := Acquire("notes")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer Release(mutation)
+	config, err := AcquireConfigWait(context.Background(), 20*time.Millisecond)
+	if err != nil {
+		t.Fatalf("config lock while unrelated mutation lock held: %v", err)
+	}
+	if err := Release(config); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestDeadOwnerLockIsRecovered(t *testing.T) {
 	if os.Getenv(lockHelperEnvironment) == "1" {
-		file, err := Acquire()
+		file, err := Acquire("notes")
 		if err != nil {
 			os.Exit(2)
 		}
@@ -138,7 +193,7 @@ func TestDeadOwnerLockIsRecovered(t *testing.T) {
 	}
 	t.Setenv("HOME", root)
 	t.Setenv("XDG_STATE_HOME", stateHome)
-	file, err := AcquireWait(context.Background(), lockTestWait)
+	file, err := AcquireWait(context.Background(), lockTestWait, "notes")
 	if err != nil {
 		t.Fatalf("acquire after owner death: %v", err)
 	}

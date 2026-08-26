@@ -19,7 +19,7 @@ var errInvalidConfig = errors.New("invalid configuration")
 // callback receives a freshly loaded and validated snapshot while the common
 // mutation lock is held; it decides whether and when to save.
 func withConfigLocked(ctx context.Context, operation func(*config.Config) error) (err error) {
-	lockFile, err := lock.AcquireWait(ctx, lock.DefaultWait)
+	lockFile, err := lock.AcquireConfigWait(ctx, lock.DefaultWait)
 	if err != nil {
 		return err
 	}
@@ -42,7 +42,7 @@ func withConfigLocked(ctx context.Context, operation func(*config.Config) error)
 // command is how the user fixes it. Every other caller must keep going
 // through withConfigLocked so mutations always see a validated snapshot.
 func withConfigFileLocked(ctx context.Context, operation func() error) (err error) {
-	lockFile, err := lock.AcquireWait(ctx, lock.DefaultWait)
+	lockFile, err := lock.AcquireConfigWait(ctx, lock.DefaultWait)
 	if err != nil {
 		return err
 	}

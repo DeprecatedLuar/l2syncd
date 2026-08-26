@@ -3,10 +3,12 @@
 package guard
 
 import (
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/BurntSushi/toml"
@@ -19,11 +21,35 @@ const (
 
 // Marker is the identity and local scan policy for one managed folder.
 type Marker struct {
+	ID     string   `toml:"id"`
 	Name   string   `toml:"name"`
 	Ignore []string `toml:"ignore"`
 }
 
 func MarkerPath(folder string) string { return filepath.Join(folder, markerFilename) }
+
+var markerIDPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+
+// NewMarkerID generates a fresh, immutable folder identity. Only `add` and
+// `join` are permitted to call this: it is the sole source of new ids, and
+// minting one anywhere else would let two unrelated folders that happen to
+// share a name each generate their own id and disagree permanently.
+func NewMarkerID() (string, error) {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", fmt.Errorf("generate marker id: %w", err)
+	}
+	raw[6] = (raw[6] & 0x0f) | 0x40
+	raw[8] = (raw[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", raw[0:4], raw[4:6], raw[6:8], raw[8:10], raw[10:16]), nil
+}
+
+func validateMarkerID(id string) error {
+	if !markerIDPattern.MatchString(id) {
+		return fmt.Errorf("marker id %q is not a valid identity", id)
+	}
+	return nil
+}
 
 // ReadMarker validates an existing folder marker. It never creates or repairs it.
 func ReadMarker(folder string) (Marker, error) {
@@ -35,6 +61,12 @@ func ReadMarker(folder string) (Marker, error) {
 	if strings.TrimSpace(marker.Name) == "" {
 		return Marker{}, errors.New("marker name is empty")
 	}
+	if strings.TrimSpace(marker.ID) == "" {
+		return Marker{}, fmt.Errorf("marker %s has no id; re-register this folder with add or join", path)
+	}
+	if err := validateMarkerID(marker.ID); err != nil {
+		return Marker{}, fmt.Errorf("marker %s: %w", path, err)
+	}
 	return marker, nil
 }
 
@@ -43,6 +75,12 @@ func ReadMarker(folder string) (Marker, error) {
 func WriteMarker(folder string, marker Marker) error {
 	if strings.TrimSpace(marker.Name) == "" {
 		return errors.New("marker name is empty")
+	}
+	if strings.TrimSpace(marker.ID) == "" {
+		return errors.New("marker id is empty")
+	}
+	if err := validateMarkerID(marker.ID); err != nil {
+		return err
 	}
 	temporary, err := os.CreateTemp(folder, ".l2sync-marker-*")
 	if err != nil {

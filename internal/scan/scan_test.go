@@ -18,7 +18,7 @@ import (
 
 func TestDetectChangesAndSkipMarker(t *testing.T) {
 	root := t.TempDir()
-	if err := os.WriteFile(filepath.Join(root, ".l2sync"), []byte("name = \"notes\"\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(root, ".l2sync"), []byte("id = \"00000000-0000-4000-8000-000000000000\"\nname = \"notes\"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(root, "same.txt"), []byte("same"), 0o600); err != nil {
@@ -234,14 +234,14 @@ func TestDetectRejectsHardLinkedRegularFile(t *testing.T) {
 
 func writeTestMarker(t *testing.T, root string) {
 	t.Helper()
-	if err := os.WriteFile(filepath.Join(root, ".l2sync"), []byte("name = \"notes\"\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(root, ".l2sync"), []byte("id = \"00000000-0000-4000-8000-000000000000\"\nname = \"notes\"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 }
 
 func TestDetectSkipsIgnoredFilesAndSymlinks(t *testing.T) {
 	root := t.TempDir()
-	if err := os.WriteFile(filepath.Join(root, ".l2sync"), []byte("name = \"notes\"\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(root, ".l2sync"), []byte("id = \"00000000-0000-4000-8000-000000000000\"\nname = \"notes\"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Mkdir(filepath.Join(root, "node_modules"), 0o700); err != nil {

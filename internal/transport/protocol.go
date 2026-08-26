@@ -108,6 +108,7 @@ func NewAuthErrorForTest(message string) error {
 type message struct {
 	Type      string            `json:"type"`
 	Share     string            `json:"share,omitempty"`
+	Id        string            `json:"id,omitempty"`
 	Path      string            `json:"path,omitempty"`
 	Size      int64             `json:"size,omitempty"`
 	Hash      string            `json:"hash,omitempty"`
@@ -154,7 +155,7 @@ type Callbacks struct {
 	ListShares         func() ([]string, error)
 	BindShare          func(string) (bool, error)
 	UnbindShare        func(string) error
-	ListFiles          func(string) ([]PeerFile, error)
+	ListFiles          func(share, expectedID string) ([]PeerFile, string, error)
 	ReadFile           func(string, string) (io.ReadCloser, error)
 	WriteFile          func(string, string, string, metadata.Manifest, io.Reader) error
 	DeleteFile         func(string, string) error
@@ -224,11 +225,15 @@ func writeListSharesRequest(writer io.Writer) error {
 	return (frameWriter{w: writer}).write(message{Type: messageListShares})
 }
 
-func writeListFilesRequest(writer io.Writer, share string) error {
+// writeListFilesRequest asks a peer to list one share. expectedID, when
+// non-empty, is this installation's folder identity for share: the identity
+// exchanged before any listing (concept.md 5.9). Empty means the caller has
+// not yet learned an id for this folder (join's first request).
+func writeListFilesRequest(writer io.Writer, share, expectedID string) error {
 	if share == "" {
 		return errors.New("share name is empty")
 	}
-	return (frameWriter{w: writer}).write(message{Type: messageListFiles, Share: share})
+	return (frameWriter{w: writer}).write(message{Type: messageListFiles, Share: share, Id: expectedID})
 }
 
 func readShares(reader io.Reader) ([]string, error) {
@@ -253,34 +258,36 @@ func readShares(reader io.Reader) ([]string, error) {
 	}
 }
 
-func readFiles(reader io.Reader) ([]PeerFile, error) {
+// readFiles returns the listed files and the provider's folder id, carried on
+// the terminal end-of-stream message.
+func readFiles(reader io.Reader) ([]PeerFile, string, error) {
 	frames := frameReader{r: bufio.NewReader(reader)}
 	files := make([]PeerFile, 0)
 	seen := make(map[string]bool)
 	for {
 		message, err := frames.read()
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		switch message.Type {
 		case messageFile:
 			if message.Path == "" {
-				return nil, errors.New("peer returned an empty file path")
+				return nil, "", errors.New("peer returned an empty file path")
 			}
 			if err := ValidateRelativePath(message.Path); err != nil {
-				return nil, err
+				return nil, "", err
 			}
 			if message.Size < 0 {
-				return nil, fmt.Errorf("peer returned a negative file size for %q", message.Path)
+				return nil, "", fmt.Errorf("peer returned a negative file size for %q", message.Path)
 			}
 			if err := validateListingEntry(message.Path, message.Hash, message.Directory, seen); err != nil {
-				return nil, err
+				return nil, "", err
 			}
 			files = append(files, PeerFile{Path: message.Path, Size: message.Size, Hash: strings.ToLower(message.Hash), Metadata: message.Metadata, Directory: message.Directory})
 		case messageEnd:
-			return files, nil
+			return files, message.Id, nil
 		default:
-			return nil, fmt.Errorf("unexpected peer message %q", message.Type)
+			return nil, "", fmt.Errorf("unexpected peer message %q", message.Type)
 		}
 	}
 }
@@ -306,23 +313,32 @@ func ListShares(ctx context.Context, endpoint Endpoint) ([]string, error) {
 }
 
 // ListFiles asks a peer for the regular files in one offered share.
-func ListFiles(ctx context.Context, endpoint Endpoint, share string) ([]PeerFile, error) {
+// expectedID is this installation's known folder identity for share, or ""
+// when it has none yet (join's first request for a not-yet-registered
+// folder). When expectedID is non-empty and the peer's identity differs, this
+// is a hard error naming both ids: reconciliation never proceeds on a name
+// match alone (concept.md 5.9). The peer's identity is always returned so a
+// first-time caller can record it.
+func ListFiles(ctx context.Context, endpoint Endpoint, share, expectedID string) ([]PeerFile, string, error) {
 	if endpoint.Address == "" {
-		return nil, errors.New("peer address is empty")
+		return nil, "", errors.New("peer address is empty")
 	}
 	var request bytes.Buffer
-	if err := writeListFilesRequest(&request, share); err != nil {
-		return nil, err
+	if err := writeListFilesRequest(&request, share, expectedID); err != nil {
+		return nil, "", err
 	}
 	output, err := runSSH(ctx, endpoint, false, request.Bytes())
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	files, err := readFiles(bytes.NewReader(output))
+	files, id, err := readFiles(bytes.NewReader(output))
 	if err != nil {
-		return nil, &Error{err: fmt.Errorf("read peer %q file listing: %w", endpoint.Address, err)}
+		return nil, "", &Error{err: fmt.Errorf("read peer %q file listing: %w", endpoint.Address, err)}
 	}
-	return files, nil
+	if expectedID != "" && id != "" && id != expectedID {
+		return nil, "", fmt.Errorf("folder %q identity mismatch: local id %q, peer %q id %q", share, expectedID, endpoint.Name, id)
+	}
+	return files, id, nil
 }
 
 // ReadFile retrieves one regular file from a peer after validating its path
@@ -619,11 +635,11 @@ func Serve(reader io.Reader, writer io.Writer, callbacks Callbacks, handshake *H
 		if callbacks.ListFiles == nil {
 			return errors.New("file listing is not configured")
 		}
-		files, err := callbacks.ListFiles(request.Share)
+		files, id, err := callbacks.ListFiles(request.Share, request.Id)
 		if err != nil {
 			return err
 		}
-		return writeFiles(writer, request.Share, files)
+		return writeFiles(writer, request.Share, id, files)
 	case messageConflictCheck:
 		if callbacks.ConflictCopyExists == nil {
 			return errors.New("conflict collision check is not configured")
@@ -815,7 +831,7 @@ func sha256Sum(data []byte) []byte {
 	return digest[:]
 }
 
-func writeFiles(writer io.Writer, share string, files []PeerFile) error {
+func writeFiles(writer io.Writer, share, id string, files []PeerFile) error {
 	if share == "" {
 		return errors.New("cannot serve an empty share name")
 	}
@@ -837,7 +853,7 @@ func writeFiles(writer io.Writer, share string, files []PeerFile) error {
 			return err
 		}
 	}
-	return responseWriter.write(message{Type: messageEnd})
+	return responseWriter.write(message{Type: messageEnd, Id: id})
 }
 
 func validateSHA256(value string) error {

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"l2syncd/internal/config"
+	"l2syncd/internal/sharename"
 )
 
 var (
@@ -21,19 +22,35 @@ var (
 )
 
 const (
-	mutationLockFilename = "mutation.lock"
-	daemonLockFilename   = "daemon.lock"
-	joinLockFilename     = "join.lock"
-	directoryMode        = 0o700
-	fileMode             = 0o600
-	retryInterval        = 50 * time.Millisecond
-	DefaultWait          = 5 * time.Second
+	mutationLockPrefix = "mutation-"
+	mutationLockSuffix = ".lock"
+	configLockFilename = "config.lock"
+	daemonLockFilename = "daemon.lock"
+	joinLockFilename   = "join.lock"
+	directoryMode      = 0o700
+	fileMode           = 0o600
+	retryInterval      = 50 * time.Millisecond
+	DefaultWait        = 5 * time.Second
 )
 
-// Acquire takes the non-blocking mutation lock and keeps its file open until
-// the returned handle is released.
-func Acquire() (*os.File, error) {
-	return acquire(mutationLockFilename)
+// mutationLockFilename derives the per-folder lock filename. Folders lock
+// independently so one folder's cycle never delays another's, and so a
+// served mutation for an unrelated folder is never blocked behind it.
+func mutationLockFilename(folder string) (string, error) {
+	if err := sharename.Validate(folder); err != nil {
+		return "", fmt.Errorf("mutation lock folder: %w", err)
+	}
+	return mutationLockPrefix + folder + mutationLockSuffix, nil
+}
+
+// Acquire takes the non-blocking mutation lock for folder and keeps its file
+// open until the returned handle is released.
+func Acquire(folder string) (*os.File, error) {
+	filename, err := mutationLockFilename(folder)
+	if err != nil {
+		return nil, err
+	}
+	return acquire(filename)
 }
 
 // AcquireDaemon takes the non-blocking daemon-instance lock. It is separate
@@ -47,11 +64,23 @@ func AcquireDaemon() (*os.File, error) {
 	return file, err
 }
 
-// AcquireWait waits up to timeout for the mutation lock. Kernel flock
+// AcquireWait waits up to timeout for folder's mutation lock. Kernel flock
 // ownership is tied to the open file description: a dead owner is recovered
 // automatically, while a live owner can never be displaced by elapsed time.
-func AcquireWait(ctx context.Context, timeout time.Duration) (*os.File, error) {
-	return acquireWait(ctx, timeout, mutationLockFilename)
+func AcquireWait(ctx context.Context, timeout time.Duration, folder string) (*os.File, error) {
+	filename, err := mutationLockFilename(folder)
+	if err != nil {
+		return nil, err
+	}
+	return acquireWait(ctx, timeout, filename)
+}
+
+// AcquireConfigWait waits up to timeout for the single machine-wide config
+// transaction lock. Config edits are not per-folder: there is one config
+// file, so this stays a distinct lock from any folder's mutation lock rather
+// than sharing a name with one.
+func AcquireConfigWait(ctx context.Context, timeout time.Duration) (*os.File, error) {
+	return acquireWait(ctx, timeout, configLockFilename)
 }
 
 // AcquireJoinWait serializes the outbound join transaction without blocking

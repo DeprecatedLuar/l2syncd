@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 
 	"l2syncd/internal/apply"
 	"l2syncd/internal/config"
@@ -96,7 +97,9 @@ var (
 )
 
 // RunCycle dispatches each bound folder to its deterministic fingerprint
-// initiator. A non-initiator holds no mutation lock while requesting work.
+// initiator, running every folder's cycle concurrently so one folder's
+// network-bound work never delays another's. A non-initiator holds no
+// mutation lock while requesting work.
 func RunCycle(ctx context.Context) (summary CycleSummary, err error) {
 	cfg, err := preflight.LoadConfig()
 	if err != nil {
@@ -106,49 +109,75 @@ func RunCycle(ctx context.Context) (summary CycleSummary, err error) {
 	if err != nil {
 		return summary, err
 	}
-	for _, name := range cycleFolderNames(cfg) {
-		cfg, peerName, endpoint, present, loadErr := loadActiveCycleFolder(ctx, name)
-		if loadErr != nil {
-			return summary, loadErr
-		}
-		if !present {
-			continue
-		}
-		if _, ok := cfg.BoundPeer(name); !ok {
-			return summary, fmt.Errorf("folder %q requires exactly one peer binding", name)
-		}
-		remoteIdentity, err := peerFingerprint(cfg.Peers[peerName])
-		if err != nil {
-			return summary, fmt.Errorf("derive peer %q identity: %w", peerName, err)
-		}
-		initiates, err := localInitiatesCycle(localIdentity, remoteIdentity)
-		if err != nil {
-			return summary, fmt.Errorf("folder %q: %w", name, err)
-		}
-		nowLogger.Info("cycle role resolved", "folder", name, "peer", peerName,
-			"local_fingerprint", localIdentity, "remote_fingerprint", remoteIdentity,
-			"initiates_locally", initiates)
-		var actions int
-		if initiates {
-			actions, err = runInitiatorFolderCycle(ctx, name, peerName, remoteIdentity)
-		} else {
-			actions, err = requestPeerCycle(ctx, endpoint, name)
-		}
-		summary.Outcomes = append(summary.Outcomes, FolderOutcome{
-			Name:             name,
-			InitiatedLocally: initiates,
-			Actions:          actions,
-			Committed:        err == nil,
-		})
-		if err != nil {
-			nowLogger.Error("folder cycle failed", "folder", name, "initiated_locally", initiates, "actions", actions, "error", err)
-			return summary, fmt.Errorf("%s: %w", name, err)
-		}
-		nowLogger.Info("folder cycle completed", "folder", name, "initiated_locally", initiates, "actions", actions)
-		summary.Folders++
-		summary.Actions += actions
+	names := cycleFolderNames(cfg)
+	outcomes := make([]*FolderOutcome, len(names))
+	errs := make([]error, len(names))
+	var wg sync.WaitGroup
+	for i, name := range names {
+		wg.Add(1)
+		go func(i int, name string) {
+			defer wg.Done()
+			outcomes[i], errs[i] = runFolderCycle(ctx, localIdentity, name)
+		}(i, name)
 	}
-	return summary, nil
+	wg.Wait()
+	for i, name := range names {
+		if outcomes[i] != nil {
+			summary.Outcomes = append(summary.Outcomes, *outcomes[i])
+			if errs[i] == nil {
+				summary.Folders++
+				summary.Actions += outcomes[i].Actions
+			}
+		}
+		if errs[i] != nil && err == nil {
+			err = fmt.Errorf("%s: %w", name, errs[i])
+		}
+	}
+	return summary, err
+}
+
+// runFolderCycle resolves and runs one folder's cycle in isolation so
+// RunCycle can dispatch every folder concurrently. A nil outcome means the
+// folder is no longer configured (loadActiveCycleFolder found it absent);
+// that is not an error.
+func runFolderCycle(ctx context.Context, localIdentity, name string) (*FolderOutcome, error) {
+	cfg, peerName, endpoint, present, loadErr := loadActiveCycleFolder(ctx, name)
+	if loadErr != nil {
+		return nil, loadErr
+	}
+	if !present {
+		return nil, nil
+	}
+	if _, ok := cfg.BoundPeer(name); !ok {
+		return nil, fmt.Errorf("folder %q requires exactly one peer binding", name)
+	}
+	remoteIdentity, err := peerFingerprint(cfg.Peers[peerName])
+	if err != nil {
+		return nil, fmt.Errorf("derive peer %q identity: %w", peerName, err)
+	}
+	initiates, err := localInitiatesCycle(localIdentity, remoteIdentity)
+	if err != nil {
+		return nil, fmt.Errorf("folder %q: %w", name, err)
+	}
+	nowLogger.Info("cycle role resolved", "folder", name, "peer", peerName,
+		"local_fingerprint", localIdentity, "remote_fingerprint", remoteIdentity,
+		"initiates_locally", initiates)
+	if initiates {
+		actions, err := runInitiatorFolderCycle(ctx, name, peerName, remoteIdentity)
+		return folderOutcome(name, initiates, actions, err)
+	}
+	actions, err := requestPeerCycle(ctx, endpoint, name)
+	return folderOutcome(name, initiates, actions, err)
+}
+
+func folderOutcome(name string, initiates bool, actions int, err error) (*FolderOutcome, error) {
+	outcome := FolderOutcome{Name: name, InitiatedLocally: initiates, Actions: actions, Committed: err == nil}
+	if err != nil {
+		nowLogger.Error("folder cycle failed", "folder", name, "initiated_locally", initiates, "actions", actions, "error", err)
+		return &outcome, err
+	}
+	nowLogger.Info("folder cycle completed", "folder", name, "initiated_locally", initiates, "actions", actions)
+	return &outcome, nil
 }
 
 // cycleFolderActivationAttempts bounds the reload retry in
@@ -205,16 +234,12 @@ func localInitiatesCycle(localIdentity, remoteIdentity string) (bool, error) {
 	return localIdentity < remoteIdentity, nil
 }
 
+// runInitiatorFolderCycle plans and applies one folder's cycle. It holds no
+// lock across this span: outbound transport calls to the peer must never
+// wait behind this installation's own local mutation lock (see
+// withFolderLock), which serve.go's forced-command handlers also acquire
+// for unrelated, concurrent, per-folder work.
 func runInitiatorFolderCycle(ctx context.Context, name, expectedPeer, authenticatedFingerprint string) (actions int, err error) {
-	lockFile, err := lock.AcquireWait(ctx, lock.DefaultWait)
-	if err != nil {
-		return 0, err
-	}
-	defer func() {
-		if releaseErr := lock.Release(lockFile); releaseErr != nil {
-			err = errors.Join(err, releaseErr)
-		}
-	}()
 	cfg, err := loadConfigForTransaction()
 	if err != nil {
 		return 0, err
@@ -247,6 +272,24 @@ func runInitiatorFolderCycle(ctx context.Context, name, expectedPeer, authentica
 	return runBoundFolderPlan(ctx, cfg, name, expectedPeer)
 }
 
+// withFolderLock serializes a local filesystem mutation against serve.go's
+// forced-command handlers for the same folder. It must wrap only the local
+// write itself, never a transport round trip: a peer waiting on this
+// installation's response must never be blocked behind a lock this
+// installation is holding while it, in turn, waits on that same peer.
+func withFolderLock(ctx context.Context, folder string, fn func() error) (err error) {
+	lockFile, err := lock.AcquireWait(ctx, lock.DefaultWait, folder)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if releaseErr := lock.Release(lockFile); releaseErr != nil {
+			err = errors.Join(err, releaseErr)
+		}
+	}()
+	return fn()
+}
+
 func planBoundFolder(ctx context.Context, cfg config.Config, name, expectedPeer string) (int, error) {
 	if folder, exists := cfg.Shared[name]; exists {
 		peer, endpoint, err := findPeerForShared(ctx, cfg, name)
@@ -271,7 +314,7 @@ func planFolder(ctx context.Context, cfg config.Config, name, path, peer string,
 	if err != nil {
 		return 0, fmt.Errorf("read marker: %w", err)
 	}
-	remoteFiles, err := transport.ListFiles(ctx, endpoint, name)
+	remoteFiles, _, err := transport.ListFiles(ctx, endpoint, name, marker.ID)
 	if err != nil {
 		return 0, fmt.Errorf("peer %q listing: %w", peer, err)
 	}
@@ -331,7 +374,9 @@ func planFolder(ctx context.Context, cfg config.Config, name, path, peer string,
 	if err := restoreDirectoryMetadata(ctx, plan.Actions, directoryActions, name, path, remoteIdentity, endpoint, local.Snapshot, remote); err != nil {
 		return 0, err
 	}
-	if err := commitFolderBaseline(name, path, marker.Ignore); err != nil {
+	if err := withFolderLock(ctx, name, func() error {
+		return commitFolderBaseline(name, path, marker.Ignore)
+	}); err != nil {
 		nowLogger.Error("initiator mutation applied WITHOUT baseline commit", "folder", name, "peer", peer,
 			"actions", len(plan.Actions), "directory_actions", len(plan.DirectoryActions), "error", err)
 		return 0, err
@@ -385,7 +430,9 @@ func restoreDirectoryMetadata(ctx context.Context, fileActions, directoryActions
 		if !exists {
 			continue
 		}
-		if err := apply.ApplyDirectory(root, path, manifest); err != nil {
+		if err := withFolderLock(ctx, share, func() error {
+			return apply.ApplyDirectory(root, path, manifest)
+		}); err != nil {
 			return err
 		}
 		if err := transport.ApplyDirectory(ctx, endpoint, share, path, manifest); err != nil {
@@ -408,7 +455,7 @@ func prepareContentReuse(ctx context.Context, actions []engine.Action, share, ro
 			}
 			reused[action.Path] = ok
 		case (action.Kind == engine.Pull || action.Kind == engine.Resurrect) && remoteSource:
-			ok, err := reuseLocal(root, action.Path, remote.Files[action.Path], baseline)
+			ok, err := reuseLocal(ctx, share, root, action.Path, remote.Files[action.Path], baseline)
 			if err != nil {
 				return nil, err
 			}
@@ -421,7 +468,9 @@ func prepareContentReuse(ctx context.Context, actions []engine.Action, share, ro
 func applyDirectoryDelete(ctx context.Context, action engine.Action, share, root, provider string, endpoint transport.Endpoint) error {
 	remoteSource := action.Source == provider
 	if remoteSource {
-		return apply.DeleteDirectory(root, action.Path)
+		return withFolderLock(ctx, share, func() error {
+			return apply.DeleteDirectory(root, action.Path)
+		})
 	}
 	return transport.DeleteDirectory(ctx, endpoint, share, action.Path)
 }
@@ -435,7 +484,7 @@ func findPeerForShared(ctx context.Context, cfg config.Config, name string) (str
 	if err != nil {
 		return "", transport.Endpoint{}, err
 	}
-	if _, err := transport.ListFiles(ctx, endpoint, name); err != nil {
+	if _, _, err := transport.ListFiles(ctx, endpoint, name, ""); err != nil {
 		return "", transport.Endpoint{}, fmt.Errorf("peer %q does not serve folder %q: %w", peer, name, err)
 	}
 	return peer, endpoint, nil
@@ -457,7 +506,9 @@ func applyAction(ctx context.Context, action engine.Action, share, root, provide
 		return pushFile(ctx, endpoint, share, root, action.Path, local.Files[action.Path])
 	case engine.Delete:
 		if remoteSource {
-			return apply.Delete(root, action.Path)
+			return withFolderLock(ctx, share, func() error {
+				return apply.Delete(root, action.Path)
+			})
 		}
 		return transport.DeleteFile(ctx, endpoint, share, action.Path)
 	case engine.Conflict:
@@ -486,7 +537,9 @@ func applyAction(ctx context.Context, action engine.Action, share, root, provide
 			if err != nil {
 				return fmt.Errorf("read conflict winner %q from peer: %w", action.Path, err)
 			}
-			return apply.WriteConflictWinnerWithSuffix(root, action.Path, suffix, bytes.NewReader(data), remoteFile.Hash, remoteFile.Metadata)
+			return withFolderLock(ctx, share, func() error {
+				return apply.WriteConflictWinnerWithSuffix(root, action.Path, suffix, bytes.NewReader(data), remoteFile.Hash, remoteFile.Metadata)
+			})
 		}
 		data, err := readShareFile(root, action.Path)
 		if err != nil {
@@ -496,7 +549,9 @@ func applyAction(ctx context.Context, action engine.Action, share, root, provide
 		if err != nil {
 			return fmt.Errorf("read conflict loser %q from peer: %w", action.Path, err)
 		}
-		if err := apply.WriteConflictCopyWithSuffix(root, action.Path, suffix, bytes.NewReader(losing), remoteFile.Hash, remoteFile.Metadata); err != nil {
+		if err := withFolderLock(ctx, share, func() error {
+			return apply.WriteConflictCopyWithSuffix(root, action.Path, suffix, bytes.NewReader(losing), remoteFile.Hash, remoteFile.Metadata)
+		}); err != nil {
 			return fmt.Errorf("preserve conflict loser %q locally: %w", action.Path, err)
 		}
 		if err := transport.WriteConflictFile(ctx, endpoint, share, action.Path, data, localFile.Hash, suffix, localFile.Metadata); err != nil {
@@ -523,7 +578,9 @@ func pullFile(ctx context.Context, endpoint transport.Endpoint, share, root, rel
 	if err != nil {
 		return fmt.Errorf("read %q from peer: %w", relative, err)
 	}
-	return apply.WriteWithMetadata(root, relative, bytes.NewReader(data), file.Hash, file.Metadata)
+	return withFolderLock(ctx, share, func() error {
+		return apply.WriteWithMetadata(root, relative, bytes.NewReader(data), file.Hash, file.Metadata)
+	})
 }
 
 func pushFile(ctx context.Context, endpoint transport.Endpoint, share, root, relative string, file state.File) error {
@@ -546,12 +603,15 @@ func readShareFile(root, relative string) ([]byte, error) {
 	return io.ReadAll(file)
 }
 
-func reuseLocal(root, relative string, offered state.File, baseline state.Baseline) (bool, error) {
+func reuseLocal(ctx context.Context, share, root, relative string, offered state.File, baseline state.Baseline) (bool, error) {
 	for source, file := range baseline.Files {
 		if file.Hash != offered.Hash {
 			continue
 		}
-		if err := apply.Reuse(root, relative, source, offered.Hash, offered.Metadata); err != nil {
+		err := withFolderLock(ctx, share, func() error {
+			return apply.Reuse(root, relative, source, offered.Hash, offered.Metadata)
+		})
+		if err != nil {
 			if errors.Is(err, apply.ErrReuseMismatch) {
 				continue
 			}

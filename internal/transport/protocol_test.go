@@ -52,7 +52,7 @@ func TestFileListingCarriesMetadataAndDirectories(t *testing.T) {
 	if err := writer.write(message{Type: messageEnd}); err != nil {
 		t.Fatal(err)
 	}
-	entries, err := readFiles(&stream)
+	entries, _, err := readFiles(&stream)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -132,7 +132,7 @@ func TestReadFilesRequiresEndMarker(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err := readFiles(&stream)
+	_, _, err := readFiles(&stream)
 	if !errors.Is(err, errUnexpectedEnd) {
 		t.Fatalf("readFiles error = %v, want truncated listing error", err)
 	}
@@ -140,23 +140,26 @@ func TestReadFilesRequiresEndMarker(t *testing.T) {
 
 func TestServePeerSortsAndTerminatesFileListing(t *testing.T) {
 	var request bytes.Buffer
-	if err := writeListFilesRequest(&request, "notes"); err != nil {
+	if err := writeListFilesRequest(&request, "notes", ""); err != nil {
 		t.Fatal(err)
 	}
 	var response bytes.Buffer
 	files := []PeerFile{{Path: "z.txt", Size: 3, Hash: protocolTestHash}, {Path: "a.txt", Size: 1, Hash: protocolTestHash}}
-	err := Serve(&request, &response, Callbacks{ListFiles: func(share string) ([]PeerFile, error) {
+	err := Serve(&request, &response, Callbacks{ListFiles: func(share, expectedID string) ([]PeerFile, string, error) {
 		if share != "notes" {
 			t.Fatalf("file lister share = %q, want notes", share)
 		}
-		return files, nil
+		return files, "folder-id", nil
 	}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := readFiles(&response)
+	got, id, err := readFiles(&response)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if id != "folder-id" {
+		t.Fatalf("id = %q, want folder-id", id)
 	}
 	if len(got) != 2 || got[0].Path != "a.txt" || got[1].Path != "z.txt" {
 		t.Fatalf("files = %#v, want sorted file listing", got)
@@ -165,25 +168,50 @@ func TestServePeerSortsAndTerminatesFileListing(t *testing.T) {
 
 func TestServePeerDispatchesFileListing(t *testing.T) {
 	var request bytes.Buffer
-	if err := writeListFilesRequest(&request, "notes"); err != nil {
+	if err := writeListFilesRequest(&request, "notes", ""); err != nil {
 		t.Fatal(err)
 	}
 	var response bytes.Buffer
-	err := Serve(&request, &response, Callbacks{ListFiles: func(share string) ([]PeerFile, error) {
+	err := Serve(&request, &response, Callbacks{ListFiles: func(share, expectedID string) ([]PeerFile, string, error) {
 		if share != "notes" {
 			t.Fatalf("file lister share = %q, want notes", share)
 		}
-		return []PeerFile{{Path: "notes/a.txt", Size: 4, Hash: protocolTestHash}}, nil
+		return []PeerFile{{Path: "notes/a.txt", Size: 4, Hash: protocolTestHash}}, "folder-id", nil
 	}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	files, err := readFiles(&response)
+	files, _, err := readFiles(&response)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(files) != 1 || files[0].Path != "notes/a.txt" || files[0].Size != 4 {
 		t.Fatalf("files = %#v, want one dispatched file", files)
+	}
+}
+
+func TestServePeerRejectsIdentityMismatchBeforeListing(t *testing.T) {
+	var request bytes.Buffer
+	if err := writeListFilesRequest(&request, "notes", "requester-id"); err != nil {
+		t.Fatal(err)
+	}
+	var response bytes.Buffer
+	listed := false
+	err := Serve(&request, &response, Callbacks{ListFiles: func(share, expectedID string) ([]PeerFile, string, error) {
+		if expectedID != "requester-id" {
+			t.Fatalf("expectedID = %q, want requester-id", expectedID)
+		}
+		listed = true
+		return nil, "", fmt.Errorf("folder %q identity mismatch: requester expects id %q, provider has %q", share, expectedID, "provider-id")
+	}}, nil)
+	if err == nil {
+		t.Fatal("Serve() error = nil, want identity mismatch error naming both ids")
+	}
+	if !strings.Contains(err.Error(), "requester-id") || !strings.Contains(err.Error(), "provider-id") {
+		t.Fatalf("Serve() error = %v, want both ids named", err)
+	}
+	if !listed {
+		t.Fatal("ListFiles callback was not invoked with the requester's expected id")
 	}
 }
 
@@ -239,7 +267,7 @@ func TestReadFilesRejectsUnsafePath(t *testing.T) {
 	if err := (frameWriter{w: &stream}).write(message{Type: messageFile, Path: "../outside", Size: 1}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := readFiles(&stream); err == nil {
+	if _, _, err := readFiles(&stream); err == nil {
 		t.Fatal("readFiles error = nil, want unsafe path error")
 	}
 }
@@ -290,7 +318,7 @@ func TestReadFilesRejectsInvalidHashesDuplicatesAndTypeCollisions(t *testing.T) 
 			if err := writer.write(message{Type: messageEnd}); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := readFiles(&stream); err == nil {
+			if _, _, err := readFiles(&stream); err == nil {
 				t.Fatal("readFiles accepted invalid listing")
 			}
 		})

@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -30,6 +29,15 @@ const (
 	successExitCode       = 0
 	invalidConfigExitCode = 2
 )
+
+func newTestMarker(t *testing.T, name string, ignore ...string) guard.Marker {
+	t.Helper()
+	id, err := guard.NewMarkerID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return guard.Marker{ID: id, Name: name, Ignore: ignore}
+}
 
 func TestAddListAndRemoveShare(t *testing.T) {
 	root := t.TempDir()
@@ -89,7 +97,7 @@ func TestAddRollsBackOnlyMarkerCreatedByFailedCommit(t *testing.T) {
 			if err := os.Mkdir(folder, 0o700); err != nil {
 				t.Fatal(err)
 			}
-			wantMarker := guard.Marker{Name: "notes", Ignore: []string{"private/**"}}
+			wantMarker := newTestMarker(t, "notes", []string{"private/**"}...)
 			if existingMarker {
 				if err := guard.WriteMarker(folder, wantMarker); err != nil {
 					t.Fatal(err)
@@ -137,7 +145,7 @@ func TestRemoveRemoteUnbindsProviderBeforeLocalRegistration(t *testing.T) {
 	if err := os.Mkdir(folder, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := guard.WriteMarker(folder, guard.Marker{Name: "notes"}); err != nil {
+	if err := guard.WriteMarker(folder, newTestMarker(t, "notes")); err != nil {
 		t.Fatal(err)
 	}
 	cfg := config.New()
@@ -178,7 +186,7 @@ func TestRemoveRemoteOfflineRetainsRetryableLocalRegistration(t *testing.T) {
 	if err := os.Mkdir(folder, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := guard.WriteMarker(folder, guard.Marker{Name: "notes"}); err != nil {
+	if err := guard.WriteMarker(folder, newTestMarker(t, "notes")); err != nil {
 		t.Fatal(err)
 	}
 	cfg := config.New()
@@ -212,6 +220,64 @@ func TestDeterministicConflictSuffixUsesLosingFingerprint(t *testing.T) {
 	}
 }
 
+// TestRunCycleOverlapsIndependentFolders proves a folder syncing does not
+// delay a cycle for a different folder: RunCycle must not process folders
+// one at a time.
+func TestRunCycleOverlapsIndependentFolders(t *testing.T) {
+	root, cfg := cycleTestConfig(t, true)
+	firstFolder := filepath.Join(root, "notes")
+	secondFolder := filepath.Join(root, "photos")
+	if err := os.Mkdir(secondFolder, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Shared["notes"] = config.Folder{Path: firstFolder, Peers: []string{"phone"}}
+	cfg.Shared["photos"] = config.Folder{Path: secondFolder, Peers: []string{"phone"}}
+	if err := guard.WriteMarker(firstFolder, newTestMarker(t, "notes")); err != nil {
+		t.Fatal(err)
+	}
+	if err := guard.WriteMarker(secondFolder, newTestMarker(t, "photos")); err != nil {
+		t.Fatal(err)
+	}
+	if err := config.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	original := runBoundFolderPlan
+	entered := make(chan string, 2)
+	release := make(chan struct{})
+	runBoundFolderPlan = func(_ context.Context, _ config.Config, name, _ string) (int, error) {
+		entered <- name
+		<-release
+		return 0, nil
+	}
+	t.Cleanup(func() { runBoundFolderPlan = original })
+
+	done := make(chan struct{})
+	go func() {
+		RunCycle(context.Background())
+		close(done)
+	}()
+
+	seen := map[string]bool{}
+	for range 2 {
+		select {
+		case name := <-entered:
+			seen[name] = true
+		case <-time.After(time.Second):
+			t.Fatal("both folder cycles did not start concurrently")
+		}
+	}
+	if !seen["notes"] || !seen["photos"] {
+		t.Fatalf("folders entered = %#v", seen)
+	}
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("RunCycle did not complete after folders released")
+	}
+}
+
 func TestCycleSharedNamesSkipsUnboundOffers(t *testing.T) {
 	cfg := config.New()
 	cfg.Shared["bound"] = config.Folder{Path: "/bound", Peers: []string{"phone"}}
@@ -237,7 +303,7 @@ func TestNonInitiatorRequestsActualCycleResultWithoutMutationLock(t *testing.T) 
 	root, cfg := cycleTestConfig(t, false)
 	folder := filepath.Join(root, "notes")
 	cfg.Shared["notes"] = config.Folder{Path: folder, Peers: []string{"phone"}}
-	if err := guard.WriteMarker(folder, guard.Marker{Name: "notes"}); err != nil {
+	if err := guard.WriteMarker(folder, newTestMarker(t, "notes")); err != nil {
 		t.Fatal(err)
 	}
 	if err := config.Save(cfg); err != nil {
@@ -249,7 +315,7 @@ func TestNonInitiatorRequestsActualCycleResultWithoutMutationLock(t *testing.T) 
 		if endpoint.Name != "phone" || name != "notes" {
 			t.Fatalf("cycle request = %q/%q", endpoint.Name, name)
 		}
-		lockFile, err := lock.Acquire()
+		lockFile, err := lock.Acquire("notes")
 		if err != nil {
 			return 0, fmt.Errorf("request made while mutation lock held: %w", err)
 		}
@@ -276,11 +342,19 @@ func TestNonInitiatorRequestsActualCycleResultWithoutMutationLock(t *testing.T) 
 	}
 }
 
-func TestInitiatorSerializesSimultaneousTriggersAndRejectsWrongPeer(t *testing.T) {
+// TestInitiatorDoesNotHoldMutationLockAcrossPlanning proves the initiator no
+// longer holds any lock spanning planning: a folder cycle proceeds even
+// while an outside actor (e.g. a concurrent serve.go mutation for the same
+// folder) is mid-hold of that folder's mutation lock. Holding a lock across
+// the whole cycle -- including outbound transport round trips -- was the
+// documented cause of cross-process "timed out waiting for the l2sync
+// mutation lock" failures; withFolderLock (now.go) only wraps the narrow
+// local-write and commit calls, not planning itself.
+func TestInitiatorDoesNotHoldMutationLockAcrossPlanning(t *testing.T) {
 	root, cfg := cycleTestConfig(t, true)
 	folder := filepath.Join(root, "notes")
 	cfg.Shared["notes"] = config.Folder{Path: folder, Peers: []string{"phone"}}
-	if err := guard.WriteMarker(folder, guard.Marker{Name: "notes"}); err != nil {
+	if err := guard.WriteMarker(folder, newTestMarker(t, "notes")); err != nil {
 		t.Fatal(err)
 	}
 	if err := config.Save(cfg); err != nil {
@@ -292,59 +366,36 @@ func TestInitiatorSerializesSimultaneousTriggersAndRejectsWrongPeer(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	firstEntered := make(chan struct{})
-	releaseFirst := make(chan struct{})
-	secondEntered := make(chan struct{})
-	var calls int
-	var callsMu sync.Mutex
+	entered := make(chan struct{})
 	runBoundFolderPlan = func(_ context.Context, _ config.Config, name, peer string) (int, error) {
 		if name != "notes" || peer != "phone" {
 			return 0, fmt.Errorf("unexpected plan target %q/%q", peer, name)
 		}
-		callsMu.Lock()
-		calls++
-		call := calls
-		callsMu.Unlock()
-		if call == 1 {
-			close(firstEntered)
-			<-releaseFirst
-			return 1, nil
-		}
-		close(secondEntered)
-		return 0, nil
+		close(entered)
+		return 3, nil
 	}
 	t.Cleanup(func() { runBoundFolderPlan = original })
 
-	results := make(chan int, 2)
-	errors := make(chan error, 2)
+	held, err := lock.Acquire("notes")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Release(held)
+
+	done := make(chan error, 1)
 	go func() {
-		value, err := runInitiatorFolderCycle(context.Background(), "notes", "phone", remoteFingerprint)
-		results <- value
-		errors <- err
+		_, err := runInitiatorFolderCycle(context.Background(), "notes", "phone", remoteFingerprint)
+		done <- err
 	}()
-	<-firstEntered
-	secondStarted := make(chan struct{})
-	go func() {
-		close(secondStarted)
-		value, err := runInitiatorFolderCycle(context.Background(), "notes", "phone", remoteFingerprint)
-		results <- value
-		errors <- err
-	}()
-	<-secondStarted
 	select {
-	case <-secondEntered:
-		t.Fatal("second trigger entered planning before the first released the mutation lock")
-	case <-time.After(25 * time.Millisecond):
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("planning did not start while the folder's mutation lock was externally held")
 	}
-	close(releaseFirst)
-	for range 2 {
-		if err := <-errors; err != nil {
-			t.Fatal(err)
-		}
+	if err := <-done; err != nil {
+		t.Fatal(err)
 	}
-	if first, second := <-results, <-results; first+second != 1 {
-		t.Fatalf("serialized action results = %d, %d", first, second)
-	}
+
 	if _, err := runInitiatorFolderCycle(context.Background(), "notes", "other", remoteFingerprint); err == nil {
 		t.Fatal("wrong authenticated peer triggered a folder cycle")
 	}
@@ -354,7 +405,7 @@ func TestInitiatorRejectsDelayedSessionAfterPeerKeyReplacement(t *testing.T) {
 	root, cfg := cycleTestConfig(t, true)
 	folder := filepath.Join(root, "notes")
 	cfg.Shared["notes"] = config.Folder{Path: folder, Peers: []string{"phone"}}
-	if err := guard.WriteMarker(folder, guard.Marker{Name: "notes"}); err != nil {
+	if err := guard.WriteMarker(folder, newTestMarker(t, "notes")); err != nil {
 		t.Fatal(err)
 	}
 	authenticatedFingerprint, err := peerFingerprint(cfg.Peers["phone"])
@@ -381,7 +432,7 @@ func TestCommitJoinedFolderRejectsExistingRemoteWithoutExpectedBinding(t *testin
 	if err := os.Mkdir(folder, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := guard.WriteMarker(folder, guard.Marker{Name: "notes"}); err != nil {
+	if err := guard.WriteMarker(folder, newTestMarker(t, "notes")); err != nil {
 		t.Fatal(err)
 	}
 	cfg := config.New()
@@ -390,7 +441,7 @@ func TestCommitJoinedFolderRejectsExistingRemoteWithoutExpectedBinding(t *testin
 	if err := config.Save(cfg); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := commitJoinedFolder("notes", folder, "phone", cfg.Peers["phone"]); err == nil || !strings.Contains(err.Error(), "bind") {
+	if _, err := commitJoinedFolder("notes", folder, "phone", cfg.Peers["phone"], ""); err == nil || !strings.Contains(err.Error(), "bind") {
 		t.Fatalf("existing malformed remote registration = %v", err)
 	}
 }
@@ -448,6 +499,10 @@ func TestFreshJoinBindsBeforeAuthorizedListing(t *testing.T) {
 		joinFindProvider, joinBindShare, joinUnbindShare, joinListFiles = originalFind, originalBind, originalUnbind, originalList
 	})
 	bound := false
+	wantProviderID, err := guard.NewMarkerID()
+	if err != nil {
+		t.Fatal(err)
+	}
 	joinFindProvider = func(context.Context, config.Config, string) (string, transport.Endpoint, error) {
 		return "phone", transport.Endpoint{Name: "phone"}, nil
 	}
@@ -459,11 +514,11 @@ func TestFreshJoinBindsBeforeAuthorizedListing(t *testing.T) {
 		bound = false
 		return nil
 	}
-	joinListFiles = func(context.Context, transport.Endpoint, string) ([]transport.PeerFile, error) {
+	joinListFiles = func(context.Context, transport.Endpoint, string, string) ([]transport.PeerFile, string, error) {
 		if !bound {
-			return nil, errors.New("listing reached before binding authorization")
+			return nil, "", errors.New("listing reached before binding authorization")
 		}
-		return nil, nil
+		return nil, wantProviderID, nil
 	}
 	var stderr bytes.Buffer
 	if code := Join([]string{"notes", folder}, &stderr); code != joinExitOK {
@@ -475,6 +530,13 @@ func TestFreshJoinBindsBeforeAuthorizedListing(t *testing.T) {
 	}
 	if joined := loaded.Remote["notes"]; joined.Path != folder || !reflect.DeepEqual(joined.Peers, []string{"phone"}) {
 		t.Fatalf("joined config = %#v", loaded)
+	}
+	marker, err := guard.ReadMarker(folder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if marker.ID != wantProviderID {
+		t.Fatalf("joined marker id = %q, want provider id %q", marker.ID, wantProviderID)
 	}
 }
 
@@ -502,8 +564,8 @@ func TestFreshJoinListingFailureCompensatesOnlyNewRemoteBinding(t *testing.T) {
 	joinBindShare = func(context.Context, transport.Endpoint, string) (bool, error) { return true, nil }
 	unbound := false
 	joinUnbindShare = func(context.Context, transport.Endpoint, string) error { unbound = true; return nil }
-	joinListFiles = func(context.Context, transport.Endpoint, string) ([]transport.PeerFile, error) {
-		return nil, errors.New("authorization verification failed")
+	joinListFiles = func(context.Context, transport.Endpoint, string, string) ([]transport.PeerFile, string, error) {
+		return nil, "", errors.New("authorization verification failed")
 	}
 	var stderr bytes.Buffer
 	if code := Join([]string{"notes", folder}, &stderr); code == joinExitOK {
@@ -545,15 +607,15 @@ func TestFreshJoinPeerIdentityChangeCompensates(t *testing.T) {
 	joinBindShare = func(context.Context, transport.Endpoint, string) (bool, error) { return true, nil }
 	unbound := false
 	joinUnbindShare = func(context.Context, transport.Endpoint, string) error { unbound = true; return nil }
-	joinListFiles = func(context.Context, transport.Endpoint, string) ([]transport.PeerFile, error) {
+	joinListFiles = func(context.Context, transport.Endpoint, string, string) ([]transport.PeerFile, string, error) {
 		changed, err := config.Load()
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		peer := changed.Peers["phone"]
 		peer.Address = "replacement-address"
 		changed.Peers["phone"] = peer
-		return nil, config.Save(changed)
+		return nil, "", config.Save(changed)
 	}
 	var stderr bytes.Buffer
 	if code := Join([]string{"notes", folder}, &stderr); code == joinExitOK {
@@ -580,11 +642,11 @@ func TestJoinMarkerAndLocalBindingRegistrationAreIdempotent(t *testing.T) {
 	if err := os.Mkdir(folder, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	wantMarker := guard.Marker{Name: "notes", Ignore: []string{"private/**"}}
+	wantMarker := newTestMarker(t, "notes", []string{"private/**"}...)
 	if err := guard.WriteMarker(folder, wantMarker); err != nil {
 		t.Fatal(err)
 	}
-	created, err := prepareJoinMarker(folder, "notes")
+	created, err := prepareJoinMarker(folder, "notes", wantMarker.ID)
 	if err != nil || created {
 		t.Fatalf("prepare existing marker = %v, %v", created, err)
 	}
@@ -593,10 +655,10 @@ func TestJoinMarkerAndLocalBindingRegistrationAreIdempotent(t *testing.T) {
 	if err := config.Save(cfg); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := commitJoinedFolder("notes", folder, "phone", cfg.Peers["phone"]); err != nil {
+	if _, err := commitJoinedFolder("notes", folder, "phone", cfg.Peers["phone"], wantMarker.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := commitJoinedFolder("notes", folder, "phone", cfg.Peers["phone"]); err != nil {
+	if _, err := commitJoinedFolder("notes", folder, "phone", cfg.Peers["phone"], wantMarker.ID); err != nil {
 		t.Fatalf("idempotent registration: %v", err)
 	}
 	marker, err := guard.ReadMarker(folder)
@@ -752,7 +814,7 @@ func TestConfigEditOpensInvalidConfigForRepair(t *testing.T) {
 	if err := os.Mkdir(remotePath, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := guard.WriteMarker(remotePath, guard.Marker{Name: "testsync"}); err != nil {
+	if err := guard.WriteMarker(remotePath, newTestMarker(t, "testsync")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -994,7 +1056,7 @@ func TestListVerifiesRemoteProvider(t *testing.T) {
 	if err := os.Mkdir(remotePath, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := guard.WriteMarker(remotePath, guard.Marker{Name: "notes"}); err != nil {
+	if err := guard.WriteMarker(remotePath, newTestMarker(t, "notes")); err != nil {
 		t.Fatal(err)
 	}
 	cfg := config.New()
@@ -1033,7 +1095,7 @@ func TestListKeepsLocalEntriesWhenPeerIsUnreachable(t *testing.T) {
 	if err := os.Mkdir(sharedPath, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := guard.WriteMarker(sharedPath, guard.Marker{Name: "notes"}); err != nil {
+	if err := guard.WriteMarker(sharedPath, newTestMarker(t, "notes")); err != nil {
 		t.Fatal(err)
 	}
 	cfg := config.New()

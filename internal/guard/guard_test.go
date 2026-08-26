@@ -10,7 +10,11 @@ import (
 
 func TestMarkerRoundTrip(t *testing.T) {
 	root := t.TempDir()
-	want := Marker{Name: "notes", Ignore: []string{"node_modules", "*.swp"}}
+	id, err := NewMarkerID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Marker{ID: id, Name: "notes", Ignore: []string{"node_modules", "*.swp"}}
 	if err := WriteMarker(root, want); err != nil {
 		t.Fatal(err)
 	}
@@ -18,7 +22,7 @@ func TestMarkerRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Name != want.Name || len(got.Ignore) != len(want.Ignore) {
+	if got.ID != want.ID || got.Name != want.Name || len(got.Ignore) != len(want.Ignore) {
 		t.Fatalf("marker = %#v, want %#v", got, want)
 	}
 }
@@ -28,11 +32,55 @@ func TestReadMarkerRejectsMissingAndInvalidFiles(t *testing.T) {
 	if _, err := ReadMarker(root); err == nil {
 		t.Fatal("ReadMarker() error = nil for missing marker")
 	}
-	if err := os.WriteFile(filepath.Join(root, markerFilename), []byte("name = \"\"\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(root, markerFilename), []byte("id = \"\"\nname = \"\"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := ReadMarker(root); err == nil {
 		t.Fatal("ReadMarker() error = nil for empty marker name")
+	}
+}
+
+func TestReadMarkerRejectsMissingID(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, markerFilename), []byte("name = \"notes\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadMarker(root); err == nil {
+		t.Fatal("ReadMarker() error = nil for marker missing id")
+	}
+}
+
+func TestReadMarkerRejectsMalformedID(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, markerFilename), []byte("id = \"not-a-uuid\"\nname = \"notes\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadMarker(root); err == nil {
+		t.Fatal("ReadMarker() error = nil for malformed id")
+	}
+}
+
+func TestWriteMarkerRejectsMissingID(t *testing.T) {
+	root := t.TempDir()
+	if err := WriteMarker(root, Marker{Name: "notes"}); err == nil {
+		t.Fatal("WriteMarker() error = nil for missing id")
+	}
+}
+
+func TestNewMarkerIDIsUniqueAndValid(t *testing.T) {
+	first, err := NewMarkerID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := NewMarkerID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == second {
+		t.Fatal("NewMarkerID() produced identical ids")
+	}
+	if err := validateMarkerID(first); err != nil {
+		t.Fatalf("validateMarkerID(%q) = %v, want nil", first, err)
 	}
 }
 

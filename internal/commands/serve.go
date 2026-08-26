@@ -190,20 +190,23 @@ func serveFailureExit(err error) int {
 }
 
 func serveCallbacks(resolve folderResolver) transport.Callbacks {
-	fileLister := func(name string) ([]transport.PeerFile, error) {
+	fileLister := func(name, expectedID string) ([]transport.PeerFile, string, error) {
 		folder, err := resolve(name)
 		if err != nil {
-			return nil, err
+			return nil, "", err
+		}
+		if expectedID != "" && folder.marker.ID != expectedID {
+			return nil, "", fmt.Errorf("folder %q identity mismatch: requester expects id %q, provider has %q", name, expectedID, folder.marker.ID)
 		}
 		listed, scanErr := scan.ListFiles(folder.root, folder.marker.Ignore)
 		if scanErr != nil {
-			return nil, fmt.Errorf("list folder %q: %w", name, scanErr)
+			return nil, "", fmt.Errorf("list folder %q: %w", name, scanErr)
 		}
 		files := make([]transport.PeerFile, 0, len(listed))
 		for _, file := range listed {
 			files = append(files, transport.PeerFile{Path: file.Path, Size: file.Size, Hash: file.Hash, Metadata: file.Metadata, Directory: file.Directory})
 		}
-		return files, nil
+		return files, folder.marker.ID, nil
 	}
 	fileReader := func(name, relative string) (io.ReadCloser, error) {
 		folder, err := resolve(name)
@@ -406,7 +409,7 @@ func mutateAndCommit(name, relative, handler string, resolve folderResolver, op 
 }
 
 func mutateServedFolderWithin(name string, resolve folderResolver, wait time.Duration, mutation func(resolvedFolder) error) (err error) {
-	lockFile, err := lock.AcquireWait(context.Background(), wait)
+	lockFile, err := lock.AcquireWait(context.Background(), wait, name)
 	if err != nil {
 		return err
 	}

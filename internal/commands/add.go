@@ -57,7 +57,7 @@ func add(args []string, stderr io.Writer) int {
 		if _, exists := current.Remote[name]; exists {
 			return fmt.Errorf("folder %q already exists as remote", name)
 		}
-		markerCreated, err := prepareJoinMarker(path, name)
+		markerCreated, err := prepareJoinMarker(path, name, "")
 		if err != nil {
 			return fmt.Errorf("write folder marker: %w", err)
 		}

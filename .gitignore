@@ -7,6 +7,7 @@ _*
 !__*
 !*/
 !*.*
+*.local.*
 
 # Secrets
 .env
@@ -52,6 +53,7 @@ logs
 
 # Purpose and planning files
 *.md
+*.txt
 
 # Whitelist
 !README.md

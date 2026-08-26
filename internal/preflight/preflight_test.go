@@ -12,6 +12,15 @@ import (
 	"l2syncd/internal/guard"
 )
 
+func newTestMarker(t *testing.T, name string) guard.Marker {
+	t.Helper()
+	id, err := guard.NewMarkerID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return guard.Marker{ID: id, Name: name}
+}
+
 func TestCheckDoesNotCreateStateDirectory(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("HOME", root)
@@ -46,7 +55,7 @@ func TestValidateRejectsMultiplePeerBinding(t *testing.T) {
 	cfg.Peers["one"] = config.Peer{Address: "one"}
 	cfg.Peers["two"] = config.Peer{Address: "two"}
 	root := t.TempDir()
-	if err := guard.WriteMarker(root, guard.Marker{Name: "notes"}); err != nil {
+	if err := guard.WriteMarker(root, newTestMarker(t, "notes")); err != nil {
 		t.Fatal(err)
 	}
 	cfg.Shared["notes"] = config.Folder{Path: root, Peers: []string{"one", "two"}}
@@ -60,7 +69,7 @@ func TestValidateRejectsMultiplePeerBindingOnRemoteFolder(t *testing.T) {
 	cfg.Peers["one"] = config.Peer{Address: "one"}
 	cfg.Peers["two"] = config.Peer{Address: "two"}
 	root := t.TempDir()
-	if err := guard.WriteMarker(root, guard.Marker{Name: "notes"}); err != nil {
+	if err := guard.WriteMarker(root, newTestMarker(t, "notes")); err != nil {
 		t.Fatal(err)
 	}
 	cfg.Remote["notes"] = config.Folder{Path: root, Peers: []string{"one", "two"}}
@@ -72,7 +81,7 @@ func TestValidateRejectsMultiplePeerBindingOnRemoteFolder(t *testing.T) {
 func TestValidateAcceptsUnboundSharedFolder(t *testing.T) {
 	cfg := config.New()
 	root := t.TempDir()
-	if err := guard.WriteMarker(root, guard.Marker{Name: "notes"}); err != nil {
+	if err := guard.WriteMarker(root, newTestMarker(t, "notes")); err != nil {
 		t.Fatal(err)
 	}
 	cfg.Shared["notes"] = config.Folder{Path: root}
@@ -84,7 +93,7 @@ func TestValidateAcceptsUnboundSharedFolder(t *testing.T) {
 func TestValidateRejectsUnboundRemoteFolder(t *testing.T) {
 	cfg := config.New()
 	root := t.TempDir()
-	if err := guard.WriteMarker(root, guard.Marker{Name: "notes"}); err != nil {
+	if err := guard.WriteMarker(root, newTestMarker(t, "notes")); err != nil {
 		t.Fatal(err)
 	}
 	cfg.Remote["notes"] = config.Folder{Path: root}
@@ -114,7 +123,7 @@ func TestValidateRejectsNonCanonicalConfiguredFolderNames(t *testing.T) {
 
 func TestValidateRequiresExactlyOneUsableBindingForRemoteFolder(t *testing.T) {
 	root := t.TempDir()
-	if err := guard.WriteMarker(root, guard.Marker{Name: "notes"}); err != nil {
+	if err := guard.WriteMarker(root, newTestMarker(t, "notes")); err != nil {
 		t.Fatal(err)
 	}
 	tests := []struct {
