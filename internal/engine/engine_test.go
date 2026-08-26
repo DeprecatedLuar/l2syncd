@@ -8,49 +8,57 @@ import (
 	"testing"
 	"time"
 
+	"l2syncd/internal/index"
 	"l2syncd/internal/metadata"
-	"l2syncd/internal/state"
+	"l2syncd/internal/vector"
 )
 
 type fakeReplica struct {
 	name    string
-	current state.Baseline
+	current ReplicaState
 }
 
-func (fake fakeReplica) Name() string                     { return fake.name }
-func (fake fakeReplica) Current() (state.Baseline, error) { return fake.current, nil }
+func (fake fakeReplica) Name() string                   { return fake.name }
+func (fake fakeReplica) Current() (ReplicaState, error) { return fake.current, nil }
 
-func file(hash string, mtime time.Time) state.File {
-	return state.File{Hash: hash, Metadata: metadata.Manifest{Mode: 0o600, Mtime: mtime}, MetadataKnown: true}
-}
-func baseline(files map[string]state.File) state.Baseline {
-	result := state.New()
-	result.Files = files
-	return result
+func entry(hash string, v vector.Vector) index.Entry {
+	return index.Entry{Hash: hash, Version: v, Metadata: metadata.Manifest{Mode: 0o600}}
 }
 
-func TestPlanStatesDecisionTable(t *testing.T) {
-	old := time.Unix(10, 0)
-	newer := time.Unix(20, 0)
+func tombstone(v vector.Vector) index.Entry {
+	return index.Entry{Deleted: true, Version: v}
+}
+
+func state(entries map[string]index.Entry) ReplicaState {
+	idx := index.New("test")
+	idx.Entries = entries
+	return ReplicaState{Index: idx}
+}
+
+func TestDecisionTableAcrossVectorComparisons(t *testing.T) {
 	tests := []struct {
-		name                  string
-		left, right, previous state.File
-		want                  ActionKind
-		wantSource            string
+		name       string
+		left       index.Entry
+		right      index.Entry
+		want       ActionKind
+		wantSource string
 	}{
-		{"left modified", file("left", newer), file("base", old), file("base", old), Push, "left-peer"},
-		{"right modified", file("base", old), file("right", newer), file("base", old), Pull, "right-peer"},
-		{"unchanged", file("base", old), file("base", old), file("base", old), "", ""},
-		{"same modified content and metadata", file("same", newer), file("same", newer), file("base", old), "", ""},
-		{"different modified content", file("left", newer), file("right", old), file("base", old), Conflict, ""},
-		{"left deleted", state.File{}, file("base", old), file("base", old), Delete, "left-peer"},
-		{"right deleted", file("base", old), state.File{}, file("base", old), Delete, "right-peer"},
-		{"left deleted right modified", state.File{}, file("right", newer), file("base", old), Resurrect, "right-peer"},
-		{"both deleted", state.File{}, state.File{}, file("base", old), "", ""},
+		{"equal vectors", entry("a", vector.Vector{"l": 1}), entry("a", vector.Vector{"l": 1}), "", ""},
+		{"left strictly ahead pushes", entry("a", vector.Vector{"l": 2}), entry("old", vector.Vector{"l": 1}), Push, "left"},
+		{"right strictly ahead pulls", entry("old", vector.Vector{"l": 1}), entry("a", vector.Vector{"l": 2}), Pull, "right"},
+		{"left dominates unseen right creates", entry("a", vector.Vector{"l": 1}), index.Entry{}, Push, "left"},
+		{"right dominates unseen left creates", index.Entry{}, entry("a", vector.Vector{"r": 1}), Pull, "right"},
+		{"left tombstone dominates pushes delete", tombstone(vector.Vector{"l": 2}), entry("a", vector.Vector{"l": 1}), Delete, "left"},
+		{"right tombstone dominates pulls delete", entry("a", vector.Vector{"r": 1}), tombstone(vector.Vector{"r": 2}), Delete, "right"},
+		{"concurrent identical hash merges", entry("same", vector.Vector{"l": 1}), entry("same", vector.Vector{"r": 1}), Merge, ""},
+		{"concurrent both tombstoned merges", tombstone(vector.Vector{"l": 1}), tombstone(vector.Vector{"r": 1}), Merge, ""},
+		{"concurrent differing hash conflicts", entry("left-bytes", vector.Vector{"l": 1}), entry("right-bytes", vector.Vector{"r": 1}), Conflict, ""},
+		{"concurrent modify-vs-delete resurrects the modification (left modified)", entry("a", vector.Vector{"l": 1, "r": 1}), tombstone(vector.Vector{"r": 2}), Resurrect, "left"},
+		{"concurrent modify-vs-delete resurrects the modification (right modified)", tombstone(vector.Vector{"l": 2}), entry("a", vector.Vector{"l": 1, "r": 1}), Resurrect, "right"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			plan := PlanStates("left-peer", baseline(map[string]state.File{"x": test.left}), "right-peer", baseline(map[string]state.File{"x": test.right}), baseline(map[string]state.File{"x": test.previous}))
+			plan := PlanStates("left", state(map[string]index.Entry{"x": test.left}), "right", state(map[string]index.Entry{"x": test.right}))
 			if test.want == "" {
 				if len(plan.Actions) != 0 {
 					t.Fatalf("actions = %#v, want none", plan.Actions)
@@ -67,15 +75,44 @@ func TestPlanStatesDecisionTable(t *testing.T) {
 	}
 }
 
-func TestConflictIdentityIsIndependentOfLocalPeerAliases(t *testing.T) {
+func TestCreationOnAPeerNeverSeenIsCreatedNotDeleted(t *testing.T) {
+	plan := PlanStates("left", state(map[string]index.Entry{"new.txt": entry("bytes", vector.Vector{"l": 1})}), "right", state(nil))
+	if len(plan.Actions) != 1 || plan.Actions[0].Kind != Push || plan.Actions[0].Source != "left" {
+		t.Fatalf("plan = %#v, want a push creation, never a delete", plan.Actions)
+	}
+}
+
+// TestThreePeerResurrectionNeverHappens is the three-peer regression case
+// from implementation-plan.md Phase C: A deletes, B applies the delete, and
+// C reconnects still holding the file from before the deletion. The file
+// must stay deleted on both A and B's perspective when C's stale entry is
+// compared, in either pairing.
+func TestThreePeerResurrectionNeverHappens(t *testing.T) {
+	// A deleted the file after B had already synced the original creation:
+	// both A and B's tombstone/knowledge dominates C's untouched copy.
+	aTombstone := tombstone(vector.Vector{"a": 2})
+	bTombstone := tombstone(vector.Vector{"a": 2})
+	cStaleFile := entry("original-bytes", vector.Vector{"a": 1})
+
+	planAC := PlanStates("a", state(map[string]index.Entry{"shared.txt": aTombstone}), "c", state(map[string]index.Entry{"shared.txt": cStaleFile}))
+	if len(planAC.Actions) != 1 || planAC.Actions[0].Kind != Delete || planAC.Actions[0].Source != "a" {
+		t.Fatalf("A-C plan = %#v, want the tombstone to win and the file to stay deleted", planAC.Actions)
+	}
+
+	planBC := PlanStates("b", state(map[string]index.Entry{"shared.txt": bTombstone}), "c", state(map[string]index.Entry{"shared.txt": cStaleFile}))
+	if len(planBC.Actions) != 1 || planBC.Actions[0].Kind != Delete || planBC.Actions[0].Source != "b" {
+		t.Fatalf("B-C plan = %#v, want the tombstone to win and the file to stay deleted", planBC.Actions)
+	}
+}
+
+func TestConflictTieBreakIsIndependentOfArgumentOrder(t *testing.T) {
 	leftIdentity := strings.Repeat("1", 64)
 	rightIdentity := strings.Repeat("f", 64)
-	previous := baseline(map[string]state.File{"x": file("base", time.Unix(1, 0))})
-	left := baseline(map[string]state.File{"x": file("left", time.Unix(2, 0))})
-	right := baseline(map[string]state.File{"x": file("right", time.Unix(3, 0))})
+	left := entry("left-bytes", vector.Vector{leftIdentity: 1})
+	right := entry("right-bytes", vector.Vector{rightIdentity: 1})
 
-	first := PlanStates(leftIdentity, left, rightIdentity, right, previous)
-	second := PlanStates(rightIdentity, right, leftIdentity, left, previous)
+	first := PlanStates(leftIdentity, state(map[string]index.Entry{"x": left}), rightIdentity, state(map[string]index.Entry{"x": right}))
+	second := PlanStates(rightIdentity, state(map[string]index.Entry{"x": right}), leftIdentity, state(map[string]index.Entry{"x": left}))
 	if len(first.Actions) != 1 || len(second.Actions) != 1 {
 		t.Fatalf("actions = %#v / %#v", first.Actions, second.Actions)
 	}
@@ -84,162 +121,105 @@ func TestConflictIdentityIsIndependentOfLocalPeerAliases(t *testing.T) {
 	}
 }
 
-func TestPlanStatesHaltsForEqualInstallationIdentities(t *testing.T) {
+func TestPlanStatesHaltsForEqualOrEmptyIdentities(t *testing.T) {
 	identity := strings.Repeat("a", 64)
-	plan := PlanStates(identity, state.New(), identity, state.New(), state.New())
+	plan := PlanStates(identity, state(nil), identity, state(nil))
 	if !plan.Halted || !strings.Contains(plan.Reason, "distinct") {
 		t.Fatalf("plan = %#v", plan)
 	}
+	plan = PlanStates("", state(nil), "right", state(nil))
+	if !plan.Halted {
+		t.Fatalf("plan = %#v, want halted for empty identity", plan)
+	}
 }
 
-func TestPlanConflictTieBreakAndThreshold(t *testing.T) {
-	when := time.Unix(10, 0)
-	plan := PlanStates("z-peer", baseline(map[string]state.File{"x": file("z", when)}), "a-peer", baseline(map[string]state.File{"x": file("a", when)}), baseline(map[string]state.File{"x": file("base", when)}))
-	if len(plan.Actions) != 1 || plan.Actions[0].Winner != "a-peer" || plan.Actions[0].Loser != "z-peer" {
-		t.Fatalf("conflict = %#v", plan.Actions)
-	}
-	files := make(map[string]state.File, 100)
+func TestDeletionThresholdCountsDeleteActionsInThePlan(t *testing.T) {
+	entries := make(map[string]index.Entry, 100)
 	for i := 0; i < 100; i++ {
-		files[string(rune(i))] = file("base", when)
+		entries[fmt.Sprintf("f/%03d", i)] = entry("h", vector.Vector{"left": 1})
 	}
-	current := make(map[string]state.File, 100)
-	for i := 0; i < 69; i++ {
-		current[string(rune(i))] = file("base", when)
+	tombstoned := make(map[string]index.Entry, 100)
+	for path, value := range entries {
+		tombstoned[path] = value
 	}
-	halted := PlanStates("left", baseline(current), "right", baseline(current), baseline(files))
-	if !halted.Halted {
-		t.Fatal("plan not halted for bulk deletion")
-	}
-}
-
-func TestConflictIgnoresClockSkewAndMetadataUsesPeerTieBreak(t *testing.T) {
-	baselineFile := file("base", time.Unix(10, 0))
-	left := file("left", time.Unix(10_000, 0))
-	right := file("right", time.Unix(1, 0))
-	plan := PlanStates("z-peer", baseline(map[string]state.File{"x": left}), "a-peer", baseline(map[string]state.File{"x": right}), baseline(map[string]state.File{"x": baselineFile}))
-	if len(plan.Actions) != 1 || plan.Actions[0].Winner != "a-peer" {
-		t.Fatalf("clock-skew conflict = %#v, want lexical a-peer winner", plan.Actions)
-	}
-
-	left = file("same", time.Unix(20, 0))
-	right = file("same", time.Unix(30, 0))
-	previous := file("same", time.Unix(10, 0))
-	plan = PlanStates("z-peer", baseline(map[string]state.File{"x": left}), "a-peer", baseline(map[string]state.File{"x": right}), baseline(map[string]state.File{"x": previous}))
-	if len(plan.Actions) != 1 || plan.Actions[0].Kind != Pull || plan.Actions[0].Source != "a-peer" {
-		t.Fatalf("metadata conflict = %#v, want lexical pull", plan.Actions)
-	}
-}
-
-func TestOneSidedMetadataOnlyEditPropagates(t *testing.T) {
-	previous := file("same", time.Unix(10, 0))
-	left := file("same", time.Unix(20, 0))
-	plan := PlanStates("left", baseline(map[string]state.File{"x": left}), "right", baseline(map[string]state.File{"x": previous}), baseline(map[string]state.File{"x": previous}))
-	if len(plan.Actions) != 1 || plan.Actions[0].Kind != Push || plan.Actions[0].Source != "left" {
-		t.Fatalf("metadata-only plan = %#v, want push from left", plan.Actions)
-	}
-}
-
-func TestUnknownLegacyMetadataComparesCurrentManifestsAndRetainsDeletionHistory(t *testing.T) {
-	legacy := state.File{Hash: "same", Size: 4, MetadataKnown: false}
-	left := file("same", time.Unix(20, 0))
-	right := file("same", time.Unix(20, 0))
-	plan := PlanStates("z-peer", baseline(map[string]state.File{"x": left}), "a-peer", baseline(map[string]state.File{"x": right}), baseline(map[string]state.File{"x": legacy}))
-	if len(plan.Actions) != 0 {
-		t.Fatalf("identical current manifests produced actions: %#v", plan.Actions)
-	}
-
-	right.Metadata.Mode = 0o640
-	plan = PlanStates("z-peer", baseline(map[string]state.File{"x": left}), "a-peer", baseline(map[string]state.File{"x": right}), baseline(map[string]state.File{"x": legacy}))
-	if len(plan.Actions) != 1 || plan.Actions[0].Kind != Pull || plan.Actions[0].Source != "a-peer" {
-		t.Fatalf("unknown-metadata disagreement = %#v, want lexical pull", plan.Actions)
-	}
-
-	plan = PlanStates("left", baseline(nil), "right", baseline(map[string]state.File{"x": right}), baseline(map[string]state.File{"x": legacy}))
-	if len(plan.Actions) != 1 || plan.Actions[0].Kind != Resurrect || plan.Actions[0].Source != "right" {
-		t.Fatalf("legacy delete-vs-existing = %#v, want conservative resurrection", plan.Actions)
-	}
-
-	modified := file("modified", time.Unix(30, 0))
-	plan = PlanStates("left", baseline(nil), "right", baseline(map[string]state.File{"x": modified}), baseline(map[string]state.File{"x": legacy}))
-	if len(plan.Actions) != 1 || plan.Actions[0].Kind != Resurrect || plan.Actions[0].Source != "right" {
-		t.Fatalf("legacy delete-vs-modified = %#v, want resurrection safety", plan.Actions)
-	}
-}
-
-func TestUnknownLegacyMetadataDeleteVsSameHashMetadataEditResurrects(t *testing.T) {
-	legacy := state.File{Hash: "same", Size: 4, MetadataKnown: false}
-	edited := file("same", time.Unix(20, 0))
-	edited.Metadata.Mode = 0o640
-	plan := PlanStates("deleted-peer", baseline(nil), "existing-peer", baseline(map[string]state.File{"x": edited}), baseline(map[string]state.File{"x": legacy}))
-	if len(plan.Actions) != 1 || plan.Actions[0].Kind != Resurrect || plan.Actions[0].Source != "existing-peer" {
-		t.Fatalf("plan = %#v, want same-hash metadata-edited survivor resurrected", plan.Actions)
-	}
-}
-
-func TestRenamePlusEditRemainsDeleteAndCreate(t *testing.T) {
-	previousFile := file("old-hash", time.Unix(10, 0))
-	previous := baseline(map[string]state.File{"old/name": previousFile})
-	left := baseline(map[string]state.File{"new/name": file("edited-hash", time.Unix(20, 0))})
-	right := baseline(map[string]state.File{"old/name": previousFile})
-	plan := PlanStates("left", left, "right", right, previous)
-	if plan.Halted || len(plan.Actions) != 2 {
-		t.Fatalf("rename-plus-edit plan = %#v", plan)
-	}
-	if plan.Actions[0].Path != "new/name" || plan.Actions[0].Kind != Push || plan.Actions[1].Path != "old/name" || plan.Actions[1].Kind != Delete {
-		t.Fatalf("actions = %#v, want create plus delete with no rename action", plan.Actions)
-	}
-}
-
-func TestDeletionThresholdUsesNetTreeLoss(t *testing.T) {
-	previous := make(map[string]state.File, 100)
-	renamed := make(map[string]state.File, 100)
-	for index := 0; index < 100; index++ {
-		oldPath := fmt.Sprintf("old/%03d", index)
-		previous[oldPath] = file(fmt.Sprintf("hash-%d", index), time.Unix(10, 0))
-		if index < 30 {
-			renamed[fmt.Sprintf("new/%03d", index)] = previous[oldPath]
-		} else {
-			renamed[oldPath] = previous[oldPath]
-		}
-	}
-	plan := PlanStates("left", baseline(renamed), "right", baseline(previous), baseline(previous))
-	if plan.Halted {
-		t.Fatalf("large rename halted: %s", plan.Reason)
-	}
-	deleted := make(map[string]state.File, 69)
-	for path, value := range previous {
-		if len(deleted) == 69 {
+	// 31% net deletion: comfortably over the ~20% threshold.
+	count := 0
+	for path := range entries {
+		if count == 31 {
 			break
 		}
-		deleted[path] = value
+		tombstoned[path] = tombstone(vector.Vector{"left": 2})
+		count++
 	}
-	plan = PlanStates("left", baseline(deleted), "right", baseline(deleted), baseline(previous))
-	if !plan.Halted {
+	halted := PlanStates("left", state(tombstoned), "right", state(entries))
+	if !halted.Halted {
 		t.Fatal("genuine 31 percent net deletion did not halt")
+	}
+
+	fewDeletes := make(map[string]index.Entry, 100)
+	for path, value := range entries {
+		fewDeletes[path] = value
+	}
+	deleteCount := 0
+	for path := range entries {
+		if deleteCount == 5 {
+			break
+		}
+		fewDeletes[path] = tombstone(vector.Vector{"left": 2})
+		deleteCount++
+	}
+	notHalted := PlanStates("left", state(fewDeletes), "right", state(entries))
+	if notHalted.Halted {
+		t.Fatalf("5 percent deletion halted: %s", notHalted.Reason)
 	}
 }
 
-func TestDirectoryMetadataUsesPostChildActionPass(t *testing.T) {
-	previous := baseline(nil)
-	left := baseline(nil)
-	right := baseline(nil)
+func TestDirectoryMetadataUsesPerReplicaPreviousManifest(t *testing.T) {
 	old := metadata.Manifest{Mode: 0o700, Mtime: time.Unix(10, 0)}
 	changed := metadata.Manifest{Mode: 0o750, Mtime: time.Unix(20, 0)}
-	previous.Directories["folder"] = old
-	left.Directories["folder"] = changed
-	right.Directories["folder"] = old
-	plan := PlanStates("left", left, "right", right, previous)
+	left := ReplicaState{Index: index.New("left"), PreviousDirectories: map[string]metadata.Manifest{"folder": old}}
+	left.Index.Directories = map[string]metadata.Manifest{"folder": changed}
+	right := ReplicaState{Index: index.New("right"), PreviousDirectories: map[string]metadata.Manifest{"folder": old}}
+	right.Index.Directories = map[string]metadata.Manifest{"folder": old}
+
+	plan := PlanStates("left", left, "right", right)
 	if len(plan.DirectoryActions) != 1 || plan.DirectoryActions[0].Kind != Push || !plan.DirectoryActions[0].Directory {
 		t.Fatalf("directory actions = %#v", plan.DirectoryActions)
 	}
 }
 
+func TestDirectoryUnchangedProducesNoAction(t *testing.T) {
+	manifest := metadata.Manifest{Mode: 0o700, Mtime: time.Unix(10, 0)}
+	left := ReplicaState{Index: index.New("left"), PreviousDirectories: map[string]metadata.Manifest{"folder": manifest}}
+	left.Index.Directories = map[string]metadata.Manifest{"folder": manifest}
+	right := ReplicaState{Index: index.New("right"), PreviousDirectories: map[string]metadata.Manifest{"folder": manifest}}
+	right.Index.Directories = map[string]metadata.Manifest{"folder": manifest}
+
+	plan := PlanStates("left", left, "right", right)
+	if len(plan.DirectoryActions) != 0 {
+		t.Fatalf("directory actions = %#v, want none", plan.DirectoryActions)
+	}
+}
+
 func TestReconcileUsesReplicaInterfaces(t *testing.T) {
-	plan, err := Reconcile(fakeReplica{"left", baseline(map[string]state.File{"x": file("l", time.Unix(2, 0))})}, fakeReplica{"right", baseline(map[string]state.File{"x": file("b", time.Unix(1, 0))})}, baseline(map[string]state.File{"x": file("b", time.Unix(1, 0))}))
+	plan, err := Reconcile(
+		fakeReplica{"left", state(map[string]index.Entry{"x": entry("l", vector.Vector{"left": 2})})},
+		fakeReplica{"right", state(map[string]index.Entry{"x": entry("b", vector.Vector{"left": 1})})},
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(plan.Actions) != 1 || plan.Actions[0].Kind != Push {
 		t.Fatalf("plan = %#v", plan)
+	}
+}
+
+func TestReconcileRejectsNilOrDuplicateIdentities(t *testing.T) {
+	if _, err := Reconcile(nil, fakeReplica{"right", state(nil)}); err == nil {
+		t.Fatal("Reconcile(nil, ...) = nil error, want error")
+	}
+	same := fakeReplica{"dup", state(nil)}
+	if _, err := Reconcile(same, same); err == nil {
+		t.Fatal("Reconcile with duplicate identities = nil error, want error")
 	}
 }

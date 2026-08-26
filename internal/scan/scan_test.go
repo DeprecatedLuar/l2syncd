@@ -3,9 +3,7 @@
 package scan
 
 import (
-	"crypto/sha256"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,57 +11,118 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
-	"l2syncd/internal/state"
+	"l2syncd/internal/index"
+	"l2syncd/internal/metadata"
+	"l2syncd/internal/vector"
 )
 
-func TestDetectChangesAndSkipMarker(t *testing.T) {
+const testFingerprint = "aaaaaaaaaaaaaaaa"
+
+func TestReconcileDetectsAddedModifiedAndDeleted(t *testing.T) {
 	root := t.TempDir()
-	if err := os.WriteFile(filepath.Join(root, ".l2sync"), []byte("id = \"00000000-0000-4000-8000-000000000000\"\nname = \"notes\"\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	writeTestMarker(t, root)
 	if err := os.WriteFile(filepath.Join(root, "same.txt"), []byte("same"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(root, "new.txt"), []byte("new"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	baseline := state.New()
-	_, snapshot, err := Detect(root, baseline)
+	first, err := Reconcile(root, index.New("test-id"), nil, testFingerprint)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(snapshot.Files) != 2 {
-		t.Fatalf("snapshot files = %d, want 2", len(snapshot.Files))
+	if len(first.Index.Entries) != 2 {
+		t.Fatalf("entries = %d, want 2", len(first.Index.Entries))
 	}
-	if _, ok := snapshot.Files[".l2sync/ignored"]; ok {
-		t.Fatal("marker contents entered snapshot")
+	if len(first.Changes) != 2 || first.Changes[0].Kind != Added {
+		t.Fatalf("changes = %#v, want two additions", first.Changes)
 	}
-	changes, _, err := Detect(root, snapshot)
+	for _, entry := range first.Index.Entries {
+		if vector.Compare(entry.Version, vector.Vector{testFingerprint: 1}) != vector.Equal {
+			t.Fatalf("new entry version = %v, want {%s: 1}", entry.Version, testFingerprint)
+		}
+	}
+
+	second, err := Reconcile(root, first.Index, nil, testFingerprint)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(changes) != 0 {
-		t.Fatalf("unchanged changes = %#v, want none", changes)
+	if len(second.Changes) != 0 {
+		t.Fatalf("unchanged changes = %#v, want none", second.Changes)
 	}
+	if vector.Compare(second.Index.Entries["same.txt"].Version, first.Index.Entries["same.txt"].Version) != vector.Equal {
+		t.Fatal("unchanged file's vector was touched")
+	}
+
 	if err := os.WriteFile(filepath.Join(root, "same.txt"), []byte("changed"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Remove(filepath.Join(root, "new.txt")); err != nil {
 		t.Fatal(err)
 	}
-	changes, _, err = Detect(root, snapshot)
+	third, err := Reconcile(root, first.Index, nil, testFingerprint)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(changes) != 2 {
-		t.Fatalf("changes = %#v, want modified and deleted", changes)
+	if len(third.Changes) != 2 || third.Changes[0].Path != "new.txt" || third.Changes[0].Kind != Deleted || third.Changes[1].Path != "same.txt" || third.Changes[1].Kind != Modified {
+		t.Fatalf("changes = %#v, want deleted new.txt and modified same.txt", third.Changes)
 	}
-	if changes[0].Path != "new.txt" || changes[0].Kind != Deleted || changes[1].Path != "same.txt" || changes[1].Kind != Modified {
-		t.Fatalf("changes = %#v, want deleted new.txt and modified same.txt", changes)
+	tombstone := third.Index.Entries["new.txt"]
+	if !tombstone.Deleted || tombstone.Hash != "" {
+		t.Fatalf("deleted entry = %#v, want a tombstone with no content", tombstone)
+	}
+	if vector.Compare(tombstone.Version, first.Index.Entries["new.txt"].Version) != vector.Greater {
+		t.Fatalf("tombstone version = %v, want strictly ahead of the pre-deletion version", tombstone.Version)
+	}
+	modified := third.Index.Entries["same.txt"]
+	if vector.Compare(modified.Version, first.Index.Entries["same.txt"].Version) != vector.Greater {
+		t.Fatalf("modified version = %v, want strictly ahead", modified.Version)
 	}
 }
 
-func TestDetectFindsMetadataOnlyFileAndDirectoryEdits(t *testing.T) {
+func TestReconcileCarriesExistingTombstonesForward(t *testing.T) {
+	root := t.TempDir()
+	writeTestMarker(t, root)
+	previous := index.New("test-id")
+	previous.Entries["gone.txt"] = index.Entry{Version: vector.Vector{testFingerprint: 3}, Deleted: true, DeletedAt: time.Unix(1, 0)}
+	result, err := Reconcile(root, previous, nil, testFingerprint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Changes) != 0 {
+		t.Fatalf("changes = %#v, want none: an existing tombstone is not a new deletion", result.Changes)
+	}
+	carried := result.Index.Entries["gone.txt"]
+	if !carried.Deleted || vector.Compare(carried.Version, previous.Entries["gone.txt"].Version) != vector.Equal {
+		t.Fatalf("carried tombstone = %#v, want untouched", carried)
+	}
+}
+
+func TestReconcileTreatsLocalRecreationAfterDeletionAsANewChange(t *testing.T) {
+	root := t.TempDir()
+	writeTestMarker(t, root)
+	previous := index.New("test-id")
+	previous.Entries["back.txt"] = index.Entry{Version: vector.Vector{testFingerprint: 2}, Deleted: true, DeletedAt: time.Unix(1, 0)}
+	if err := os.WriteFile(filepath.Join(root, "back.txt"), []byte("recreated"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := Reconcile(root, previous, nil, testFingerprint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Changes) != 1 || result.Changes[0].Kind != Added {
+		t.Fatalf("changes = %#v, want one addition", result.Changes)
+	}
+	recreated := result.Index.Entries["back.txt"]
+	if recreated.Deleted {
+		t.Fatal("recreated file is still marked deleted")
+	}
+	if vector.Compare(recreated.Version, previous.Entries["back.txt"].Version) != vector.Greater {
+		t.Fatalf("recreated version = %v, want strictly ahead of the tombstone", recreated.Version)
+	}
+}
+
+func TestReconcileFindsMetadataOnlyFileAndDirectoryEdits(t *testing.T) {
 	root := t.TempDir()
 	writeTestMarker(t, root)
 	directory := filepath.Join(root, "folder")
@@ -74,7 +133,7 @@ func TestDetectFindsMetadataOnlyFileAndDirectoryEdits(t *testing.T) {
 	if err := os.WriteFile(file, []byte("same bytes"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	first, err := DetectWithIgnore(root, state.New(), nil)
+	first, err := Reconcile(root, index.New("test-id"), nil, testFingerprint)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,44 +145,22 @@ func TestDetectFindsMetadataOnlyFileAndDirectoryEdits(t *testing.T) {
 	if err := os.Chtimes(directory, mtime, mtime); err != nil {
 		t.Fatal(err)
 	}
-	second, err := DetectWithIgnore(root, first.Snapshot, nil)
+	second, err := Reconcile(root, first.Index, nil, testFingerprint)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(second.Changes) != 1 || second.Changes[0].Kind != Modified {
 		t.Fatalf("changes = %#v, want one metadata-only modification", second.Changes)
 	}
-	if second.Snapshot.Files["folder/file"].Hash != first.Snapshot.Files["folder/file"].Hash {
+	if second.Index.Entries["folder/file"].Hash != first.Index.Entries["folder/file"].Hash {
 		t.Fatal("metadata-only edit changed content hash")
 	}
-	if second.Snapshot.Directories["folder"].Mtime.Equal(first.Snapshot.Directories["folder"].Mtime) {
+	if second.Index.Directories["folder"].Mtime.Equal(first.Index.Directories["folder"].Mtime) {
 		t.Fatal("directory metadata edit was not captured")
 	}
 }
 
-func TestLegacyUnknownMetadataDefersManifestDecisionAndProducesKnownSnapshot(t *testing.T) {
-	root := t.TempDir()
-	writeTestMarker(t, root)
-	contents := []byte("same bytes")
-	if err := os.WriteFile(filepath.Join(root, "same.txt"), contents, 0o640); err != nil {
-		t.Fatal(err)
-	}
-	legacy := state.New()
-	legacy.Files["same.txt"] = state.File{Size: int64(len(contents)), Hash: fmt.Sprintf("%x", sha256.Sum256(contents)), MetadataKnown: false}
-	result, err := DetectWithIgnore(root, legacy, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(result.Changes) != 0 {
-		t.Fatalf("legacy unknown metadata changes = %#v, want deferred decision", result.Changes)
-	}
-	current := result.Snapshot.Files["same.txt"]
-	if !current.MetadataKnown || current.Metadata.Mode != 0o640 || current.Hash != legacy.Files["same.txt"].Hash {
-		t.Fatalf("current snapshot = %#v, want known captured metadata", current)
-	}
-}
-
-func TestDetectReportsOutOfSetEntriesWithoutFailing(t *testing.T) {
+func TestReconcileReportsOutOfSetEntriesWithoutFailing(t *testing.T) {
 	root := t.TempDir()
 	writeTestMarker(t, root)
 	if err := os.WriteFile(filepath.Join(root, "regular"), []byte("ok"), 0o600); err != nil {
@@ -148,19 +185,19 @@ func TestDetectReportsOutOfSetEntriesWithoutFailing(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	result, err := DetectWithIgnore(root, state.New(), nil)
+	result, err := Reconcile(root, index.New("test-id"), nil, testFingerprint)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got := strings.Join(result.Skipped, ","); got != wantSkipped {
 		t.Fatalf("skipped = %q, want %q", got, wantSkipped)
 	}
-	if len(result.Snapshot.Files) != 1 {
-		t.Fatalf("regular files = %d, want 1", len(result.Snapshot.Files))
+	if len(result.Index.Entries) != 1 {
+		t.Fatalf("regular files = %d, want 1", len(result.Index.Entries))
 	}
 }
 
-func TestScanFailsClosedWhenOpenedPathIsReplacedBySymlink(t *testing.T) {
+func TestReconcileFailsClosedWhenOpenedPathIsReplacedBySymlink(t *testing.T) {
 	for _, ancestor := range []bool{false, true} {
 		name := "leaf"
 		if ancestor {
@@ -206,7 +243,7 @@ func TestScanFailsClosedWhenOpenedPathIsReplacedBySymlink(t *testing.T) {
 				}
 			}
 			t.Cleanup(func() { afterScanOpen = original })
-			if _, err := DetectWithIgnore(root, state.New(), nil); err == nil {
+			if _, err := Reconcile(root, index.New("test-id"), nil, testFingerprint); err == nil {
 				t.Fatal("scan accepted a path replaced after its anchored open")
 			}
 			contents, err := os.ReadFile(outsideFile)
@@ -217,7 +254,7 @@ func TestScanFailsClosedWhenOpenedPathIsReplacedBySymlink(t *testing.T) {
 	}
 }
 
-func TestDetectRejectsHardLinkedRegularFile(t *testing.T) {
+func TestReconcileRejectsHardLinkedRegularFile(t *testing.T) {
 	root := t.TempDir()
 	writeTestMarker(t, root)
 	first := filepath.Join(root, "first")
@@ -227,8 +264,16 @@ func TestDetectRejectsHardLinkedRegularFile(t *testing.T) {
 	if err := os.Link(first, filepath.Join(root, "second")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := DetectWithIgnore(root, state.New(), nil); err == nil || !strings.Contains(err.Error(), "hard link") {
-		t.Fatalf("DetectWithIgnore error = %v, want hard-link rejection", err)
+	if _, err := Reconcile(root, index.New("test-id"), nil, testFingerprint); err == nil || !strings.Contains(err.Error(), "hard link") {
+		t.Fatalf("Reconcile error = %v, want hard-link rejection", err)
+	}
+}
+
+func TestReconcileRequiresFingerprint(t *testing.T) {
+	root := t.TempDir()
+	writeTestMarker(t, root)
+	if _, err := Reconcile(root, index.New("test-id"), nil, ""); err == nil {
+		t.Fatal("Reconcile with empty fingerprint = nil error, want error")
 	}
 }
 
@@ -239,11 +284,9 @@ func writeTestMarker(t *testing.T, root string) {
 	}
 }
 
-func TestDetectSkipsIgnoredFilesAndSymlinks(t *testing.T) {
+func TestReconcileSkipsIgnoredFilesAndSymlinks(t *testing.T) {
 	root := t.TempDir()
-	if err := os.WriteFile(filepath.Join(root, ".l2sync"), []byte("id = \"00000000-0000-4000-8000-000000000000\"\nname = \"notes\"\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	writeTestMarker(t, root)
 	if err := os.Mkdir(filepath.Join(root, "node_modules"), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -257,14 +300,71 @@ func TestDetectSkipsIgnoredFilesAndSymlinks(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	result, err := DetectWithIgnore(root, state.New(), []string{"custom.txt"})
+	result, err := Reconcile(root, index.New("test-id"), []string{"custom.txt"}, testFingerprint)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, found := result.Snapshot.Files["node_modules/package.json"]; found {
-		t.Fatal("ignored file entered snapshot")
+	if _, found := result.Index.Entries["node_modules/package.json"]; found {
+		t.Fatal("ignored file entered the index")
 	}
 	if len(result.Skipped) != 1 || result.Skipped[0] != "link" {
 		t.Fatalf("skipped = %#v, want [link]", result.Skipped)
 	}
+}
+
+func TestReconcileDropsNowIgnoredEntryWithoutReportingADeletion(t *testing.T) {
+	root := t.TempDir()
+	writeTestMarker(t, root)
+	if err := os.WriteFile(filepath.Join(root, "keep.txt"), []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	first, err := Reconcile(root, index.New("test-id"), nil, testFingerprint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := first.Index.Entries["keep.txt"]; !ok {
+		t.Fatal("setup failed: keep.txt was not tracked")
+	}
+	second, err := Reconcile(root, first.Index, []string{"keep.txt"}, testFingerprint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(second.Changes) != 0 {
+		t.Fatalf("changes = %#v, want none: a newly ignored path is dropped, not reported deleted", second.Changes)
+	}
+	if _, ok := second.Index.Entries["keep.txt"]; ok {
+		t.Fatal("now-ignored entry was carried forward")
+	}
+}
+
+func TestListEntriesProjectsLiveFilesDirectoriesAndTombstones(t *testing.T) {
+	idx := index.New("test-id")
+	idx.Entries["live.txt"] = index.Entry{Version: vector.Vector{testFingerprint: 1}, Hash: "abc", Size: 3}
+	idx.Entries["gone.txt"] = index.Entry{Version: vector.Vector{testFingerprint: 2}, Deleted: true, DeletedAt: time.Unix(5, 0)}
+	idx.Directories["folder"] = metadataWithMode(0o750)
+
+	files := ListEntries(idx)
+	if len(files) != 3 {
+		t.Fatalf("files = %#v, want 3", files)
+	}
+	byPath := make(map[string]ListedFile, len(files))
+	for _, file := range files {
+		byPath[file.Path] = file
+	}
+	live, ok := byPath["live.txt"]
+	if !ok || live.Deleted || live.Hash != "abc" || live.Size != 3 {
+		t.Fatalf("live = %#v", live)
+	}
+	tombstone, ok := byPath["gone.txt"]
+	if !ok || !tombstone.Deleted || tombstone.Hash != "" {
+		t.Fatalf("tombstone = %#v, want no content", tombstone)
+	}
+	directory, ok := byPath["folder"]
+	if !ok || !directory.Directory {
+		t.Fatalf("directory = %#v", directory)
+	}
+}
+
+func metadataWithMode(mode uint32) metadata.Manifest {
+	return metadata.Manifest{Mode: mode}
 }

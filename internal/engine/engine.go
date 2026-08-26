@@ -8,8 +8,9 @@ import (
 	"sort"
 
 	"l2syncd/internal/guard"
+	"l2syncd/internal/index"
 	"l2syncd/internal/metadata"
-	"l2syncd/internal/state"
+	"l2syncd/internal/vector"
 )
 
 type ActionKind string
@@ -20,6 +21,10 @@ const (
 	Delete    ActionKind = "delete"
 	Resurrect ActionKind = "resurrect"
 	Conflict  ActionKind = "conflict"
+	// Merge resolves a concurrent pair that needs no byte transfer: both
+	// sides already hold the same content (or are both tombstoned). Only
+	// the vector advances, silently, with no conflict copy (concept.md 4.2).
+	Merge ActionKind = "merge"
 )
 
 type Action struct {
@@ -29,6 +34,10 @@ type Action struct {
 	Winner    string
 	Loser     string
 	Directory bool
+	// Vector is the version vector both replicas must hold for Path once
+	// this action lands. It is the one thing an index-commit function needs
+	// to know to persist the result of any action kind uniformly.
+	Vector vector.Vector
 }
 
 type Plan struct {
@@ -38,15 +47,25 @@ type Plan struct {
 	Reason           string
 }
 
+// ReplicaState is everything engine needs from one replica. Entries are
+// version-vector tracked and compared directly, needing no third reference
+// point (concept.md 4.2). Directories are not vector-tracked (concept.md 7
+// records a plain manifest per directory), so reconciling them still needs
+// each side's own last-committed manifests alongside its current ones.
+type ReplicaState struct {
+	Index               index.Index
+	PreviousDirectories map[string]metadata.Manifest
+}
+
 // Replica supplies one side's current state to the planner.
 type Replica interface {
 	Name() string
-	Current() (state.Baseline, error)
+	Current() (ReplicaState, error)
 }
 
 // Reconcile reads both replicas and returns decisions only. It never applies
-// an action or writes a baseline.
-func Reconcile(left, right Replica, baseline state.Baseline) (Plan, error) {
+// an action or writes an index.
+func Reconcile(left, right Replica) (Plan, error) {
 	if left == nil || right == nil {
 		return Plan{}, fmt.Errorf("both replicas are required")
 	}
@@ -61,52 +80,117 @@ func Reconcile(left, right Replica, baseline state.Baseline) (Plan, error) {
 	if err != nil {
 		return Plan{}, fmt.Errorf("read replica %q: %w", right.Name(), err)
 	}
-	return PlanStates(left.Name(), mine, right.Name(), theirs, baseline), nil
+	return PlanStates(left.Name(), mine, right.Name(), theirs), nil
 }
 
-// PlanStates plans from already-read states. Hashes are the only cross-peer
-// comparison; inode and ctime are used only for local change detection.
-func PlanStates(leftName string, left state.Baseline, rightName string, right state.Baseline, baseline state.Baseline) Plan {
+// PlanStates plans from already-read states. A version vector comparison is
+// the only cross-peer ordering authority (concept.md 4.2); no baseline or
+// wall-clock time is consulted anywhere in this function.
+func PlanStates(leftName string, left ReplicaState, rightName string, right ReplicaState) Plan {
 	if leftName == "" || rightName == "" || leftName == rightName {
 		return Plan{Halted: true, Reason: "replica identities must be distinct and non-empty"}
 	}
-	if deletionHalt(left, baseline) || deletionHalt(right, baseline) {
+	paths := make(map[string]struct{}, len(left.Index.Entries)+len(right.Index.Entries))
+	for path := range left.Index.Entries {
+		paths[path] = struct{}{}
+	}
+	for path := range right.Index.Entries {
+		paths[path] = struct{}{}
+	}
+	ordered := make([]string, 0, len(paths))
+	for path := range paths {
+		ordered = append(ordered, path)
+	}
+	sort.Strings(ordered)
+	actions := make([]Action, 0, len(ordered))
+	deletes := 0
+	for _, path := range ordered {
+		action, ok := decide(path, leftName, left.Index.Entries[path], rightName, right.Index.Entries[path])
+		if !ok {
+			continue
+		}
+		if action.Kind == Delete {
+			deletes++
+		}
+		actions = append(actions, action)
+	}
+	if guard.DeleteThreshold(deletes, len(ordered)) {
 		return Plan{Halted: true, Reason: "deletion threshold exceeded"}
 	}
-	paths := make(map[string]struct{}, len(left.Files)+len(right.Files)+len(baseline.Files))
-	for path := range left.Files {
-		paths[path] = struct{}{}
-	}
-	for path := range right.Files {
-		paths[path] = struct{}{}
-	}
-	for path := range baseline.Files {
-		paths[path] = struct{}{}
-	}
-	ordered := make([]string, 0, len(paths))
-	for path := range paths {
-		ordered = append(ordered, path)
-	}
-	sort.Strings(ordered)
-	actions := make([]Action, 0)
-	for _, path := range ordered {
-		if action, ok := decide(path, leftName, left.Files[path], rightName, right.Files[path], baseline.Files[path]); ok {
-			actions = append(actions, action)
-		}
-	}
-	return Plan{Actions: actions, DirectoryActions: planDirectories(leftName, left, rightName, right, baseline)}
+	return Plan{Actions: actions, DirectoryActions: planDirectories(leftName, left, rightName, right)}
 }
 
-func planDirectories(leftName string, left state.Baseline, rightName string, right state.Baseline, baseline state.Baseline) []Action {
-	paths := make(map[string]struct{}, len(left.Directories)+len(right.Directories)+len(baseline.Directories))
-	for path := range left.Directories {
-		paths[path] = struct{}{}
+// decide plans one path from both sides' entries. A missing entry compares
+// as an all-zero vector (vector.Compare), so a path one side has never heard
+// of is handled by the same Greater/Lesser branches as any other causal
+// gap: it is always a creation, never inferred as a deletion (concept.md
+// 4.2, 5.2 gate 4).
+func decide(path, leftName string, left index.Entry, rightName string, right index.Entry) (Action, bool) {
+	switch vector.Compare(left.Version, right.Version) {
+	case vector.Equal:
+		return Action{}, false
+	case vector.Greater:
+		return oneSidedAction(path, leftName, left, Push), true
+	case vector.Lesser:
+		return oneSidedAction(path, rightName, right, Pull), true
+	default:
+		return concurrentAction(path, leftName, left, rightName, right)
 	}
-	for path := range right.Directories {
-		paths[path] = struct{}{}
+}
+
+func oneSidedAction(path, winnerName string, winner index.Entry, contentKind ActionKind) Action {
+	if winner.Deleted {
+		return Action{Path: path, Kind: Delete, Source: winnerName, Vector: winner.Version}
 	}
-	for path := range baseline.Directories {
-		paths[path] = struct{}{}
+	return Action{Path: path, Kind: contentKind, Source: winnerName, Vector: winner.Version}
+}
+
+// concurrentAction resolves entries whose vectors are causally incomparable:
+// neither side's knowledge is a superset of the other's, so nothing but
+// content and deletion state can decide the outcome. This is the only
+// branch that can write a conflict copy.
+func concurrentAction(path, leftName string, left index.Entry, rightName string, right index.Entry) (Action, bool) {
+	merged := vector.Merge(left.Version, right.Version)
+	switch {
+	case left.Deleted && right.Deleted:
+		// Both sides independently tombstoned the same path. Merge the
+		// vectors silently; there is nothing left to transfer.
+		return Action{Path: path, Kind: Merge, Vector: merged}, true
+	case left.Deleted != right.Deleted:
+		// Modification concurrent with deletion: the modification wins,
+		// without rename, because losing data is worse than keeping an
+		// unwanted file (concept.md 4.2).
+		if left.Deleted {
+			return Action{Path: path, Kind: Resurrect, Source: rightName, Vector: merged}, true
+		}
+		return Action{Path: path, Kind: Resurrect, Source: leftName, Vector: merged}, true
+	case left.Hash == right.Hash:
+		// Concurrent edits that happen to produce identical bytes: merge
+		// silently, no conflict copy (concept.md 4.2).
+		return Action{Path: path, Kind: Merge, Vector: merged}, true
+	default:
+		winner, loser := resolveConflict(leftName, rightName)
+		return Action{Path: path, Kind: Conflict, Winner: winner, Loser: loser, Vector: merged}, true
+	}
+}
+
+func resolveConflict(leftName, rightName string) (string, string) {
+	if leftName < rightName {
+		return leftName, rightName
+	}
+	return rightName, leftName
+}
+
+// planDirectories reconciles directory metadata. Directories carry no
+// version vector (concept.md 7): each side's own previously committed
+// manifest is the only reference available for deciding who changed what,
+// exactly as before, just no longer shared between replicas.
+func planDirectories(leftName string, left ReplicaState, rightName string, right ReplicaState) []Action {
+	paths := make(map[string]struct{}, len(left.Index.Directories)+len(right.Index.Directories)+len(left.PreviousDirectories)+len(right.PreviousDirectories))
+	for _, set := range []map[string]metadata.Manifest{left.Index.Directories, right.Index.Directories, left.PreviousDirectories, right.PreviousDirectories} {
+		for path := range set {
+			paths[path] = struct{}{}
+		}
 	}
 	ordered := make([]string, 0, len(paths))
 	for path := range paths {
@@ -115,13 +199,14 @@ func planDirectories(leftName string, left state.Baseline, rightName string, rig
 	sort.Strings(ordered)
 	actions := make([]Action, 0)
 	for _, path := range ordered {
-		leftValue, leftExists := left.Directories[path]
-		rightValue, rightExists := right.Directories[path]
-		previous, previousExists := baseline.Directories[path]
-		leftChanged := leftExists != previousExists || leftExists && previousExists && !sameDirectory(leftValue, previous)
-		rightChanged := rightExists != previousExists || rightExists && previousExists && !sameDirectory(rightValue, previous)
+		leftCurrent, leftExists := left.Index.Directories[path]
+		rightCurrent, rightExists := right.Index.Directories[path]
+		leftPrevious, leftPreviousExists := left.PreviousDirectories[path]
+		rightPrevious, rightPreviousExists := right.PreviousDirectories[path]
+		leftChanged := leftExists != leftPreviousExists || leftExists && leftPreviousExists && !metadata.Equal(leftCurrent, leftPrevious)
+		rightChanged := rightExists != rightPreviousExists || rightExists && rightPreviousExists && !metadata.Equal(rightCurrent, rightPrevious)
 		unchanged := !leftChanged && !rightChanged
-		converged := leftChanged && rightChanged && leftExists && rightExists && sameDirectory(leftValue, rightValue)
+		converged := leftChanged && rightChanged && leftExists && rightExists && metadata.Equal(leftCurrent, rightCurrent)
 		bothDeleted := leftChanged && rightChanged && !leftExists && !rightExists
 		if unchanged || converged || bothDeleted {
 			continue
@@ -151,103 +236,4 @@ func planDirectories(leftName string, left state.Baseline, rightName string, rig
 		actions = append(actions, action)
 	}
 	return actions
-}
-
-func decide(path, leftName string, left state.File, rightName string, right state.File, previous state.File) (Action, bool) {
-	leftExists := left.Hash != ""
-	rightExists := right.Hash != ""
-	previousExists := previous.Hash != ""
-	if previousExists && !previous.MetadataKnown {
-		return decideUnknownMetadata(path, leftName, left, leftExists, rightName, right, rightExists)
-	}
-	leftChanged := leftExists != previousExists || leftExists && !sameFile(left, previous)
-	rightChanged := rightExists != previousExists || rightExists && !sameFile(right, previous)
-	if !leftChanged && !rightChanged {
-		return Action{}, false
-	}
-	if leftChanged && rightChanged && leftExists && rightExists && sameFile(left, right) {
-		return Action{}, false
-	}
-	if leftChanged && rightChanged {
-		if !leftExists && !rightExists {
-			return Action{}, false
-		}
-		if !leftExists && rightExists {
-			return Action{Path: path, Kind: Resurrect, Source: rightName}, true
-		}
-		if leftExists && !rightExists {
-			return Action{Path: path, Kind: Resurrect, Source: leftName}, true
-		}
-		winner, loser := resolveConflict(leftName, rightName)
-		if left.Hash == right.Hash {
-			if winner == leftName {
-				return Action{Path: path, Kind: Push, Source: leftName}, true
-			}
-			return Action{Path: path, Kind: Pull, Source: rightName}, true
-		}
-		return Action{Path: path, Kind: Conflict, Winner: winner, Loser: loser}, true
-	}
-	if leftChanged {
-		if leftExists {
-			return Action{Path: path, Kind: Push, Source: leftName}, true
-		}
-		return Action{Path: path, Kind: Delete, Source: leftName}, true
-	}
-	if rightExists {
-		return Action{Path: path, Kind: Pull, Source: rightName}, true
-	}
-	return Action{Path: path, Kind: Delete, Source: rightName}, true
-}
-
-func decideUnknownMetadata(path, leftName string, left state.File, leftExists bool, rightName string, right state.File, rightExists bool) (Action, bool) {
-	switch {
-	case !leftExists && !rightExists:
-		return Action{}, false
-	case !leftExists:
-		return Action{Path: path, Kind: Resurrect, Source: rightName}, true
-	case !rightExists:
-		return Action{Path: path, Kind: Resurrect, Source: leftName}, true
-	case sameFile(left, right):
-		return Action{}, false
-	}
-	winner, loser := resolveConflict(leftName, rightName)
-	if left.Hash != right.Hash {
-		return Action{Path: path, Kind: Conflict, Winner: winner, Loser: loser}, true
-	}
-	if winner == leftName {
-		return Action{Path: path, Kind: Push, Source: leftName}, true
-	}
-	return Action{Path: path, Kind: Pull, Source: rightName}, true
-}
-
-func resolveConflict(leftName, rightName string) (string, string) {
-	if leftName < rightName {
-		return leftName, rightName
-	}
-	return rightName, leftName
-}
-
-func deletionHalt(current, baseline state.Baseline) bool {
-	netLoss := len(baseline.Files) - len(current.Files)
-	if netLoss <= 0 {
-		return false
-	}
-	return guard.DeleteThreshold(netLoss, len(baseline.Files))
-}
-
-// sameFile reports whether left and right represent the same file content
-// and metadata. When either side's metadata is not known (a legacy
-// version-1 baseline), only the hash is compared.
-func sameFile(left, right state.File) bool {
-	if !left.MetadataKnown || !right.MetadataKnown {
-		return left.Hash == right.Hash
-	}
-	return left.Hash == right.Hash && metadata.Equal(left.Metadata, right.Metadata)
-}
-
-func sameDirectory(left, right metadata.Manifest) bool {
-	if right.Mtime.IsZero() {
-		return true
-	}
-	return metadata.Equal(left, right)
 }

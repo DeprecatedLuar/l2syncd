@@ -79,8 +79,8 @@ func TestNewMarkerIDIsUniqueAndValid(t *testing.T) {
 	if first == second {
 		t.Fatal("NewMarkerID() produced identical ids")
 	}
-	if err := validateMarkerID(first); err != nil {
-		t.Fatalf("validateMarkerID(%q) = %v, want nil", first, err)
+	if err := ValidateMarkerID(first); err != nil {
+		t.Fatalf("ValidateMarkerID(%q) = %v, want nil", first, err)
 	}
 }
 

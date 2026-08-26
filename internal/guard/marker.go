@@ -44,7 +44,10 @@ func NewMarkerID() (string, error) {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", raw[0:4], raw[4:6], raw[6:8], raw[8:10], raw[10:16]), nil
 }
 
-func validateMarkerID(id string) error {
+// ValidateMarkerID reports whether id is a well-formed folder identity
+// (concept.md 5.9). Exported so other packages that key state by folder id
+// (internal/index) can validate it without duplicating the pattern.
+func ValidateMarkerID(id string) error {
 	if !markerIDPattern.MatchString(id) {
 		return fmt.Errorf("marker id %q is not a valid identity", id)
 	}
@@ -64,7 +67,7 @@ func ReadMarker(folder string) (Marker, error) {
 	if strings.TrimSpace(marker.ID) == "" {
 		return Marker{}, fmt.Errorf("marker %s has no id; re-register this folder with add or join", path)
 	}
-	if err := validateMarkerID(marker.ID); err != nil {
+	if err := ValidateMarkerID(marker.ID); err != nil {
 		return Marker{}, fmt.Errorf("marker %s: %w", path, err)
 	}
 	return marker, nil
@@ -79,7 +82,7 @@ func WriteMarker(folder string, marker Marker) error {
 	if strings.TrimSpace(marker.ID) == "" {
 		return errors.New("marker id is empty")
 	}
-	if err := validateMarkerID(marker.ID); err != nil {
+	if err := ValidateMarkerID(marker.ID); err != nil {
 		return err
 	}
 	temporary, err := os.CreateTemp(folder, ".l2sync-marker-*")
