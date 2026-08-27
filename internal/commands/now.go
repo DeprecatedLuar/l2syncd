@@ -236,12 +236,34 @@ func localInitiatesCycle(localIdentity, remoteIdentity string) (bool, error) {
 	return localIdentity < remoteIdentity, nil
 }
 
-// runInitiatorFolderCycle plans and applies one folder's cycle. It holds no
-// lock across this span: outbound transport calls to the peer must never
-// wait behind this installation's own local mutation lock (see
-// withFolderLock), which serve.go's forced-command handlers also acquire
-// for unrelated, concurrent, per-folder work.
+// folderCycleLocks serializes every full initiator cycle for one folder
+// within this process (implementation-plan.md Phase F). A locally
+// triggered cycle (filesystem, periodic, retry, startup) and an inbound
+// peer-requested cycle (serve.go's RequestCycle callback, reached over a
+// concurrent SSH session) both call runInitiatorFolderCycle for the same
+// folder; without this, both can pass applyConflict's ConflictCopyExists
+// precheck before either writes, since that check runs outside
+// withFolderLock. This lock is process-local and never held across a
+// network round trip to another installation, so it carries none of
+// withFolderLock's cross-peer deadlock risk.
+var folderCycleLocks sync.Map
+
+func lockFolderCycle(name string) func() {
+	value, _ := folderCycleLocks.LoadOrStore(name, &sync.Mutex{})
+	mutex := value.(*sync.Mutex)
+	mutex.Lock()
+	return mutex.Unlock
+}
+
+// runInitiatorFolderCycle plans and applies one folder's cycle. Beyond the
+// per-folder serialization above, it holds no lock across this span:
+// outbound transport calls to the peer must never wait behind this
+// installation's own local mutation lock (see withFolderLock), which
+// serve.go's forced-command handlers also acquire for unrelated, concurrent,
+// per-folder work.
 func runInitiatorFolderCycle(ctx context.Context, name, expectedPeer, authenticatedFingerprint string) (actions int, err error) {
+	unlock := lockFolderCycle(name)
+	defer unlock()
 	cfg, err := loadConfigForTransaction()
 	if err != nil {
 		return 0, err
@@ -386,9 +408,37 @@ func planFolder(ctx context.Context, cfg config.Config, name, path, peer string,
 	if err := restoreDirectoryMetadata(ctx, plan.Actions, directoryActions, name, marker.ID, path, remoteIdentity, endpoint, local, remote); err != nil {
 		return 0, err
 	}
+	acknowledgeCycle(ctx, name, marker.ID, remoteIdentity, endpoint)
 	nowLogger.Info("initiator cycle outcome", "folder", name, "peer", peer, "outcome", "success",
 		"actions", len(plan.Actions), "directory_actions", len(plan.DirectoryActions))
 	return len(plan.Actions) + len(plan.DirectoryActions), nil
+}
+
+// acknowledgeCycle records, at the end of a successful cycle, that peer
+// remoteIdentity's knowledge of this folder has caught up to every entry
+// this installation now holds, pruning any tombstone that watermark
+// dominates (implementation-plan.md Phase E, concept.md 4.2 "Tombstone
+// lifetime"). It never fails the cycle: a local index error or an
+// unreachable peer just postpones pruning to a later cycle, exactly as
+// pruning is specified to be lazy and optional.
+func acknowledgeCycle(ctx context.Context, share, folderID, remoteIdentity string, endpoint transport.Endpoint) {
+	var global vector.Vector
+	err := withFolderLock(ctx, share, func() error {
+		idx, err := loadIndex(folderID)
+		if err != nil {
+			return err
+		}
+		global = index.GlobalVector(idx)
+		updated := index.Acknowledge(idx, remoteIdentity, global, []string{remoteIdentity})
+		return index.Save(updated)
+	})
+	if err != nil {
+		nowLogger.Warn("tombstone acknowledgment skipped", "folder", share, "error", err)
+		return
+	}
+	if err := transport.AcknowledgeVector(ctx, endpoint, share, global); err != nil {
+		nowLogger.Warn("peer tombstone acknowledgment failed; retained until a later cycle", "folder", share, "error", err)
+	}
 }
 
 // sortByDepthDescending orders items so deeper paths (more path separators)

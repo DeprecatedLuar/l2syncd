@@ -130,6 +130,59 @@ func TestServeMergeVectorRequiresConfiguredCallback(t *testing.T) {
 	}
 }
 
+func TestServeAcknowledgeVectorDispatchesShareAndVector(t *testing.T) {
+	var request bytes.Buffer
+	vec := vector.Vector{"a": 3, "b": 1}
+	if err := (frameWriter{w: &request}).write(message{Type: messageAcknowledge, Share: "notes", Version: vec}); err != nil {
+		t.Fatal(err)
+	}
+	var gotShare string
+	var gotVec vector.Vector
+	var response bytes.Buffer
+	err := Serve(&request, &response, Callbacks{AcknowledgeVector: func(share string, v vector.Vector) error {
+		gotShare, gotVec = share, v
+		return nil
+	}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotShare != "notes" || gotVec["a"] != 3 || gotVec["b"] != 1 {
+		t.Fatalf("acknowledge-vector dispatch = %q %v", gotShare, gotVec)
+	}
+	reply, err := (frameReader{r: bufio.NewReader(&response)}).read()
+	if err != nil || reply.Type != messageEnd {
+		t.Fatalf("acknowledge-vector reply = %#v, %v", reply, err)
+	}
+}
+
+func TestServeAcknowledgeVectorRequiresConfiguredCallback(t *testing.T) {
+	var request bytes.Buffer
+	if err := (frameWriter{w: &request}).write(message{Type: messageAcknowledge, Share: "notes"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := Serve(&request, io.Discard, Callbacks{}, nil); err == nil {
+		t.Fatal("Serve accepted acknowledge-vector with no callback configured")
+	}
+}
+
+func TestServeAcknowledgeVectorRequiresShareName(t *testing.T) {
+	var request bytes.Buffer
+	if err := (frameWriter{w: &request}).write(message{Type: messageAcknowledge}); err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	err := Serve(&request, io.Discard, Callbacks{AcknowledgeVector: func(string, vector.Vector) error {
+		called = true
+		return nil
+	}}, nil)
+	if err == nil {
+		t.Fatal("Serve accepted acknowledge-vector with an empty share name")
+	}
+	if called {
+		t.Fatal("AcknowledgeVector callback invoked despite missing share name")
+	}
+}
+
 func TestServePeerReuseTransfersNoContentFrames(t *testing.T) {
 	manifest := metadata.Manifest{Mode: 0o600, Mtime: time.Unix(100, 0)}
 	var request bytes.Buffer

@@ -253,6 +253,97 @@ func TestAddTreeExcludesTrashDirectory(t *testing.T) {
 	}
 }
 
+func TestBoundCyclePeersDeduplicatesAcrossFolders(t *testing.T) {
+	cfg := config.New()
+	cfg.Peers["phone"] = config.Peer{Address: "phone", PublicKey: "key"}
+	cfg.Shared["notes"] = config.Folder{Path: "/notes", Peers: []string{"phone"}}
+	cfg.Remote["photos"] = config.Folder{Path: "/photos", Peers: []string{"phone"}}
+
+	got := boundCyclePeers(cfg)
+	if len(got) != 1 || got[0] != "phone" {
+		t.Fatalf("boundCyclePeers = %v, want [phone]", got)
+	}
+}
+
+func TestSeedPeerReachabilityDoesNotReportReconnect(t *testing.T) {
+	cfg := config.New()
+	cfg.Peers["phone"] = config.Peer{Address: "phone", PublicKey: "key"}
+	cfg.Remote["photos"] = config.Folder{Path: "/photos", Peers: []string{"phone"}}
+
+	reachable := make(map[string]bool)
+	seedPeerReachability(context.Background(), cfg, reachable, func(context.Context, config.Config, string) bool {
+		return true
+	})
+	if !reachable["phone"] {
+		t.Fatal("seed did not record reachable peer")
+	}
+}
+
+func TestPollPeerReachabilityFiresOnlyOnTransition(t *testing.T) {
+	cfg := config.New()
+	cfg.Peers["phone"] = config.Peer{Address: "phone", PublicKey: "key"}
+	cfg.Shared["notes"] = config.Folder{Path: "/notes", Peers: []string{"phone"}}
+	reachable := map[string]bool{"phone": false}
+	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+
+	unreachable := func(context.Context, config.Config, string) bool { return false }
+	if pollPeerReachability(context.Background(), cfg, reachable, logger, unreachable) {
+		t.Fatal("still-unreachable peer reported as reconnected")
+	}
+
+	reachableProbe := func(context.Context, config.Config, string) bool { return true }
+	if !pollPeerReachability(context.Background(), cfg, reachable, logger, reachableProbe) {
+		t.Fatal("peer transitioning to reachable was not reported")
+	}
+	if !reachable["phone"] {
+		t.Fatal("reachable state not updated after transition")
+	}
+
+	if pollPeerReachability(context.Background(), cfg, reachable, logger, reachableProbe) {
+		t.Fatal("already-reachable peer re-reported as reconnected")
+	}
+}
+
+func TestLockFolderCycleSerializesSameFolder(t *testing.T) {
+	unlockFirst := lockFolderCycle("notes")
+	started := make(chan struct{})
+	acquired := make(chan struct{})
+	go func() {
+		close(started)
+		unlockSecond := lockFolderCycle("notes")
+		close(acquired)
+		unlockSecond()
+	}()
+	<-started
+	select {
+	case <-acquired:
+		t.Fatal("second cycle lock acquired while first cycle still holds it")
+	case <-time.After(50 * time.Millisecond):
+	}
+	unlockFirst()
+	select {
+	case <-acquired:
+	case <-time.After(time.Second):
+		t.Fatal("second cycle lock never acquired after first released")
+	}
+}
+
+func TestLockFolderCycleAllowsDifferentFolders(t *testing.T) {
+	unlockA := lockFolderCycle("folder-a")
+	defer unlockA()
+	done := make(chan struct{})
+	go func() {
+		unlockB := lockFolderCycle("folder-b")
+		unlockB()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("lock for a different folder blocked unexpectedly")
+	}
+}
+
 func TestCycleConfigurationIgnoresUnchangedRewritesAndUnboundPeers(t *testing.T) {
 	current := config.New()
 	current.Peers["phone"] = config.Peer{Address: "phone", PublicKey: "key"}

@@ -148,6 +148,71 @@ func Path(id string) (string, error) {
 	return filepath.Join(directory, indexSubdir, id+fileExtension), nil
 }
 
+// GlobalVector returns the component-wise maximum of every entry's version
+// vector in idx: the smallest vector that dominates everything idx
+// currently records, live or tombstoned. After a cycle in which every path
+// has converged between two replicas, this is exactly the vector the other
+// replica is now known to have reached too, which is what a caller records
+// as that member's acknowledgment (concept.md 4.2 "Tombstone lifetime").
+func GlobalVector(idx Index) vector.Vector {
+	var result vector.Vector
+	for _, entry := range idx.Entries {
+		result = vector.Merge(result, entry.Version)
+	}
+	return result
+}
+
+// Acknowledge records that member's confirmed knowledge for this folder has
+// reached at least vec, then prunes every tombstone that members (the
+// folder's complete known membership) now collectively dominate. vec is
+// cloned so the caller's own copy is never aliased into the index.
+func Acknowledge(idx Index, member string, vec vector.Vector, members []string) Index {
+	if idx.Acknowledged == nil {
+		idx.Acknowledged = make(map[string]vector.Vector)
+	}
+	idx.Acknowledged[member] = vector.Clone(vec)
+	return Prune(idx, members)
+}
+
+// Prune removes every tombstone whose vector every member in members has
+// acknowledged (concept.md 4.2 "Tombstone lifetime"). Pruning is lazy and
+// always optional: an absent member, or one whose acknowledged vector does
+// not dominate a given tombstone, leaves that tombstone untouched. Nothing
+// here consults elapsed time; a tombstone with no members to check against
+// is retained, never guessed away.
+func Prune(idx Index, members []string) Index {
+	if len(members) == 0 {
+		return idx
+	}
+	for path, entry := range idx.Entries {
+		if !entry.Deleted {
+			continue
+		}
+		if allAcknowledge(idx.Acknowledged, members, entry.Version) {
+			delete(idx.Entries, path)
+		}
+	}
+	return idx
+}
+
+// allAcknowledge reports whether every member's acknowledged vector
+// dominates target: target's knowledge is fully contained within each
+// member's, i.e. never causally ahead of it.
+func allAcknowledge(acknowledged map[string]vector.Vector, members []string, target vector.Vector) bool {
+	for _, member := range members {
+		bound, ok := acknowledged[member]
+		if !ok {
+			return false
+		}
+		switch vector.Compare(target, bound) {
+		case vector.Equal, vector.Lesser:
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // atomicWriteJSON writes value as JSON to path via a same-directory temp
 // file, fsyncing the file and its parent directory before the rename
 // becomes visible.

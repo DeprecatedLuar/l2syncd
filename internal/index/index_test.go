@@ -153,3 +153,90 @@ func TestLoadRejectsVersion1LegacyFile(t *testing.T) {
 func metadataWithMode(mode uint32) metadata.Manifest {
 	return metadata.Manifest{Mode: mode}
 }
+
+func TestGlobalVectorMergesEveryEntry(t *testing.T) {
+	idx := New(testID)
+	idx.Entries["a"] = Entry{Version: vector.Vector{"m1": 3, "m2": 1}}
+	idx.Entries["b"] = Entry{Version: vector.Vector{"m1": 1, "m2": 5}, Deleted: true}
+	got := GlobalVector(idx)
+	want := vector.Vector{"m1": 3, "m2": 5}
+	if vector.Compare(got, want) != vector.Equal {
+		t.Fatalf("GlobalVector = %v, want %v", got, want)
+	}
+}
+
+func TestGlobalVectorOfEmptyIndexIsNil(t *testing.T) {
+	if got := GlobalVector(New(testID)); len(got) != 0 {
+		t.Fatalf("GlobalVector(empty) = %v, want empty", got)
+	}
+}
+
+// TestAcknowledgeTwoMembersPrunesWhenBothCatchUp covers the two-peer case:
+// pruning happens at the end of the cycle in which both sides agree
+// (concept.md 4.2 "Tombstone lifetime").
+func TestAcknowledgeTwoMembersPrunesWhenBothCatchUp(t *testing.T) {
+	idx := New(testID)
+	idx.Entries["gone.txt"] = Entry{Version: vector.Vector{"a": 2}, Deleted: true}
+	idx.Entries["live.txt"] = Entry{Version: vector.Vector{"a": 1}}
+
+	idx = Acknowledge(idx, "peer-b", vector.Vector{"a": 1}, []string{"peer-b"})
+	if _, exists := idx.Entries["gone.txt"]; !exists {
+		t.Fatal("tombstone pruned before its acknowledged member caught up")
+	}
+
+	idx = Acknowledge(idx, "peer-b", vector.Vector{"a": 2}, []string{"peer-b"})
+	if _, exists := idx.Entries["gone.txt"]; exists {
+		t.Fatal("tombstone retained after its only member fully acknowledged it")
+	}
+	if _, exists := idx.Entries["live.txt"]; !exists {
+		t.Fatal("Prune removed a live entry, not just tombstones")
+	}
+}
+
+// TestPruneRetainsTombstoneWithAbsentMember covers a three-member folder
+// where one member has never acknowledged: the tombstone must be retained
+// regardless of what the other members have confirmed, and only pruned once
+// every member (including the absent one) reconnects and acknowledges.
+func TestPruneRetainsTombstoneWithAbsentMember(t *testing.T) {
+	idx := New(testID)
+	idx.Entries["gone.txt"] = Entry{Version: vector.Vector{"a": 5}, Deleted: true}
+	idx.Acknowledged["peer-b"] = vector.Vector{"a": 5}
+	// peer-c has never acknowledged anything for this folder.
+	members := []string{"peer-b", "peer-c"}
+
+	pruned := Prune(idx, members)
+	if _, exists := pruned.Entries["gone.txt"]; !exists {
+		t.Fatal("tombstone pruned despite an absent member: partial acknowledgment must never prune")
+	}
+
+	pruned.Acknowledged["peer-c"] = vector.Vector{"a": 5}
+	pruned = Prune(pruned, members)
+	if _, exists := pruned.Entries["gone.txt"]; exists {
+		t.Fatal("tombstone retained after every known member acknowledged it")
+	}
+}
+
+// TestPruneRejectsPartialAcknowledgmentVector covers forcing a prune with a
+// member whose acknowledged vector does not yet dominate the tombstone: it
+// must be rejected outright, not merely discouraged.
+func TestPruneRejectsPartialAcknowledgmentVector(t *testing.T) {
+	idx := New(testID)
+	idx.Entries["gone.txt"] = Entry{Version: vector.Vector{"a": 2, "b": 1}, Deleted: true}
+	// peer-b's acknowledged vector is concurrent with the tombstone's, not
+	// dominating it.
+	idx.Acknowledged["peer-b"] = vector.Vector{"a": 1, "b": 2}
+
+	pruned := Prune(idx, []string{"peer-b"})
+	if _, exists := pruned.Entries["gone.txt"]; !exists {
+		t.Fatal("tombstone pruned against a non-dominating acknowledged vector")
+	}
+}
+
+func TestPruneWithNoKnownMembersNeverGuesses(t *testing.T) {
+	idx := New(testID)
+	idx.Entries["gone.txt"] = Entry{Version: vector.Vector{"a": 1}, Deleted: true}
+	pruned := Prune(idx, nil)
+	if _, exists := pruned.Entries["gone.txt"]; !exists {
+		t.Fatal("tombstone pruned with no known members to check against")
+	}
+}

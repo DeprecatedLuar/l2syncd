@@ -124,6 +124,20 @@ func Serve(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	callbacks.RequestCycle = func(name string) (int, error) {
 		return runInitiatorFolderCycle(context.Background(), name, peerName, forcedFingerprint)
 	}
+	callbacks.AcknowledgeVector = func(name string, vec vector.Vector) error {
+		return mutateServedFolder(name, resolve, func(folder resolvedFolder) error {
+			idx, err := loadIndex(folder.marker.ID)
+			if err != nil {
+				return err
+			}
+			updated := index.Acknowledge(idx, forcedFingerprint, vec, []string{forcedFingerprint})
+			if err := index.Save(updated); err != nil {
+				return err
+			}
+			commitLogger.Info("tombstones acknowledged", "folder", name, "peer", peerName, "entries", len(updated.Entries))
+			return nil
+		})
+	}
 	callbacks.BindShare = func(name string) (bool, error) { return bindSharedFolder(peerName, forcedFingerprint, name) }
 	callbacks.UnbindShare = func(name string) error {
 		return updateConfigLocked(func(current *config.Config) error {

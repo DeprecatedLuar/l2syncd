@@ -23,24 +23,28 @@ import (
 	"l2syncd/internal/lock"
 	"l2syncd/internal/logging"
 	"l2syncd/internal/preflight"
+	"l2syncd/internal/transport"
 )
 
 const (
-	runExitOK        = 0
-	runExitError     = 1
-	runDebounce      = 500 * time.Millisecond
-	runFullScan      = 15 * time.Minute
-	runBackoffStart  = time.Second
-	runBackoffMax    = time.Minute
-	runWatchRetry    = time.Minute
-	runConfigDirMode = 0o700
-	inotifyLimitPath = "/proc/sys/fs/inotify/max_user_watches"
-	inotifyLimitName = "fs.inotify.max_user_watches"
+	runExitOK             = 0
+	runExitError          = 1
+	runDebounce           = 500 * time.Millisecond
+	runFullScan           = 15 * time.Minute
+	runBackoffStart       = time.Second
+	runBackoffMax         = time.Minute
+	runWatchRetry         = time.Minute
+	runConfigDirMode      = 0o700
+	runReconnectPoll      = 15 * time.Second
+	runReconnectProbeWait = 5 * time.Second
+	inotifyLimitPath      = "/proc/sys/fs/inotify/max_user_watches"
+	inotifyLimitName      = "fs.inotify.max_user_watches"
 
 	cycleTriggerFilesystem = "filesystem"
 	cycleTriggerPeriodic   = "periodic"
 	cycleTriggerRetry      = "retry"
 	cycleTriggerStartup    = "startup"
+	cycleTriggerReconnect  = "reconnect"
 )
 
 type cycleRunner func(context.Context) (CycleSummary, error)
@@ -150,6 +154,8 @@ func Run(args []string, stderr io.Writer) (exitCode int) {
 	defer periodic.Stop()
 	watchRetry := time.NewTicker(runWatchRetry)
 	defer watchRetry.Stop()
+	reconnectPoll := time.NewTicker(runReconnectPoll)
+	defer reconnectPoll.Stop()
 	retry := time.NewTimer(time.Hour)
 	if !retry.Stop() {
 		<-retry.C
@@ -157,6 +163,8 @@ func Run(args []string, stderr io.Writer) (exitCode int) {
 	dirty := false
 	backoff := runBackoffStart
 	backoff = executeCycle(ctx, logger, retry, backoff, cycleTriggerStartup, RunCycle)
+	reachable := make(map[string]bool)
+	seedPeerReachability(ctx, cfg, reachable, probePeerReachable)
 	for {
 		select {
 		case <-ctx.Done():
@@ -234,6 +242,10 @@ func Run(args []string, stderr io.Writer) (exitCode int) {
 			}
 		case <-retry.C:
 			backoff = executeCycle(ctx, logger, retry, backoff, cycleTriggerRetry, RunCycle)
+		case <-reconnectPoll.C:
+			if pollPeerReachability(ctx, cfg, reachable, logger, probePeerReachable) {
+				backoff = executeCycle(ctx, logger, retry, backoff, cycleTriggerReconnect, RunCycle)
+			}
 		}
 	}
 }
@@ -431,6 +443,65 @@ func retryWatchConditions(watcher *fsnotify.Watcher, roots []watchRoot, conditio
 		logger.Info("filesystem watches restored", "folder", root.name, "path", root.path)
 	}
 	return changed
+}
+
+// boundCyclePeers returns the distinct peers bound to any folder RunCycle
+// would process, so reachability polling probes only peers this daemon
+// actually depends on.
+func boundCyclePeers(cfg config.Config) []string {
+	peers := make(map[string]struct{})
+	for _, name := range cycleFolderNames(cfg) {
+		if peer, ok := cfg.BoundPeer(name); ok {
+			peers[peer] = struct{}{}
+		}
+	}
+	return sortedKeys(peers)
+}
+
+// probePeerReachable performs a lightweight ping RPC to decide whether peer
+// is currently reachable, independent of whether a full cycle would
+// succeed.
+func probePeerReachable(ctx context.Context, cfg config.Config, peer string) bool {
+	configured, exists := cfg.Peers[peer]
+	if !exists || configured.PublicKey == "" {
+		return false
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, runReconnectProbeWait)
+	defer cancel()
+	endpoint, err := peerEndpoint(probeCtx, cfg, peer)
+	if err != nil {
+		return false
+	}
+	return transport.Exchange(probeCtx, endpoint) == nil
+}
+
+// seedPeerReachability records each bound peer's current reachability
+// without treating any of it as a reconnect, so the daemon's first poll
+// after the startup cycle (which already ran regardless of reachability)
+// does not fire a redundant immediate cycle.
+func seedPeerReachability(ctx context.Context, cfg config.Config, reachable map[string]bool, probe func(context.Context, config.Config, string) bool) {
+	for _, peer := range boundCyclePeers(cfg) {
+		reachable[peer] = probe(ctx, cfg, peer)
+	}
+}
+
+// pollPeerReachability updates reachable in place and reports whether any
+// bound peer just transitioned from unreachable to reachable
+// (implementation-plan.md Phase F: reconnect trigger). A change made while
+// the peer was unreachable already fired its filesystem event and was
+// otherwise lost until the periodic backstop; this lets it propagate as
+// soon as the peer comes back.
+func pollPeerReachability(ctx context.Context, cfg config.Config, reachable map[string]bool, logger *slog.Logger, probe func(context.Context, config.Config, string) bool) bool {
+	reconnected := false
+	for _, peer := range boundCyclePeers(cfg) {
+		now := probe(ctx, cfg, peer)
+		if now && !reachable[peer] {
+			logger.Info("peer reconnected", "peer", peer)
+			reconnected = true
+		}
+		reachable[peer] = now
+	}
+	return reconnected
 }
 
 func resetTimer(timer *time.Timer, duration time.Duration) {

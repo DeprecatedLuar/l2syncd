@@ -53,6 +53,7 @@ const (
 	messageDeleteDir     = "delete-directory"
 	messageReuseFile     = "reuse-file"
 	messageMergeVector   = "merge-vector"
+	messageAcknowledge   = "acknowledge-vector"
 	messageShare         = "share"
 	messageFile          = "file"
 	messageEnd           = "end"
@@ -190,6 +191,12 @@ type Callbacks struct {
 	// moving any bytes: the resolution for a concurrent-but-identical pair
 	// (engine.Merge), where nothing else carries the vector to this peer.
 	MergeVector func(share, relative string, vec vector.Vector) error
+	// AcknowledgeVector records that the calling peer's knowledge of share
+	// has reached vec, letting the callee prune any tombstone that vec now
+	// dominates (implementation-plan.md Phase E, concept.md 4.2 "Tombstone
+	// lifetime"). It carries no per-path target: vec is a whole-folder
+	// watermark, not a single entry's vector.
+	AcknowledgeVector func(share string, vec vector.Vector) error
 }
 
 type frameWriter struct {
@@ -546,6 +553,21 @@ func MergeVector(ctx context.Context, endpoint Endpoint, share, relative string,
 	return runSimpleMutation(ctx, endpoint, message{Type: messageMergeVector, Share: share, Path: relative, Version: vec})
 }
 
+// AcknowledgeVector tells a peer that this installation's knowledge of share
+// has reached vec, so the peer may prune any tombstone vec now dominates
+// (implementation-plan.md Phase E). Unlike other mutation RPCs it carries no
+// relative path, so it bypasses runSimpleMutation's path validation.
+func AcknowledgeVector(ctx context.Context, endpoint Endpoint, share string, vec vector.Vector) error {
+	if endpoint.Address == "" || share == "" {
+		return errors.New("peer address and share are required")
+	}
+	var request bytes.Buffer
+	if err := (frameWriter{w: &request}).write(message{Type: messageAcknowledge, Share: share, Version: vec}); err != nil {
+		return err
+	}
+	return runMutation(ctx, endpoint, request.Bytes(), false)
+}
+
 func runSimpleMutation(ctx context.Context, endpoint Endpoint, requestMessage message) error {
 	if endpoint.Address == "" || requestMessage.Share == "" {
 		return errors.New("peer address and share are required")
@@ -775,6 +797,17 @@ func Serve(reader io.Reader, writer io.Writer, callbacks Callbacks, handshake *H
 			return err
 		}
 		if err := callbacks.MergeVector(request.Share, request.Path, request.Version); err != nil {
+			return err
+		}
+		return (frameWriter{w: writer}).write(message{Type: messageEnd})
+	case messageAcknowledge:
+		if callbacks.AcknowledgeVector == nil {
+			return errors.New("vector acknowledgment is not configured")
+		}
+		if request.Share == "" {
+			return errors.New("share name is empty")
+		}
+		if err := callbacks.AcknowledgeVector(request.Share, request.Version); err != nil {
 			return err
 		}
 		return (frameWriter{w: writer}).write(message{Type: messageEnd})
