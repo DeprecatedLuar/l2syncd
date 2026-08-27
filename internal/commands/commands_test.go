@@ -136,7 +136,7 @@ func TestRunCycleReloadsConfigInsteadOfUsingCallerSnapshot(t *testing.T) {
 	}
 }
 
-func TestRemoveRemoteUnbindsProviderBeforeLocalRegistration(t *testing.T) {
+func TestLeaveUnbindsProviderBeforeLocalRegistration(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("HOME", root)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
@@ -145,7 +145,8 @@ func TestRemoveRemoteUnbindsProviderBeforeLocalRegistration(t *testing.T) {
 	if err := os.Mkdir(folder, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := guard.WriteMarker(folder, newTestMarker(t, "notes")); err != nil {
+	marker := newTestMarker(t, "notes")
+	if err := guard.WriteMarker(folder, marker); err != nil {
 		t.Fatal(err)
 	}
 	cfg := config.New()
@@ -154,10 +155,13 @@ func TestRemoveRemoteUnbindsProviderBeforeLocalRegistration(t *testing.T) {
 	if err := config.Save(cfg); err != nil {
 		t.Fatal(err)
 	}
-	original := removeUnbindShare
-	t.Cleanup(func() { removeUnbindShare = original })
+	if err := index.Save(index.New(marker.ID)); err != nil {
+		t.Fatal(err)
+	}
+	original := leaveUnbindShare
+	t.Cleanup(func() { leaveUnbindShare = original })
 	unbound := false
-	removeUnbindShare = func(_ context.Context, endpoint transport.Endpoint, share string) error {
+	leaveUnbindShare = func(_ context.Context, endpoint transport.Endpoint, share string) error {
 		if endpoint.Name != "phone" || share != "notes" {
 			return fmt.Errorf("unexpected unbind %q/%q", endpoint.Name, share)
 		}
@@ -165,8 +169,8 @@ func TestRemoveRemoteUnbindsProviderBeforeLocalRegistration(t *testing.T) {
 		return nil
 	}
 	var stderr bytes.Buffer
-	if code := Remove([]string{"notes"}, &stderr); code != removeExitOK {
-		t.Fatalf("Remove = %d, stderr = %q", code, stderr.String())
+	if code := Leave([]string{"notes"}, &stderr); code != leaveExitOK {
+		t.Fatalf("Leave = %d, stderr = %q", code, stderr.String())
 	}
 	loaded, err := config.Load()
 	if err != nil {
@@ -175,9 +179,16 @@ func TestRemoveRemoteUnbindsProviderBeforeLocalRegistration(t *testing.T) {
 	if _, remains := loaded.Remote["notes"]; !unbound || remains {
 		t.Fatalf("unbound = %v, config = %#v", unbound, loaded)
 	}
+	indexPath, err := index.Path(marker.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(indexPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("leave left an index file behind: %v", err)
+	}
 }
 
-func TestRemoveRemoteOfflineRetainsRetryableLocalRegistration(t *testing.T) {
+func TestLeaveOfflineRetainsRetryableLocalRegistration(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("HOME", root)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
@@ -195,19 +206,64 @@ func TestRemoveRemoteOfflineRetainsRetryableLocalRegistration(t *testing.T) {
 	if err := config.Save(cfg); err != nil {
 		t.Fatal(err)
 	}
-	original := removeUnbindShare
-	t.Cleanup(func() { removeUnbindShare = original })
-	removeUnbindShare = func(context.Context, transport.Endpoint, string) error { return errors.New("offline") }
+	original := leaveUnbindShare
+	t.Cleanup(func() { leaveUnbindShare = original })
+	leaveUnbindShare = func(context.Context, transport.Endpoint, string) error { return errors.New("offline") }
 	var stderr bytes.Buffer
-	if code := Remove([]string{"notes"}, &stderr); code == removeExitOK {
-		t.Fatal("Remove succeeded while provider was offline")
+	if code := Leave([]string{"notes"}, &stderr); code == leaveExitOK {
+		t.Fatal("Leave succeeded while provider was offline")
 	}
 	loaded, err := config.Load()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if remaining := loaded.Remote["notes"]; remaining.Path != folder || !reflect.DeepEqual(remaining.Peers, []string{"phone"}) {
-		t.Fatalf("offline removal changed retryable config: %#v", loaded)
+		t.Fatalf("offline leave changed retryable config: %#v", loaded)
+	}
+}
+
+func TestRemovePrunesIndexWhileBound(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
+	folder := filepath.Join(root, "notes")
+	if err := os.Mkdir(folder, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	marker := newTestMarker(t, "notes")
+	if err := guard.WriteMarker(folder, marker); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.New()
+	cfg.Peers["phone"] = config.Peer{Address: "phone", PublicKey: generatedPublicKey(t, filepath.Join(root, "peer-key"))}
+	cfg.Shared["notes"] = config.Folder{Path: folder, Peers: []string{"phone"}}
+	if err := config.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := index.Save(index.New(marker.ID)); err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	if code := Remove([]string{"notes"}, &stderr); code != removeExitOK {
+		t.Fatalf("Remove = %d, stderr = %q", code, stderr.String())
+	}
+	if _, err := os.Stat(folder); err != nil {
+		t.Fatalf("share path removed: %v", err)
+	}
+	loaded, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := loaded.Shared["notes"]; exists {
+		t.Fatal("share remains in config after remove")
+	}
+	indexPath, err := index.Path(marker.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(indexPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("remove left an index file behind: %v", err)
 	}
 }
 
@@ -537,6 +593,130 @@ func TestFreshJoinBindsBeforeAuthorizedListing(t *testing.T) {
 	}
 	if marker.ID != wantProviderID {
 		t.Fatalf("joined marker id = %q, want provider id %q", marker.ID, wantProviderID)
+	}
+}
+
+func joinDivergenceTestSetup(t *testing.T) (folder, extraPath, providerID string) {
+	t.Helper()
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
+	folder = filepath.Join(root, "notes")
+	if err := os.Mkdir(folder, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	extraPath = filepath.Join(folder, "local-only.txt")
+	if err := os.WriteFile(extraPath, []byte("mine"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.New()
+	cfg.Peers["phone"] = config.Peer{Address: "phone", PublicKey: generatedPublicKey(t, filepath.Join(root, "remote-key"))}
+	if err := config.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	id, err := guard.NewMarkerID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return folder, extraPath, id
+}
+
+func TestJoinDivergenceMergeKeepsLocalExtras(t *testing.T) {
+	folder, extraPath, providerID := joinDivergenceTestSetup(t)
+	originalFind, originalBind, originalUnbind, originalList, originalResolve :=
+		joinFindProvider, joinBindShare, joinUnbindShare, joinListFiles, joinResolveDivergence
+	t.Cleanup(func() {
+		joinFindProvider, joinBindShare, joinUnbindShare, joinListFiles, joinResolveDivergence =
+			originalFind, originalBind, originalUnbind, originalList, originalResolve
+	})
+	joinFindProvider = func(context.Context, config.Config, string) (string, transport.Endpoint, error) {
+		return "phone", transport.Endpoint{Name: "phone"}, nil
+	}
+	joinBindShare = func(context.Context, transport.Endpoint, string) (bool, error) { return true, nil }
+	joinUnbindShare = func(context.Context, transport.Endpoint, string) error { return nil }
+	joinListFiles = func(context.Context, transport.Endpoint, string, string) ([]transport.PeerFile, string, error) {
+		return nil, providerID, nil
+	}
+	prompted := false
+	joinResolveDivergence = func(_ io.Writer, _ string, extras []string) (divergenceChoice, error) {
+		prompted = true
+		if len(extras) != 1 || extras[0] != "local-only.txt" {
+			t.Fatalf("prompted extras = %v", extras)
+		}
+		return divergenceMerge, nil
+	}
+	var stderr bytes.Buffer
+	if code := Join([]string{"notes", folder}, &stderr); code != joinExitOK {
+		t.Fatalf("Join = %d, stderr = %q", code, stderr.String())
+	}
+	if !prompted {
+		t.Fatal("divergence was not prompted")
+	}
+	if _, err := os.Stat(extraPath); err != nil {
+		t.Fatalf("merge should keep local extra: %v", err)
+	}
+}
+
+func TestJoinDivergenceDropTrashesLocalExtras(t *testing.T) {
+	folder, extraPath, providerID := joinDivergenceTestSetup(t)
+	originalFind, originalBind, originalUnbind, originalList, originalResolve :=
+		joinFindProvider, joinBindShare, joinUnbindShare, joinListFiles, joinResolveDivergence
+	t.Cleanup(func() {
+		joinFindProvider, joinBindShare, joinUnbindShare, joinListFiles, joinResolveDivergence =
+			originalFind, originalBind, originalUnbind, originalList, originalResolve
+	})
+	joinFindProvider = func(context.Context, config.Config, string) (string, transport.Endpoint, error) {
+		return "phone", transport.Endpoint{Name: "phone"}, nil
+	}
+	joinBindShare = func(context.Context, transport.Endpoint, string) (bool, error) { return true, nil }
+	joinUnbindShare = func(context.Context, transport.Endpoint, string) error { return nil }
+	joinListFiles = func(context.Context, transport.Endpoint, string, string) ([]transport.PeerFile, string, error) {
+		return nil, providerID, nil
+	}
+	joinResolveDivergence = func(io.Writer, string, []string) (divergenceChoice, error) {
+		return divergenceDrop, nil
+	}
+	var stderr bytes.Buffer
+	if code := Join([]string{"notes", folder}, &stderr); code != joinExitOK {
+		t.Fatalf("Join = %d, stderr = %q", code, stderr.String())
+	}
+	if _, err := os.Stat(extraPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("drop should trash local extra: %v", err)
+	}
+}
+
+func TestJoinDivergenceNonInteractiveErrorsAndCompensates(t *testing.T) {
+	folder, extraPath, providerID := joinDivergenceTestSetup(t)
+	originalFind, originalBind, originalUnbind, originalList := joinFindProvider, joinBindShare, joinUnbindShare, joinListFiles
+	t.Cleanup(func() {
+		joinFindProvider, joinBindShare, joinUnbindShare, joinListFiles = originalFind, originalBind, originalUnbind, originalList
+	})
+	joinFindProvider = func(context.Context, config.Config, string) (string, transport.Endpoint, error) {
+		return "phone", transport.Endpoint{Name: "phone"}, nil
+	}
+	joinBindShare = func(context.Context, transport.Endpoint, string) (bool, error) { return true, nil }
+	unbound := false
+	joinUnbindShare = func(context.Context, transport.Endpoint, string) error { unbound = true; return nil }
+	joinListFiles = func(context.Context, transport.Endpoint, string, string) ([]transport.PeerFile, string, error) {
+		return nil, providerID, nil
+	}
+	var stderr bytes.Buffer
+	if code := Join([]string{"notes", folder}, &stderr); code == joinExitOK {
+		t.Fatal("Join succeeded on a divergence with no interactive answer")
+	}
+	if !unbound {
+		t.Fatal("non-interactive divergence did not compensate the remote binding")
+	}
+	if _, err := os.Stat(extraPath); err != nil {
+		t.Fatalf("non-interactive divergence should leave local files untouched: %v", err)
+	}
+	loaded, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, remains := loaded.Remote["notes"]; remains {
+		t.Fatal("non-interactive divergence left a remote registration behind")
 	}
 }
 

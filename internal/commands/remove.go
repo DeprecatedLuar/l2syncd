@@ -8,12 +8,10 @@ import (
 	"io"
 
 	"l2syncd/internal/config"
+	"l2syncd/internal/guard"
 	"l2syncd/internal/lock"
 	"l2syncd/internal/preflight"
-	"l2syncd/internal/transport"
 )
-
-var removeUnbindShare = transport.UnbindShare
 
 const (
 	removeExitOK      = 0
@@ -21,84 +19,55 @@ const (
 	removeExitInvalid = 2
 )
 
+// remove is the provider-side unilateral withdrawal of an offered folder
+// (concept.md 8.1). It no longer refuses while consumers are bound: the
+// provider does not need their cooperation or reachability, and consumers
+// discover the withdrawal on their own next successful connection. It never
+// touches files, and it prunes the folder's index.
 func remove(cfg config.Config, args []string, stderr io.Writer) int {
 	if len(args) != 1 {
 		fmt.Fprintln(stderr, "usage: l2sync remove <name>")
 		return removeExitError
 	}
 	name := args[0]
-	if _, exists := cfg.Shared[name]; !exists {
-		if remoteFolder, remote := cfg.Remote[name]; remote {
-			if len(remoteFolder.Peers) != 1 {
-				fmt.Fprintf(stderr, "l2sync: remote folder %q has no valid peer binding\n", name)
-				return removeExitError
-			}
-			peerName := remoteFolder.Peers[0]
-			endpoint, err := peerEndpoint(context.Background(), cfg, peerName)
-			if err != nil {
-				fmt.Fprintf(stderr, "l2sync: prepare peer %q for folder removal: %v; local registration retained\n", peerName, err)
-				return removeExitError
-			}
-			expectedPeer := cfg.Peers[peerName]
-			if err := removeUnbindShare(context.Background(), endpoint, name); err != nil {
-				fmt.Fprintf(stderr, "l2sync: unbind folder %q on peer %q: %v; local registration retained for retry\n", name, peerName, err)
-				return removeExitError
-			}
-			installed, commitErr := commitConfigLocked(func(current *config.Config) error {
-				if current.Peers[peerName] != expectedPeer {
-					return fmt.Errorf("peer %q connection identity changed during folder removal", peerName)
-				}
-				currentFolder := current.Remote[name]
-				if currentFolder.Path != remoteFolder.Path {
-					return fmt.Errorf("folder %q changed concurrently after remote unbind", name)
-				}
-				if len(currentFolder.Peers) != 1 || currentFolder.Peers[0] != peerName {
-					return fmt.Errorf("folder %q binding changed concurrently after remote unbind", name)
-				}
-				delete(current.Remote, name)
-				return nil
-			})
-			if commitErr != nil {
-				if installed {
-					fmt.Fprintf(stderr, "l2sync: folder registration was removed, but durability or lock release failed: %v\n", commitErr)
-				} else {
-					fmt.Fprintf(stderr, "l2sync: peer unbound, but remove local folder registration: %v; retry remove to finish\n", commitErr)
-				}
-				return removeExitError
-			}
-			return removeExitOK
-		}
+	if _, isRemote := cfg.Remote[name]; isRemote {
+		fmt.Fprintf(stderr, "l2sync: folder %q is a remote folder; use leave\n", name)
+		return removeExitError
+	}
+	sharedFolder, exists := cfg.Shared[name]
+	if !exists {
 		fmt.Fprintf(stderr, "l2sync: share %q not found\n", name)
 		return removeExitError
 	}
-	if len(cfg.Shared[name].Peers) != 0 {
-		fmt.Fprintf(stderr, "l2sync: shared folder %q is still bound; remove it from the consuming peer first\n", name)
-		return removeExitError
+	var folderID string
+	if marker, markerErr := guard.ReadMarker(sharedFolder.Path); markerErr == nil {
+		folderID = marker.ID
 	}
-	sharedFolder := cfg.Shared[name]
-	installed, err := commitConfigLocked(func(current *config.Config) error {
-		currentFolder := current.Shared[name]
+	_, err := commitConfigLocked(func(current *config.Config) error {
+		currentFolder, exists := current.Shared[name]
+		if !exists {
+			return fmt.Errorf("shared folder %q removed concurrently", name)
+		}
 		if currentFolder.Path != sharedFolder.Path {
 			return fmt.Errorf("shared folder %q changed concurrently", name)
-		}
-		if len(currentFolder.Peers) != 0 {
-			return fmt.Errorf("shared folder %q became bound concurrently", name)
 		}
 		delete(current.Shared, name)
 		return nil
 	})
 	if err != nil {
-		if installed {
-			fmt.Fprintf(stderr, "l2sync: shared folder registration was removed, but durability or lock release failed: %v\n", err)
-		} else {
-			fmt.Fprintf(stderr, "l2sync: save config: %v\n", err)
-		}
+		fmt.Fprintf(stderr, "l2sync: save config: %v\n", err)
 		return removeExitError
+	}
+	if folderID != "" {
+		if err := pruneIndex(folderID); err != nil {
+			fmt.Fprintf(stderr, "l2sync: folder %q removed, but prune its index: %v\n", name, err)
+			return removeExitError
+		}
 	}
 	return removeExitOK
 }
 
-// Remove unregisters a local share without touching its files.
+// Remove withdraws a local shared folder offer without touching its files.
 func Remove(args []string, stderr io.Writer) (exitCode int) {
 	transactionLock, err := lock.AcquireJoinWait(context.Background(), lock.DefaultWait)
 	if err != nil {

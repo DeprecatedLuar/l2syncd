@@ -3,12 +3,15 @@
 package commands
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"l2syncd/internal/config"
@@ -17,6 +20,7 @@ import (
 	"l2syncd/internal/preflight"
 	"l2syncd/internal/sharename"
 	"l2syncd/internal/transport"
+	"l2syncd/internal/trash"
 )
 
 const (
@@ -142,7 +146,7 @@ func Join(args []string, stderr io.Writer) (exitCode int) {
 		}
 		return errors.Join(cause, joinUnbindShare(context.Background(), endpoint, name))
 	}
-	_, providerID, err := joinListFiles(context.Background(), endpoint, name, "")
+	remoteFiles, providerID, err := joinListFiles(context.Background(), endpoint, name, "")
 	if err != nil {
 		fmt.Fprintf(stderr, "l2sync: verify newly bound folder %q on peer %q: %v\n", name, peerName, compensateRemote(err))
 		return joinExitUnreachable
@@ -150,6 +154,28 @@ func Join(args []string, stderr io.Writer) (exitCode int) {
 	if providerID == "" {
 		fmt.Fprintf(stderr, "l2sync: peer %q returned no folder identity for %q: %v\n", peerName, name, compensateRemote(errors.New("empty folder identity")))
 		return joinExitUnreachable
+	}
+	var localIgnore []string
+	if existingMarker, markerErr := guard.ReadMarker(path); markerErr == nil {
+		localIgnore = existingMarker.Ignore
+	}
+	extras, err := divergentLocalPaths(path, localIgnore, remoteFiles)
+	if err != nil {
+		fmt.Fprintf(stderr, "l2sync: compare folder %q against provider %q: %v\n", name, peerName, compensateRemote(err))
+		return joinExitError
+	}
+	if len(extras) > 0 {
+		choice, promptErr := joinResolveDivergence(stderr, name, extras)
+		if promptErr != nil {
+			fmt.Fprintf(stderr, "l2sync: %v\n", compensateRemote(promptErr))
+			return joinExitError
+		}
+		if choice == divergenceDrop {
+			if dropErr := dropLocalExtras(path, extras); dropErr != nil {
+				fmt.Fprintf(stderr, "l2sync: drop diverged local paths for folder %q: %v\n", name, compensateRemote(dropErr))
+				return joinExitError
+			}
+		}
 	}
 	installed, err := commitJoinedFolder(name, path, peerName, expectedPeer, providerID)
 	if err != nil {
@@ -240,6 +266,118 @@ func commitJoinedFolder(name, path, peerName string, expectedPeer config.Peer, p
 		return saveErr
 	})
 	return installed, err
+}
+
+// divergenceChoice is the user's answer to a rejoin prompt: keep local
+// paths the provider does not offer by pushing them (merge), or discard
+// them (drop). concept.md 8.1 "Rejoin prompts; it does not guess".
+type divergenceChoice int
+
+const (
+	divergenceDrop divergenceChoice = iota
+	divergenceMerge
+)
+
+var joinResolveDivergence = promptDivergenceInteractive
+
+// divergentLocalPaths walks root and returns, sorted, every regular file
+// path the provider's listing does not carry live. Symlinks and other
+// unsupported types are skipped, matching scan.Reconcile's own handling,
+// since v1 has no fidelity contract for them either way.
+func divergentLocalPaths(root string, patterns []string, providerFiles []transport.PeerFile) ([]string, error) {
+	ignore, err := guard.NewIgnore(patterns)
+	if err != nil {
+		return nil, err
+	}
+	providerPaths := make(map[string]bool, len(providerFiles))
+	for _, file := range providerFiles {
+		if file.Deleted || file.Directory {
+			continue
+		}
+		providerPaths[file.Path] = true
+	}
+	var extras []string
+	err = filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		relative, err := filepath.Rel(root, path)
+		if err != nil {
+			return fmt.Errorf("make path relative: %w", err)
+		}
+		relative = filepath.ToSlash(relative)
+		if relative == "." {
+			return nil
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			if entry.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if guard.DefaultIgnorePath(relative) || ignore.Match(relative, entry.IsDir()) {
+			if entry.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if entry.IsDir() || !entry.Type().IsRegular() {
+			return nil
+		}
+		if !providerPaths[relative] {
+			extras = append(extras, relative)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("walk folder %q: %w", root, err)
+	}
+	sort.Strings(extras)
+	return extras, nil
+}
+
+// dropLocalExtras trashes every listed path (never a hard delete, per the
+// project's safety contract) so a "drop" answer to the rejoin prompt cannot
+// destroy data outright.
+func dropLocalExtras(root string, extras []string) error {
+	for _, relative := range extras {
+		if _, err := trash.Move(root, relative); err != nil {
+			return fmt.Errorf("trash %q: %w", relative, err)
+		}
+	}
+	return nil
+}
+
+// promptDivergenceInteractive asks the user to resolve a rejoin divergence.
+// It never prompts when stdin is not a terminal: concept.md 8.1 requires a
+// non-interactive invocation with a divergence to be an error, never a
+// silently chosen default.
+func promptDivergenceInteractive(stderr io.Writer, name string, extras []string) (divergenceChoice, error) {
+	info, statErr := os.Stdin.Stat()
+	if statErr != nil || info.Mode()&os.ModeCharDevice == 0 {
+		return 0, fmt.Errorf("folder %q diverged from provider %q's copy (%d local path(s) not offered); rerun interactively to resolve", name, name, len(extras))
+	}
+	fmt.Fprintf(stderr, "l2sync: folder %q holds %d local path(s) the provider does not offer:\n", name, len(extras))
+	for _, path := range extras {
+		fmt.Fprintf(stderr, "  %s\n", path)
+	}
+	fmt.Fprint(stderr, "Drop them locally, or merge them by pushing to the provider?\n"+
+		"Merging means any of these the provider deliberately deleted while you were detached will return.\n"+
+		"[d]rop/[m]erge: ")
+	reader := bufio.NewReader(os.Stdin)
+	for {
+		line, readErr := reader.ReadString('\n')
+		switch answer := strings.ToLower(strings.TrimSpace(line)); answer {
+		case "d", "drop":
+			return divergenceDrop, nil
+		case "m", "merge":
+			return divergenceMerge, nil
+		}
+		if readErr != nil {
+			return 0, fmt.Errorf("no answer given for folder %q divergence", name)
+		}
+		fmt.Fprint(stderr, "please answer drop or merge: ")
+	}
 }
 
 func contains(values []string, wanted string) bool {

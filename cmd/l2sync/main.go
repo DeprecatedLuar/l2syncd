@@ -44,6 +44,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return commands.List(stdout, stderr)
 	case "join":
 		return commands.Join(args[1:], stderr)
+	case "leave":
+		return commands.Leave(args[1:], stderr)
 	case "serve":
 		return commands.Serve(args[1:], os.Stdin, stdout, stderr)
 	case "connection", "connections":
