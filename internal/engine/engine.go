@@ -47,24 +47,16 @@ type Plan struct {
 	Reason           string
 }
 
-// ReplicaState is everything engine needs from one replica. Entries are
-// version-vector tracked and compared directly, needing no third reference
-// point (concept.md 4.2). Directories are not vector-tracked (concept.md 7
-// records a plain manifest per directory), so reconciling them still needs
-// each side's own last-committed manifests alongside its current ones.
-type ReplicaState struct {
-	Index               index.Index
-	PreviousDirectories map[string]metadata.Manifest
-}
-
-// Replica supplies one side's current state to the planner.
+// Replica supplies one side's current index to the planner.
 type Replica interface {
 	Name() string
-	Current() (ReplicaState, error)
+	Current() (index.Index, error)
 }
 
 // Reconcile reads both replicas and returns decisions only. It never applies
-// an action or writes an index.
+// an action or writes an index. It plans file entries only: a caller needing
+// directory reconciliation too (every production caller) uses PlanStates
+// directly, which also takes the previously committed directory manifests.
 func Reconcile(left, right Replica) (Plan, error) {
 	if left == nil || right == nil {
 		return Plan{}, fmt.Errorf("both replicas are required")
@@ -80,21 +72,26 @@ func Reconcile(left, right Replica) (Plan, error) {
 	if err != nil {
 		return Plan{}, fmt.Errorf("read replica %q: %w", right.Name(), err)
 	}
-	return PlanStates(left.Name(), mine, right.Name(), theirs), nil
+	return PlanStates(left.Name(), mine, right.Name(), theirs, nil), nil
 }
 
-// PlanStates plans from already-read states. A version vector comparison is
-// the only cross-peer ordering authority (concept.md 4.2); no baseline or
-// wall-clock time is consulted anywhere in this function.
-func PlanStates(leftName string, left ReplicaState, rightName string, right ReplicaState) Plan {
+// PlanStates plans from already-read indexes. A version vector comparison is
+// the only cross-peer ordering authority for file entries (concept.md 4.2);
+// no baseline or wall-clock time is consulted for them anywhere in this
+// function. Directories carry no vector (concept.md 7), so reconciling them
+// still needs previousDirectories: the manifests last committed locally,
+// exactly the role the old agreed-snapshot baseline played for directories
+// only. It may be nil when a caller (such as Reconcile) has no use for
+// directory actions.
+func PlanStates(leftName string, left index.Index, rightName string, right index.Index, previousDirectories map[string]metadata.Manifest) Plan {
 	if leftName == "" || rightName == "" || leftName == rightName {
 		return Plan{Halted: true, Reason: "replica identities must be distinct and non-empty"}
 	}
-	paths := make(map[string]struct{}, len(left.Index.Entries)+len(right.Index.Entries))
-	for path := range left.Index.Entries {
+	paths := make(map[string]struct{}, len(left.Entries)+len(right.Entries))
+	for path := range left.Entries {
 		paths[path] = struct{}{}
 	}
-	for path := range right.Index.Entries {
+	for path := range right.Entries {
 		paths[path] = struct{}{}
 	}
 	ordered := make([]string, 0, len(paths))
@@ -105,7 +102,7 @@ func PlanStates(leftName string, left ReplicaState, rightName string, right Repl
 	actions := make([]Action, 0, len(ordered))
 	deletes := 0
 	for _, path := range ordered {
-		action, ok := decide(path, leftName, left.Index.Entries[path], rightName, right.Index.Entries[path])
+		action, ok := decide(path, leftName, left.Entries[path], rightName, right.Entries[path])
 		if !ok {
 			continue
 		}
@@ -117,7 +114,7 @@ func PlanStates(leftName string, left ReplicaState, rightName string, right Repl
 	if guard.DeleteThreshold(deletes, len(ordered)) {
 		return Plan{Halted: true, Reason: "deletion threshold exceeded"}
 	}
-	return Plan{Actions: actions, DirectoryActions: planDirectories(leftName, left, rightName, right)}
+	return Plan{Actions: actions, DirectoryActions: planDirectories(leftName, left, rightName, right, previousDirectories)}
 }
 
 // decide plans one path from both sides' entries. A missing entry compares
@@ -182,12 +179,12 @@ func resolveConflict(leftName, rightName string) (string, string) {
 }
 
 // planDirectories reconciles directory metadata. Directories carry no
-// version vector (concept.md 7): each side's own previously committed
-// manifest is the only reference available for deciding who changed what,
-// exactly as before, just no longer shared between replicas.
-func planDirectories(leftName string, left ReplicaState, rightName string, right ReplicaState) []Action {
-	paths := make(map[string]struct{}, len(left.Index.Directories)+len(right.Index.Directories)+len(left.PreviousDirectories)+len(right.PreviousDirectories))
-	for _, set := range []map[string]metadata.Manifest{left.Index.Directories, right.Index.Directories, left.PreviousDirectories, right.PreviousDirectories} {
+// version vector (concept.md 7): previous is the manifests last committed
+// locally, the same three-way comparison the old agreed-snapshot baseline
+// made, scoped now to directories only.
+func planDirectories(leftName string, left index.Index, rightName string, right index.Index, previous map[string]metadata.Manifest) []Action {
+	paths := make(map[string]struct{}, len(left.Directories)+len(right.Directories)+len(previous))
+	for _, set := range []map[string]metadata.Manifest{left.Directories, right.Directories, previous} {
 		for path := range set {
 			paths[path] = struct{}{}
 		}
@@ -199,12 +196,11 @@ func planDirectories(leftName string, left ReplicaState, rightName string, right
 	sort.Strings(ordered)
 	actions := make([]Action, 0)
 	for _, path := range ordered {
-		leftCurrent, leftExists := left.Index.Directories[path]
-		rightCurrent, rightExists := right.Index.Directories[path]
-		leftPrevious, leftPreviousExists := left.PreviousDirectories[path]
-		rightPrevious, rightPreviousExists := right.PreviousDirectories[path]
-		leftChanged := leftExists != leftPreviousExists || leftExists && leftPreviousExists && !metadata.Equal(leftCurrent, leftPrevious)
-		rightChanged := rightExists != rightPreviousExists || rightExists && rightPreviousExists && !metadata.Equal(rightCurrent, rightPrevious)
+		leftCurrent, leftExists := left.Directories[path]
+		rightCurrent, rightExists := right.Directories[path]
+		previousManifest, previousExists := previous[path]
+		leftChanged := leftExists != previousExists || leftExists && previousExists && !metadata.Equal(leftCurrent, previousManifest)
+		rightChanged := rightExists != previousExists || rightExists && previousExists && !metadata.Equal(rightCurrent, previousManifest)
 		unchanged := !leftChanged && !rightChanged
 		converged := leftChanged && rightChanged && leftExists && rightExists && metadata.Equal(leftCurrent, rightCurrent)
 		bothDeleted := leftChanged && rightChanged && !leftExists && !rightExists

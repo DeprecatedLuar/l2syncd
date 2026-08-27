@@ -19,13 +19,14 @@ import (
 	"l2syncd/internal/config"
 	"l2syncd/internal/engine"
 	"l2syncd/internal/guard"
+	"l2syncd/internal/index"
 	"l2syncd/internal/lock"
 	"l2syncd/internal/logging"
 	"l2syncd/internal/preflight"
 	"l2syncd/internal/scan"
 	"l2syncd/internal/sharepath"
-	"l2syncd/internal/state"
 	"l2syncd/internal/transport"
+	"l2syncd/internal/vector"
 )
 
 const (
@@ -37,7 +38,7 @@ const (
 )
 
 // nowLogger reports initiator-side cycle activity: role resolution, the
-// plan computed for each folder, and whether that folder's baseline commit
+// plan computed for each folder, and whether that folder's index commit
 // actually succeeded. Used regardless of whether the cycle was triggered by
 // `l2sync now` or by the daemon's cycle loop in run.go; both entrypoints
 // point it (and commitLogger) at the shared per-machine log file via
@@ -69,11 +70,11 @@ func Now(args []string, stdout, stderr io.Writer) int {
 }
 
 // FolderOutcome reports the observable per-folder result of one
-// reconciliation cycle, so a folder whose mutation landed without a
-// baseline commit is visible individually rather than only folded into the
-// cycle's aggregate counts. Committed reflects whether the folder's cycle
-// returned without error: for the local initiator this is a direct proxy
-// for commitFolderBaseline succeeding (see planFolder); for a non-initiator
+// reconciliation cycle, so a folder whose mutation landed without an index
+// commit is visible individually rather than only folded into the cycle's
+// aggregate counts. Committed reflects whether the folder's cycle returned
+// without error: for the local initiator this is a direct proxy for every
+// action's commit succeeding (see planFolder); for a non-initiator
 // requesting the peer run its own cycle, it reflects the request completing
 // without a transport error and does not itself observe the peer's commit
 // (see serve.go's own commit logging for that side).
@@ -272,11 +273,12 @@ func runInitiatorFolderCycle(ctx context.Context, name, expectedPeer, authentica
 	return runBoundFolderPlan(ctx, cfg, name, expectedPeer)
 }
 
-// withFolderLock serializes a local filesystem mutation against serve.go's
-// forced-command handlers for the same folder. It must wrap only the local
-// write itself, never a transport round trip: a peer waiting on this
-// installation's response must never be blocked behind a lock this
-// installation is holding while it, in turn, waits on that same peer.
+// withFolderLock serializes a local filesystem mutation and its index
+// commit against serve.go's forced-command handlers for the same folder. It
+// must wrap only the local write and commit themselves, never a transport
+// round trip: a peer waiting on this installation's response must never be
+// blocked behind a lock this installation is holding while it, in turn,
+// waits on that same peer.
 func withFolderLock(ctx context.Context, folder string, fn func() error) (err error) {
 	lockFile, err := lock.AcquireWait(ctx, lock.DefaultWait, folder)
 	if err != nil {
@@ -309,30 +311,16 @@ func planBoundFolder(ctx context.Context, cfg config.Config, name, expectedPeer 
 	return planFolder(ctx, cfg, name, folder.Path, provider, endpoint)
 }
 
+// planFolder reconciles one folder against its bound peer. Unlike the
+// agreed-snapshot model, there is no separate "commit the whole tree at the
+// end" step: every applied action commits its own resulting vector as it
+// lands, through the single commitLocalEntry/commitDirectory/
+// removeDirectoryEntry functions also used by serve.go (implementation-plan.md
+// Phase C).
 func planFolder(ctx context.Context, cfg config.Config, name, path, peer string, endpoint transport.Endpoint) (int, error) {
 	marker, err := guard.ReadMarker(path)
 	if err != nil {
 		return 0, fmt.Errorf("read marker: %w", err)
-	}
-	remoteFiles, _, err := transport.ListFiles(ctx, endpoint, name, marker.ID)
-	if err != nil {
-		return 0, fmt.Errorf("peer %q listing: %w", peer, err)
-	}
-	localBaseline, err := loadBaseline(name)
-	if err != nil {
-		return 0, fmt.Errorf("load baseline: %w", err)
-	}
-	local, err := scanShare(path, localBaseline, marker.Ignore)
-	if err != nil {
-		return 0, err
-	}
-	remote := state.New()
-	for _, file := range remoteFiles {
-		if file.Directory {
-			remote.Directories[file.Path] = file.Metadata
-		} else {
-			remote.Files[file.Path] = state.File{Hash: file.Hash, Size: file.Size, Metadata: file.Metadata, MetadataKnown: true}
-		}
 	}
 	localIdentity, err := localFingerprint()
 	if err != nil {
@@ -342,14 +330,36 @@ func planFolder(ctx context.Context, cfg config.Config, name, path, peer string,
 	if err != nil {
 		return 0, fmt.Errorf("derive peer %q identity: %w", peer, err)
 	}
-	plan := engine.PlanStates(localIdentity, local.Snapshot, remoteIdentity, remote, localBaseline)
+
+	previous, err := loadIndex(marker.ID)
+	if err != nil {
+		return 0, fmt.Errorf("load index: %w", err)
+	}
+	local, err := scanShare(path, previous, marker.Ignore, localIdentity)
+	if err != nil {
+		return 0, err
+	}
+	// Locally confirmed changes are a local fact, durable regardless of
+	// whether the peer is reachable: commit them before any network call.
+	if err := index.Save(local); err != nil {
+		return 0, fmt.Errorf("save index: %w", err)
+	}
+
+	remoteFiles, _, err := transport.ListFiles(ctx, endpoint, name, marker.ID)
+	if err != nil {
+		return 0, fmt.Errorf("peer %q listing: %w", peer, err)
+	}
+	remote := remoteIndexFromListing(remoteIdentity, remoteFiles)
+
+	plan := engine.PlanStates(localIdentity, local, remoteIdentity, remote, previous.Directories)
 	if plan.Halted {
 		nowLogger.Error("plan halted", "folder", name, "peer", peer, "reason", plan.Reason)
 		return 0, fmt.Errorf("halted: %s", plan.Reason)
 	}
 	nowLogger.Info("folder plan computed", "folder", name, "peer", peer,
 		"actions", len(plan.Actions), "directory_actions", len(plan.DirectoryActions))
-	reused, err := prepareContentReuse(ctx, plan.Actions, name, path, remoteIdentity, endpoint, localBaseline, local.Snapshot, remote)
+
+	reused, err := prepareContentReuse(ctx, plan.Actions, name, marker.ID, path, remoteIdentity, endpoint, local)
 	if err != nil {
 		return 0, err
 	}
@@ -357,7 +367,8 @@ func planFolder(ctx context.Context, cfg config.Config, name, path, peer string,
 		if reused[action.Path] {
 			continue
 		}
-		if err := applyAction(ctx, action, name, path, remoteIdentity, endpoint, local.Snapshot, remote); err != nil {
+		if err := applyAction(ctx, action, name, marker.ID, path, remoteIdentity, endpoint, local, remote); err != nil {
+			nowLogger.Error("initiator mutation applied WITHOUT index commit", "folder", name, "peer", peer, "path", action.Path, "kind", action.Kind, "error", err)
 			return 0, err
 		}
 	}
@@ -367,21 +378,14 @@ func planFolder(ctx context.Context, cfg config.Config, name, path, peer string,
 		if action.Kind != engine.Delete {
 			continue
 		}
-		if err := applyDirectoryDelete(ctx, action, name, path, remoteIdentity, endpoint); err != nil {
+		if err := applyDirectoryDelete(ctx, action, name, marker.ID, path, remoteIdentity, endpoint); err != nil {
 			return 0, err
 		}
 	}
-	if err := restoreDirectoryMetadata(ctx, plan.Actions, directoryActions, name, path, remoteIdentity, endpoint, local.Snapshot, remote); err != nil {
+	if err := restoreDirectoryMetadata(ctx, plan.Actions, directoryActions, name, marker.ID, path, remoteIdentity, endpoint, local, remote); err != nil {
 		return 0, err
 	}
-	if err := withFolderLock(ctx, name, func() error {
-		return commitFolderBaseline(name, path, marker.Ignore)
-	}); err != nil {
-		nowLogger.Error("initiator mutation applied WITHOUT baseline commit", "folder", name, "peer", peer,
-			"actions", len(plan.Actions), "directory_actions", len(plan.DirectoryActions), "error", err)
-		return 0, err
-	}
-	nowLogger.Info("initiator baseline commit outcome", "folder", name, "peer", peer, "outcome", "success",
+	nowLogger.Info("initiator cycle outcome", "folder", name, "peer", peer, "outcome", "success",
 		"actions", len(plan.Actions), "directory_actions", len(plan.DirectoryActions))
 	return len(plan.Actions) + len(plan.DirectoryActions), nil
 }
@@ -395,7 +399,7 @@ func sortByDepthDescending[T any](items []T, path func(T) string) {
 	})
 }
 
-func restoreDirectoryMetadata(ctx context.Context, fileActions, directoryActions []engine.Action, share, root, provider string, endpoint transport.Endpoint, local, remote state.Baseline) error {
+func restoreDirectoryMetadata(ctx context.Context, fileActions, directoryActions []engine.Action, share, folderID, root, provider string, endpoint transport.Endpoint, local, remote index.Index) error {
 	directoryActionByPath := make(map[string]engine.Action, len(directoryActions))
 	paths := make(map[string]struct{})
 	for _, action := range directoryActions {
@@ -431,7 +435,10 @@ func restoreDirectoryMetadata(ctx context.Context, fileActions, directoryActions
 			continue
 		}
 		if err := withFolderLock(ctx, share, func() error {
-			return apply.ApplyDirectory(root, path, manifest)
+			if err := apply.ApplyDirectory(root, path, manifest); err != nil {
+				return err
+			}
+			return commitDirectory(folderID, path, manifest)
 		}); err != nil {
 			return err
 		}
@@ -442,20 +449,20 @@ func restoreDirectoryMetadata(ctx context.Context, fileActions, directoryActions
 	return nil
 }
 
-func prepareContentReuse(ctx context.Context, actions []engine.Action, share, root, provider string, endpoint transport.Endpoint, baseline, local, remote state.Baseline) (map[string]bool, error) {
+func prepareContentReuse(ctx context.Context, actions []engine.Action, share, folderID, root, provider string, endpoint transport.Endpoint, local index.Index) (map[string]bool, error) {
 	reused := make(map[string]bool)
 	for _, action := range actions {
 		remoteSource := action.Source == provider
 		switch {
 		case action.Kind == engine.Push || action.Kind == engine.Resurrect && !remoteSource:
-			file := local.Files[action.Path]
-			ok, err := transport.ReuseFile(ctx, endpoint, share, action.Path, file.Hash, file.Metadata)
+			entry := local.Entries[action.Path]
+			ok, err := transport.ReuseFile(ctx, endpoint, share, action.Path, entry.Hash, entry.Metadata, action.Vector)
 			if err != nil {
 				return nil, fmt.Errorf("reuse %q on peer: %w", action.Path, err)
 			}
 			reused[action.Path] = ok
 		case (action.Kind == engine.Pull || action.Kind == engine.Resurrect) && remoteSource:
-			ok, err := reuseLocal(ctx, share, root, action.Path, remote.Files[action.Path], baseline)
+			ok, err := reuseLocal(ctx, share, folderID, root, action.Path, action.Vector, local)
 			if err != nil {
 				return nil, err
 			}
@@ -465,11 +472,14 @@ func prepareContentReuse(ctx context.Context, actions []engine.Action, share, ro
 	return reused, nil
 }
 
-func applyDirectoryDelete(ctx context.Context, action engine.Action, share, root, provider string, endpoint transport.Endpoint) error {
+func applyDirectoryDelete(ctx context.Context, action engine.Action, share, folderID, root, provider string, endpoint transport.Endpoint) error {
 	remoteSource := action.Source == provider
 	if remoteSource {
 		return withFolderLock(ctx, share, func() error {
-			return apply.DeleteDirectory(root, action.Path)
+			if err := apply.DeleteDirectory(root, action.Path); err != nil {
+				return err
+			}
+			return removeDirectoryEntry(folderID, action.Path)
 		})
 	}
 	return transport.DeleteDirectory(ctx, endpoint, share, action.Path)
@@ -490,82 +500,107 @@ func findPeerForShared(ctx context.Context, cfg config.Config, name string) (str
 	return peer, endpoint, nil
 }
 
-func applyAction(ctx context.Context, action engine.Action, share, root, provider string, endpoint transport.Endpoint, local, remote state.Baseline) error {
-	remoteFile := remote.Files[action.Path]
+// applyAction executes one file-entry decision. Every branch that changes
+// this installation's own index commits the resulting action.Vector through
+// commitLocalEntry; a branch that only changes the peer's copy relies on the
+// corresponding transport call to carry that same vector across
+// (implementation-plan.md Phase C).
+func applyAction(ctx context.Context, action engine.Action, share, folderID, root, provider string, endpoint transport.Endpoint, local, remote index.Index) error {
+	remoteEntry := remote.Entries[action.Path]
+	localEntry := local.Entries[action.Path]
 	remoteSource := action.Source == provider || action.Winner == provider
 	switch action.Kind {
 	case engine.Pull:
 		if !remoteSource {
 			return fmt.Errorf("pull source for %q is not the provider", action.Path)
 		}
-		return pullFile(ctx, endpoint, share, root, action.Path, remoteFile)
+		return pullFile(ctx, endpoint, share, folderID, root, action.Path, remoteEntry, action.Vector)
 	case engine.Resurrect:
 		if remoteSource {
-			return pullFile(ctx, endpoint, share, root, action.Path, remoteFile)
+			return pullFile(ctx, endpoint, share, folderID, root, action.Path, remoteEntry, action.Vector)
 		}
-		return pushFile(ctx, endpoint, share, root, action.Path, local.Files[action.Path])
+		return pushFile(ctx, endpoint, share, root, action.Path, localEntry, action.Vector)
 	case engine.Delete:
 		if remoteSource {
-			return withFolderLock(ctx, share, func() error {
-				return apply.Delete(root, action.Path)
-			})
+			return applyLocalDelete(ctx, share, folderID, root, action.Path, action.Vector)
 		}
-		return transport.DeleteFile(ctx, endpoint, share, action.Path)
-	case engine.Conflict:
-		localFile := local.Files[action.Path]
-		suffix := deterministicConflictSuffix(localFile, remoteFile, action.Loser)
-		localCollision, err := apply.ConflictCopyExists(root, action.Path, suffix)
-		if err != nil {
-			return fmt.Errorf("check local conflict destination for %q: %w", action.Path, err)
-		}
-		remoteCollision, err := transport.ConflictCopyExists(ctx, endpoint, share, action.Path, suffix)
-		if err != nil {
-			return fmt.Errorf("check peer conflict destination for %q: %w", action.Path, err)
-		}
-		if localCollision || remoteCollision {
-			return fmt.Errorf("conflict destination for %q already exists on one or both replicas", action.Path)
-		}
-		if remoteSource {
-			losing, err := readShareFile(root, action.Path)
-			if err != nil {
-				return fmt.Errorf("read local conflict loser %q: %w", action.Path, err)
-			}
-			if err := transport.WriteConflictCopy(ctx, endpoint, share, action.Path, losing, localFile.Hash, suffix, localFile.Metadata); err != nil {
-				return fmt.Errorf("preserve conflict loser %q on peer: %w", action.Path, err)
-			}
-			data, err := transport.ReadFile(ctx, endpoint, share, action.Path, remoteFile.Hash)
-			if err != nil {
-				return fmt.Errorf("read conflict winner %q from peer: %w", action.Path, err)
-			}
-			return withFolderLock(ctx, share, func() error {
-				return apply.WriteConflictWinnerWithSuffix(root, action.Path, suffix, bytes.NewReader(data), remoteFile.Hash, remoteFile.Metadata)
-			})
-		}
-		data, err := readShareFile(root, action.Path)
-		if err != nil {
-			return fmt.Errorf("read local conflict winner %q: %w", action.Path, err)
-		}
-		losing, err := transport.ReadFile(ctx, endpoint, share, action.Path, remoteFile.Hash)
-		if err != nil {
-			return fmt.Errorf("read conflict loser %q from peer: %w", action.Path, err)
-		}
+		return transport.DeleteFile(ctx, endpoint, share, action.Path, action.Vector)
+	case engine.Merge:
+		merged := localEntry
+		merged.Version = action.Vector
 		if err := withFolderLock(ctx, share, func() error {
-			return apply.WriteConflictCopyWithSuffix(root, action.Path, suffix, bytes.NewReader(losing), remoteFile.Hash, remoteFile.Metadata)
+			return commitLocalEntry(folderID, action.Path, merged)
 		}); err != nil {
-			return fmt.Errorf("preserve conflict loser %q locally: %w", action.Path, err)
+			return fmt.Errorf("commit merged vector for %q: %w", action.Path, err)
 		}
-		if err := transport.WriteConflictFile(ctx, endpoint, share, action.Path, data, localFile.Hash, suffix, localFile.Metadata); err != nil {
-			return fmt.Errorf("write conflict winner %q to peer: %w", action.Path, err)
-		}
-		return nil
+		return transport.MergeVector(ctx, endpoint, share, action.Path, action.Vector)
+	case engine.Conflict:
+		return applyConflict(ctx, action, share, folderID, root, provider, endpoint, localEntry, remoteEntry)
 	case engine.Push:
-		return pushFile(ctx, endpoint, share, root, action.Path, local.Files[action.Path])
+		return pushFile(ctx, endpoint, share, root, action.Path, localEntry, action.Vector)
 	default:
 		return fmt.Errorf("unknown action %q", action.Kind)
 	}
 }
 
-func deterministicConflictSuffix(left, right state.File, loser string) string {
+func applyConflict(ctx context.Context, action engine.Action, share, folderID, root, provider string, endpoint transport.Endpoint, localEntry, remoteEntry index.Entry) error {
+	remoteSource := action.Winner == provider
+	suffix := deterministicConflictSuffix(localEntry, remoteEntry, action.Loser)
+	localCollision, err := apply.ConflictCopyExists(root, action.Path, suffix)
+	if err != nil {
+		return fmt.Errorf("check local conflict destination for %q: %w", action.Path, err)
+	}
+	remoteCollision, err := transport.ConflictCopyExists(ctx, endpoint, share, action.Path, suffix)
+	if err != nil {
+		return fmt.Errorf("check peer conflict destination for %q: %w", action.Path, err)
+	}
+	if localCollision || remoteCollision {
+		return fmt.Errorf("conflict destination for %q already exists on one or both replicas", action.Path)
+	}
+	if remoteSource {
+		losing, err := readShareFile(root, action.Path)
+		if err != nil {
+			return fmt.Errorf("read local conflict loser %q: %w", action.Path, err)
+		}
+		if err := transport.WriteConflictCopy(ctx, endpoint, share, action.Path, losing, localEntry.Hash, suffix, localEntry.Metadata); err != nil {
+			return fmt.Errorf("preserve conflict loser %q on peer: %w", action.Path, err)
+		}
+		data, err := transport.ReadFile(ctx, endpoint, share, action.Path, remoteEntry.Hash)
+		if err != nil {
+			return fmt.Errorf("read conflict winner %q from peer: %w", action.Path, err)
+		}
+		return withFolderLock(ctx, share, func() error {
+			if err := apply.WriteConflictWinnerWithSuffix(root, action.Path, suffix, bytes.NewReader(data), remoteEntry.Hash, remoteEntry.Metadata); err != nil {
+				return err
+			}
+			return commitLocalEntry(folderID, action.Path, index.Entry{Version: action.Vector, Hash: remoteEntry.Hash, Metadata: remoteEntry.Metadata})
+		})
+	}
+	data, err := readShareFile(root, action.Path)
+	if err != nil {
+		return fmt.Errorf("read local conflict winner %q: %w", action.Path, err)
+	}
+	losing, err := transport.ReadFile(ctx, endpoint, share, action.Path, remoteEntry.Hash)
+	if err != nil {
+		return fmt.Errorf("read conflict loser %q from peer: %w", action.Path, err)
+	}
+	if err := withFolderLock(ctx, share, func() error {
+		if err := apply.WriteConflictCopyWithSuffix(root, action.Path, suffix, bytes.NewReader(losing), remoteEntry.Hash, remoteEntry.Metadata); err != nil {
+			return err
+		}
+		// The local canonical file already holds the winning bytes; only
+		// its vector advances to the merged value.
+		return commitLocalEntry(folderID, action.Path, index.Entry{Version: action.Vector, Hash: localEntry.Hash, Metadata: localEntry.Metadata})
+	}); err != nil {
+		return fmt.Errorf("preserve conflict loser %q locally: %w", action.Path, err)
+	}
+	if err := transport.WriteConflictFile(ctx, endpoint, share, action.Path, data, localEntry.Hash, suffix, localEntry.Metadata, action.Vector); err != nil {
+		return fmt.Errorf("write conflict winner %q to peer: %w", action.Path, err)
+	}
+	return nil
+}
+
+func deterministicConflictSuffix(left, right index.Entry, loser string) string {
 	stamp := left.Metadata.Mtime
 	if right.Metadata.Mtime.After(stamp) {
 		stamp = right.Metadata.Mtime
@@ -573,25 +608,37 @@ func deterministicConflictSuffix(left, right state.File, loser string) string {
 	return stamp.UTC().Format("20060102-150405") + "-" + loser[:12]
 }
 
-func pullFile(ctx context.Context, endpoint transport.Endpoint, share, root, relative string, file state.File) error {
-	data, err := transport.ReadFile(ctx, endpoint, share, relative, file.Hash)
+func pullFile(ctx context.Context, endpoint transport.Endpoint, share, folderID, root, relative string, entry index.Entry, vec vector.Vector) error {
+	data, err := transport.ReadFile(ctx, endpoint, share, relative, entry.Hash)
 	if err != nil {
 		return fmt.Errorf("read %q from peer: %w", relative, err)
 	}
 	return withFolderLock(ctx, share, func() error {
-		return apply.WriteWithMetadata(root, relative, bytes.NewReader(data), file.Hash, file.Metadata)
+		if err := apply.WriteWithMetadata(root, relative, bytes.NewReader(data), entry.Hash, entry.Metadata); err != nil {
+			return err
+		}
+		return commitLocalEntry(folderID, relative, index.Entry{Version: vec, Hash: entry.Hash, Metadata: entry.Metadata})
 	})
 }
 
-func pushFile(ctx context.Context, endpoint transport.Endpoint, share, root, relative string, file state.File) error {
+func pushFile(ctx context.Context, endpoint transport.Endpoint, share, root, relative string, entry index.Entry, vec vector.Vector) error {
 	data, err := readShareFile(root, relative)
 	if err != nil {
 		return fmt.Errorf("read local file %q: %w", relative, err)
 	}
-	if err := transport.WriteFile(ctx, endpoint, share, relative, data, file.Hash, file.Metadata); err != nil {
+	if err := transport.WriteFile(ctx, endpoint, share, relative, data, entry.Hash, entry.Metadata, vec); err != nil {
 		return fmt.Errorf("write %q to peer: %w", relative, err)
 	}
 	return nil
+}
+
+func applyLocalDelete(ctx context.Context, share, folderID, root, relative string, vec vector.Vector) error {
+	return withFolderLock(ctx, share, func() error {
+		if err := apply.Delete(root, relative); err != nil {
+			return err
+		}
+		return commitLocalEntry(folderID, relative, index.Entry{Version: vec, Deleted: true})
+	})
 }
 
 func readShareFile(root, relative string) ([]byte, error) {
@@ -603,13 +650,21 @@ func readShareFile(root, relative string) ([]byte, error) {
 	return io.ReadAll(file)
 }
 
-func reuseLocal(ctx context.Context, share, root, relative string, offered state.File, baseline state.Baseline) (bool, error) {
-	for source, file := range baseline.Files {
-		if file.Hash != offered.Hash {
+// reuseLocal asks whether some other locally tracked file already holds the
+// bytes a pull needs, copying it in place of a wire transfer. It searches
+// local's own index, which is this installation's authoritative record of
+// what content it currently holds.
+func reuseLocal(ctx context.Context, share, folderID, root, relative string, vec vector.Vector, local index.Index) (bool, error) {
+	offered := local.Entries[relative]
+	for source, entry := range local.Entries {
+		if entry.Deleted || entry.Hash != offered.Hash {
 			continue
 		}
 		err := withFolderLock(ctx, share, func() error {
-			return apply.Reuse(root, relative, source, offered.Hash, offered.Metadata)
+			if err := apply.Reuse(root, relative, source, offered.Hash, offered.Metadata); err != nil {
+				return err
+			}
+			return commitLocalEntry(folderID, relative, index.Entry{Version: vec, Hash: offered.Hash, Metadata: offered.Metadata})
 		})
 		if err != nil {
 			if errors.Is(err, apply.ErrReuseMismatch) {
@@ -622,12 +677,27 @@ func reuseLocal(ctx context.Context, share, root, relative string, offered state
 	return false, nil
 }
 
-func scanShare(path string, baseline state.Baseline, ignore []string) (scan.Result, error) {
-	result, err := scan.DetectWithIgnore(path, baseline, ignore)
+func scanShare(path string, previous index.Index, ignore []string, localIdentity string) (index.Index, error) {
+	result, err := scan.Reconcile(path, previous, ignore, localIdentity)
 	if err != nil {
-		return scan.Result{}, fmt.Errorf("scan share: %w", err)
+		return index.Index{}, fmt.Errorf("scan share: %w", err)
 	}
-	return result, nil
+	return result.Index, nil
+}
+
+func remoteIndexFromListing(remoteID string, files []transport.PeerFile) index.Index {
+	idx := index.New(remoteID)
+	for _, file := range files {
+		switch {
+		case file.Directory:
+			idx.Directories[file.Path] = file.Metadata
+		case file.Deleted:
+			idx.Entries[file.Path] = index.Entry{Version: file.Version, Deleted: true, DeletedAt: file.DeletedAt}
+		default:
+			idx.Entries[file.Path] = index.Entry{Version: file.Version, Hash: file.Hash, Size: file.Size, Metadata: file.Metadata}
+		}
+	}
+	return idx
 }
 
 func findProvider(ctx context.Context, cfg config.Config, name string) (string, transport.Endpoint, error) {

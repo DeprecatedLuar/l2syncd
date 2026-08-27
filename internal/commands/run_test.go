@@ -15,7 +15,7 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 	"l2syncd/internal/config"
-	"l2syncd/internal/state"
+	"l2syncd/internal/index"
 )
 
 func TestExecuteCycleLogsSummary(t *testing.T) {
@@ -104,7 +104,7 @@ func TestWatchFailureIsRetriedAndClearedWithoutRestart(t *testing.T) {
 	}
 	defer watcher.Close()
 	roots := []watchRoot{{name: "notes", path: root}}
-	conditions := map[string]state.WatchCondition{
+	conditions := map[string]index.WatchCondition{
 		"notes": newWatchCondition(root, errors.New("watch limit reached")),
 	}
 	if err := os.Mkdir(root, 0o700); err != nil {
@@ -124,13 +124,13 @@ func TestStatusReportsPersistedScanOnlyCondition(t *testing.T) {
 	t.Setenv("HOME", root)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
 	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
-	condition := state.WatchCondition{
+	condition := index.WatchCondition{
 		Path:   filepath.Join(root, "notes"),
 		Reason: "watch directory: no space left on device",
 		Limit:  8192,
 		Sysctl: inotifyLimitName,
 	}
-	if err := state.SaveWatchConditions(map[string]state.WatchCondition{"notes": condition}); err != nil {
+	if err := index.SaveWatchConditions(map[string]index.WatchCondition{"notes": condition}); err != nil {
 		t.Fatal(err)
 	}
 	var stdout, stderr bytes.Buffer

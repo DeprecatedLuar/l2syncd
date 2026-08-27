@@ -54,11 +54,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return commands.Now(args[1:], stdout, stderr)
 	case "run":
 		return commands.Run(args[1:], stderr)
-	case "baseline":
+	case "index":
 		if len(args) > 1 && args[1] == "commit" {
-			return commands.BaselineCommit(args[2:], stderr)
+			return commands.IndexCommit(args[2:], stderr)
 		}
-		fmt.Fprintln(stderr, "l2sync: unknown baseline command")
+		fmt.Fprintln(stderr, "l2sync: unknown index command")
 		return exitError
 	default:
 		fmt.Fprintf(stderr, "l2sync: command %q is not implemented yet\n", args[0])

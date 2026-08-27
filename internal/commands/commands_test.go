@@ -18,10 +18,10 @@ import (
 	"l2syncd/internal/config"
 	"l2syncd/internal/connection"
 	"l2syncd/internal/guard"
+	"l2syncd/internal/index"
 	"l2syncd/internal/lock"
 	"l2syncd/internal/metadata"
 	"l2syncd/internal/preflight"
-	"l2syncd/internal/state"
 	"l2syncd/internal/transport"
 )
 
@@ -212,8 +212,8 @@ func TestRemoveRemoteOfflineRetainsRetryableLocalRegistration(t *testing.T) {
 }
 
 func TestDeterministicConflictSuffixUsesLosingFingerprint(t *testing.T) {
-	left := state.File{Metadata: metadata.Manifest{Mtime: time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC)}}
-	right := state.File{Metadata: metadata.Manifest{Mtime: time.Date(2026, 8, 23, 13, 30, 45, 0, time.FixedZone("other", -3*60*60))}}
+	left := index.Entry{Metadata: metadata.Manifest{Mtime: time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC)}}
+	right := index.Entry{Metadata: metadata.Manifest{Mtime: time.Date(2026, 8, 23, 13, 30, 45, 0, time.FixedZone("other", -3*60*60))}}
 	loser := strings.Repeat("a", 64)
 	if got, want := deterministicConflictSuffix(left, right, loser), "20260823-163045-aaaaaaaaaaaa"; got != want {
 		t.Fatalf("suffix = %q, want %q", got, want)
@@ -978,7 +978,7 @@ func TestAddRejectsUnsafeName(t *testing.T) {
 	}
 }
 
-func TestBaselineCommitAndStatus(t *testing.T) {
+func TestIndexCommitAndStatus(t *testing.T) {
 	root := t.TempDir()
 	sharePath := filepath.Join(root, "notes")
 	if err := os.Mkdir(sharePath, 0o700); err != nil {
@@ -995,8 +995,8 @@ func TestBaselineCommitAndStatus(t *testing.T) {
 		t.Fatalf("add exit code = %d, stderr = %q", got, stderr.String())
 	}
 	stderr.Reset()
-	if got := BaselineCommit([]string{"notes"}, &stderr); got != successExitCode {
-		t.Fatalf("baseline exit code = %d, stderr = %q", got, stderr.String())
+	if got := IndexCommit([]string{"notes"}, &stderr); got != successExitCode {
+		t.Fatalf("index commit exit code = %d, stderr = %q", got, stderr.String())
 	}
 	if got := Status(&stdout, &stderr); got != successExitCode || stdout.Len() != 0 {
 		t.Fatalf("clean status = code %d, stdout %q, stderr %q", got, stdout.String(), stderr.String())
@@ -1010,7 +1010,7 @@ func TestBaselineCommitAndStatus(t *testing.T) {
 	}
 }
 
-func TestBaselineCommitDoesNotBlindlyRewriteLegacyHistory(t *testing.T) {
+func TestIndexCommitDoesNotRewriteUnsupportedVersion(t *testing.T) {
 	root := t.TempDir()
 	sharePath := filepath.Join(root, "notes")
 	if err := os.Mkdir(sharePath, 0o700); err != nil {
@@ -1026,27 +1026,34 @@ func TestBaselineCommitDoesNotBlindlyRewriteLegacyHistory(t *testing.T) {
 	if got := Add([]string{"notes", sharePath}, &stderr); got != successExitCode {
 		t.Fatalf("add exit code = %d, stderr = %q", got, stderr.String())
 	}
-	baselinePath, err := state.Path("notes")
+	marker, err := guard.ReadMarker(sharePath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.MkdirAll(filepath.Dir(baselinePath), 0o700); err != nil {
+	indexPath, err := index.Path(marker.ID)
+	if err != nil {
 		t.Fatal(err)
 	}
-	legacy := `{"version":1,"files":{"deleted":{"ino":7,"mtime":"2025-01-01T00:00:00Z","size":3,"hash":"abc"}}}`
-	if err := os.WriteFile(baselinePath, []byte(legacy), 0o600); err != nil {
+	if err := os.MkdirAll(filepath.Dir(indexPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// There is no migration from any earlier index format: version 3 is the
+	// only format this installation understands, so any other version --
+	// including a well-formed one -- must be refused, not rewritten.
+	unsupported := `{"version":2,"entries":{"deleted":{"ino":7,"ctime":"2025-01-01T00:00:00Z","size":3,"hash":"abc"}}}`
+	if err := os.WriteFile(indexPath, []byte(unsupported), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	stderr.Reset()
-	if got := BaselineCommit([]string{"notes"}, &stderr); got == successExitCode {
-		t.Fatal("baseline commit accepted migrated legacy history")
+	if got := IndexCommit([]string{"notes"}, &stderr); got == successExitCode {
+		t.Fatal("index commit accepted an unsupported index version")
 	}
-	contents, err := os.ReadFile(baselinePath)
+	contents, err := os.ReadFile(indexPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(contents) != legacy {
-		t.Fatal("baseline commit rewrote legacy history")
+	if string(contents) != unsupported {
+		t.Fatal("index commit rewrote the unsupported-version file")
 	}
 }
 

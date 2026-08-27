@@ -11,18 +11,20 @@ import (
 	"os"
 	"time"
 
+	"golang.org/x/sys/unix"
 	"l2syncd/internal/apply"
 	"l2syncd/internal/config"
 	"l2syncd/internal/connection"
 	"l2syncd/internal/guard"
+	"l2syncd/internal/index"
 	"l2syncd/internal/lock"
 	"l2syncd/internal/logging"
 	"l2syncd/internal/metadata"
 	"l2syncd/internal/preflight"
 	"l2syncd/internal/scan"
 	"l2syncd/internal/sharepath"
-	"l2syncd/internal/state"
 	"l2syncd/internal/transport"
+	"l2syncd/internal/vector"
 )
 
 const (
@@ -42,7 +44,7 @@ const (
 // variables at it (with this process's own stderr as the fallback/mirror
 // destination) before handling a request. The zero-value defaults below
 // exist only so package-level helpers have a safe logger if ever invoked
-// outside Serve (see status.go's BaselineCommit, which sets commitLogger
+// outside Serve (see status.go's IndexCommit, which sets commitLogger
 // itself before calling those helpers).
 var (
 	serveLogger  = slog.New(slog.NewTextHandler(os.Stderr, nil)).With("pid", os.Getpid(), "component", "serve")
@@ -191,22 +193,42 @@ func serveFailureExit(err error) int {
 
 func serveCallbacks(resolve folderResolver) transport.Callbacks {
 	fileLister := func(name, expectedID string) ([]transport.PeerFile, string, error) {
-		folder, err := resolve(name)
+		localIdentity, err := localFingerprint()
 		if err != nil {
 			return nil, "", err
 		}
-		if expectedID != "" && folder.marker.ID != expectedID {
-			return nil, "", fmt.Errorf("folder %q identity mismatch: requester expects id %q, provider has %q", name, expectedID, folder.marker.ID)
-		}
-		listed, scanErr := scan.ListFiles(folder.root, folder.marker.Ignore)
-		if scanErr != nil {
-			return nil, "", fmt.Errorf("list folder %q: %w", name, scanErr)
+		var listed []scan.ListedFile
+		var folderID string
+		err = mutateServedFolderWithin(name, resolve, lock.DefaultWait, func(current resolvedFolder) error {
+			if expectedID != "" && current.marker.ID != expectedID {
+				return fmt.Errorf("folder %q identity mismatch: requester expects id %q, provider has %q", name, expectedID, current.marker.ID)
+			}
+			folderID = current.marker.ID
+			previous, loadErr := loadIndex(current.marker.ID)
+			if loadErr != nil {
+				return loadErr
+			}
+			result, scanErr := scan.Reconcile(current.root, previous, current.marker.Ignore, localIdentity)
+			if scanErr != nil {
+				return fmt.Errorf("list folder %q: %w", name, scanErr)
+			}
+			if saveErr := index.Save(result.Index); saveErr != nil {
+				return fmt.Errorf("save index for folder %q: %w", name, saveErr)
+			}
+			listed = scan.ListEntries(result.Index)
+			return nil
+		})
+		if err != nil {
+			return nil, "", err
 		}
 		files := make([]transport.PeerFile, 0, len(listed))
 		for _, file := range listed {
-			files = append(files, transport.PeerFile{Path: file.Path, Size: file.Size, Hash: file.Hash, Metadata: file.Metadata, Directory: file.Directory})
+			files = append(files, transport.PeerFile{
+				Path: file.Path, Size: file.Size, Hash: file.Hash, Metadata: file.Metadata,
+				Directory: file.Directory, Deleted: file.Deleted, DeletedAt: file.DeletedAt, Version: file.Version,
+			})
 		}
-		return files, folder.marker.ID, nil
+		return files, folderID, nil
 	}
 	fileReader := func(name, relative string) (io.ReadCloser, error) {
 		folder, err := resolve(name)
@@ -219,23 +241,36 @@ func serveCallbacks(resolve folderResolver) transport.Callbacks {
 		}
 		return file, nil
 	}
-	fileWriter := func(name, relative, expectedHash string, manifest metadata.Manifest, contents io.Reader) error {
-		return mutateAndCommit(name, relative, handlerWriteFile, resolve, func(folder resolvedFolder) error {
-			return apply.WriteWithMetadata(folder.root, relative, contents, expectedHash, manifest)
+	fileWriter := func(name, relative, expectedHash string, manifest metadata.Manifest, vec vector.Vector, contents io.Reader) error {
+		return mutateAndLog(name, relative, handlerWriteFile, resolve, func(folder resolvedFolder) error {
+			if err := apply.WriteWithMetadata(folder.root, relative, contents, expectedHash, manifest); err != nil {
+				return err
+			}
+			return commitLocalEntry(folder.marker.ID, relative, index.Entry{Version: vec, Hash: expectedHash, Metadata: manifest})
 		})
 	}
-	fileDeleter := func(name, relative string) error {
-		return mutateAndCommit(name, relative, handlerDeleteFile, resolve, func(folder resolvedFolder) error {
-			return apply.Delete(folder.root, relative)
+	fileDeleter := func(name, relative string, vec vector.Vector) error {
+		return mutateAndLog(name, relative, handlerDeleteFile, resolve, func(folder resolvedFolder) error {
+			if err := apply.Delete(folder.root, relative); err != nil {
+				return err
+			}
+			return commitLocalEntry(folder.marker.ID, relative, index.Entry{Version: vec, Deleted: true, DeletedAt: time.Now().UTC()})
 		})
 	}
-	conflictWriter := func(name, relative, loser, expectedHash string, manifest metadata.Manifest, contents io.Reader) error {
-		return mutateAndCommit(name, relative, handlerWriteConflict, resolve, func(folder resolvedFolder) error {
-			return apply.WriteConflictWinnerWithSuffix(folder.root, relative, loser, contents, expectedHash, manifest)
+	conflictWriter := func(name, relative, loser, expectedHash string, manifest metadata.Manifest, vec vector.Vector, contents io.Reader) error {
+		return mutateAndLog(name, relative, handlerWriteConflict, resolve, func(folder resolvedFolder) error {
+			if err := apply.WriteConflictWinnerWithSuffix(folder.root, relative, loser, contents, expectedHash, manifest); err != nil {
+				return err
+			}
+			return commitLocalEntry(folder.marker.ID, relative, index.Entry{Version: vec, Hash: expectedHash, Metadata: manifest})
 		})
 	}
 	conflictCopyWriter := func(name, relative, suffix, expectedHash string, manifest metadata.Manifest, contents io.Reader) error {
-		return mutateAndCommit(name, relative, handlerWriteConflictCopy, resolve, func(folder resolvedFolder) error {
+		return mutateAndLog(name, relative, handlerWriteConflictCopy, resolve, func(folder resolvedFolder) error {
+			// A conflict copy lands at a new path neither replica has
+			// tracked before, so it carries no vector to commit: the next
+			// local scan on either side picks it up as an ordinary
+			// creation (implementation-plan.md Phase C).
 			return apply.WriteConflictCopyWithSuffix(folder.root, relative, suffix, contents, expectedHash, manifest)
 		})
 	}
@@ -246,16 +281,16 @@ func serveCallbacks(resolve folderResolver) transport.Callbacks {
 		}
 		return apply.ConflictCopyExists(folder.root, relative, suffix)
 	}
-	fileReuser := func(name, relative, expectedHash string, manifest metadata.Manifest) (bool, error) {
+	fileReuser := func(name, relative, expectedHash string, manifest metadata.Manifest, vec vector.Vector) (bool, error) {
 		serveLogger.Debug("mutation start", "handler", handlerReuseFile, "folder", name, "path", relative)
 		var reused bool
 		err := mutateServedFolder(name, resolve, func(folder resolvedFolder) error {
-			baseline, loadErr := loadBaseline(name)
+			previous, loadErr := loadIndex(folder.marker.ID)
 			if loadErr != nil {
 				return loadErr
 			}
-			for source, file := range baseline.Files {
-				if file.Hash != expectedHash {
+			for source, entry := range previous.Entries {
+				if entry.Deleted || entry.Hash != expectedHash {
 					continue
 				}
 				if reuseErr := apply.Reuse(folder.root, relative, source, expectedHash, manifest); reuseErr != nil {
@@ -265,21 +300,15 @@ func serveCallbacks(resolve folderResolver) transport.Callbacks {
 					serveLogger.Error("reuse failed", "handler", handlerReuseFile, "folder", name, "path", relative, "source", source, "error", reuseErr)
 					return reuseErr
 				}
-				// Unlike the six handlers wrapped by mutateAndCommit, this
-				// path only reaches commitFolderBaseline after a successful
-				// mutation, and only on this one branch. If the commit call
-				// below fails, apply.Reuse already mutated the file on disk
-				// with no corresponding baseline commit -- this is the exact
-				// "mutation without commit" condition under diagnosis.
-				if commitErr := commitFolderBaseline(name, folder.root, folder.marker.Ignore); commitErr != nil {
-					serveLogger.Error("mutation applied WITHOUT baseline commit", "handler", handlerReuseFile, "folder", name, "path", relative, "source", source, "error", commitErr)
+				if commitErr := commitLocalEntry(folder.marker.ID, relative, index.Entry{Version: vec, Hash: expectedHash, Metadata: manifest}); commitErr != nil {
+					serveLogger.Error("mutation applied WITHOUT index commit", "handler", handlerReuseFile, "folder", name, "path", relative, "source", source, "error", commitErr)
 					return commitErr
 				}
 				serveLogger.Info("reuse applied and committed", "handler", handlerReuseFile, "folder", name, "path", relative, "source", source)
 				reused = true
 				return nil
 			}
-			serveLogger.Debug("reuse skipped: no matching baseline hash, no mutation, no commit", "handler", handlerReuseFile, "folder", name, "path", relative)
+			serveLogger.Debug("reuse skipped: no matching index hash, no mutation, no commit", "handler", handlerReuseFile, "folder", name, "path", relative)
 			return nil
 		})
 		if err != nil {
@@ -290,13 +319,43 @@ func serveCallbacks(resolve folderResolver) transport.Callbacks {
 		return reused, err
 	}
 	directoryWriter := func(name, relative string, manifest metadata.Manifest) error {
-		return mutateAndCommit(name, relative, handlerApplyDirectory, resolve, func(folder resolvedFolder) error {
-			return apply.ApplyDirectory(folder.root, relative, manifest)
+		return mutateAndLog(name, relative, handlerApplyDirectory, resolve, func(folder resolvedFolder) error {
+			if err := apply.ApplyDirectory(folder.root, relative, manifest); err != nil {
+				return err
+			}
+			return commitDirectory(folder.marker.ID, relative, manifest)
 		})
 	}
 	directoryDeleter := func(name, relative string) error {
-		return mutateAndCommit(name, relative, handlerDeleteDirectory, resolve, func(folder resolvedFolder) error {
-			return apply.DeleteDirectory(folder.root, relative)
+		return mutateAndLog(name, relative, handlerDeleteDirectory, resolve, func(folder resolvedFolder) error {
+			if err := apply.DeleteDirectory(folder.root, relative); err != nil {
+				return err
+			}
+			// DeleteDirectory silently retains a non-empty directory
+			// (apply.DeleteDirectory), so only drop the index entry when
+			// the directory is actually gone.
+			exists, statErr := directoryExists(folder.root, relative)
+			if statErr != nil {
+				return statErr
+			}
+			if exists {
+				return nil
+			}
+			return removeDirectoryEntry(folder.marker.ID, relative)
+		})
+	}
+	mergeVector := func(name, relative string, vec vector.Vector) error {
+		return mutateAndLog(name, relative, "MergeVector", resolve, func(folder resolvedFolder) error {
+			previous, loadErr := loadIndex(folder.marker.ID)
+			if loadErr != nil {
+				return loadErr
+			}
+			entry, exists := previous.Entries[relative]
+			if !exists {
+				return fmt.Errorf("cannot merge vector for untracked path %q", relative)
+			}
+			entry.Version = vec
+			return commitLocalEntry(folder.marker.ID, relative, entry)
 		})
 	}
 	return transport.Callbacks{
@@ -310,7 +369,19 @@ func serveCallbacks(resolve folderResolver) transport.Callbacks {
 		ReuseFile:          fileReuser,
 		ApplyDirectory:     directoryWriter,
 		DeleteDirectory:    directoryDeleter,
+		MergeVector:        mergeVector,
 	}
+}
+
+func directoryExists(root, relative string) (bool, error) {
+	directory, err := sharepath.OpenDirectory(root, relative)
+	if err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, directory.Close()
 }
 
 func newReloadingShareLister(peer, authenticatedFingerprint string) func() ([]string, error) {
@@ -387,17 +458,17 @@ func mutateServedFolder(name string, resolve folderResolver, mutation func(resol
 	return mutateServedFolderWithin(name, resolve, lock.DefaultWait, mutation)
 }
 
-// mutateAndCommit runs op against the resolved folder and, on success,
-// rescans and saves its baseline within the same held lock.
-func mutateAndCommit(name, relative, handler string, resolve folderResolver, op func(resolvedFolder) error) error {
+// mutateAndLog runs op against the resolved folder under the per-folder
+// mutation lock, logging start/failure/completion uniformly. op is
+// responsible for both applying the mutation and persisting its result --
+// via commitLocalEntry, commitDirectory, or removeDirectoryEntry, the
+// index-commit functions every mutating path uses (implementation-plan.md
+// Phase C).
+func mutateAndLog(name, relative, handler string, resolve folderResolver, op func(resolvedFolder) error) error {
 	serveLogger.Debug("mutation start", "handler", handler, "folder", name, "path", relative)
 	err := mutateServedFolder(name, resolve, func(folder resolvedFolder) error {
 		if err := op(folder); err != nil {
 			serveLogger.Error("mutation failed", "handler", handler, "folder", name, "path", relative, "error", err)
-			return err
-		}
-		if err := commitFolderBaseline(name, folder.root, folder.marker.Ignore); err != nil {
-			serveLogger.Error("mutation applied WITHOUT baseline commit", "handler", handler, "folder", name, "path", relative, "error", err)
 			return err
 		}
 		return nil
@@ -423,29 +494,4 @@ func mutateServedFolderWithin(name string, resolve folderResolver, wait time.Dur
 		return err
 	}
 	return mutation(folder)
-}
-
-// commitFolderBaseline rescans path and saves it as folder name's baseline.
-// It is the single point through which every code path -- serve-side
-// mutations and the initiator's own apply cycle alike -- must pass to make
-// a mutation durable; a mutation that happens without a following call
-// reaching the Info log below is exactly the "write with no commit"
-// condition this logging exists to surface.
-func commitFolderBaseline(name, path string, ignore []string) error {
-	baseline, err := loadBaseline(name)
-	if err != nil {
-		commitLogger.Error("baseline commit failed", "folder", name, "stage", "load", "error", err)
-		return fmt.Errorf("load folder baseline: %w", err)
-	}
-	result, err := scan.DetectWithIgnore(path, baseline, ignore)
-	if err != nil {
-		commitLogger.Error("baseline commit failed", "folder", name, "stage", "scan", "error", err)
-		return fmt.Errorf("scan folder after mutation: %w", err)
-	}
-	if err := state.Save(name, result.Snapshot); err != nil {
-		commitLogger.Error("baseline commit failed", "folder", name, "stage", "save", "files", len(result.Snapshot.Files), "error", err)
-		return fmt.Errorf("save folder baseline after mutation: %w", err)
-	}
-	commitLogger.Info("baseline committed", "folder", name, "files", len(result.Snapshot.Files))
-	return nil
 }

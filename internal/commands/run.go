@@ -19,10 +19,10 @@ import (
 	"github.com/fsnotify/fsnotify"
 	"l2syncd/internal/config"
 	"l2syncd/internal/guard"
+	"l2syncd/internal/index"
 	"l2syncd/internal/lock"
 	"l2syncd/internal/logging"
 	"l2syncd/internal/preflight"
-	"l2syncd/internal/state"
 )
 
 const (
@@ -111,7 +111,7 @@ func Run(args []string, stderr io.Writer) (exitCode int) {
 		return runExitError
 	}
 	watchRoots := configuredWatchRoots(cfg)
-	watchConditions := make(map[string]state.WatchCondition)
+	watchConditions := make(map[string]index.WatchCondition)
 	for _, root := range watchRoots {
 		if err := addTree(watcher, root.path); err != nil {
 			watchConditions[root.name] = newWatchCondition(root.path, err)
@@ -128,7 +128,7 @@ func Run(args []string, stderr io.Writer) (exitCode int) {
 		return runExitError
 	}
 	cfg = latest
-	if err := state.SaveWatchConditions(watchConditions); err != nil {
+	if err := index.SaveWatchConditions(watchConditions); err != nil {
 		logger.Error("save watch status", "error", err)
 		return runExitError
 	}
@@ -202,7 +202,7 @@ func Run(args []string, stderr io.Writer) (exitCode int) {
 					if watchErr := addTree(watcher, event.Name); watchErr != nil {
 						logger.Error("register filesystem watch", "path", event.Name, "error", watchErr)
 						if markWatchFailure(watchConditions, watchRoots, event.Name, watchErr) {
-							if err := state.SaveWatchConditions(watchConditions); err != nil {
+							if err := index.SaveWatchConditions(watchConditions); err != nil {
 								logger.Error("save watch status", "error", err)
 							}
 						}
@@ -228,7 +228,7 @@ func Run(args []string, stderr io.Writer) (exitCode int) {
 			backoff = executeCycle(ctx, logger, retry, backoff, cycleTriggerPeriodic, RunCycle)
 		case <-watchRetry.C:
 			if retryWatchConditions(watcher, watchRoots, watchConditions, logger) {
-				if err := state.SaveWatchConditions(watchConditions); err != nil {
+				if err := index.SaveWatchConditions(watchConditions); err != nil {
 					logger.Error("save watch status", "error", err)
 				}
 			}
@@ -388,8 +388,8 @@ func configuredWatchRoots(cfg config.Config) []watchRoot {
 	return roots
 }
 
-func newWatchCondition(path string, watchErr error) state.WatchCondition {
-	condition := state.WatchCondition{Path: path, Reason: watchErr.Error(), Sysctl: inotifyLimitName}
+func newWatchCondition(path string, watchErr error) index.WatchCondition {
+	condition := index.WatchCondition{Path: path, Reason: watchErr.Error(), Sysctl: inotifyLimitName}
 	contents, err := os.ReadFile(inotifyLimitPath)
 	if err != nil {
 		return condition
@@ -401,7 +401,7 @@ func newWatchCondition(path string, watchErr error) state.WatchCondition {
 	return condition
 }
 
-func markWatchFailure(conditions map[string]state.WatchCondition, roots []watchRoot, failedPath string, watchErr error) bool {
+func markWatchFailure(conditions map[string]index.WatchCondition, roots []watchRoot, failedPath string, watchErr error) bool {
 	for _, root := range roots {
 		relative, err := filepath.Rel(root.path, failedPath)
 		if err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
@@ -412,7 +412,7 @@ func markWatchFailure(conditions map[string]state.WatchCondition, roots []watchR
 	return false
 }
 
-func retryWatchConditions(watcher *fsnotify.Watcher, roots []watchRoot, conditions map[string]state.WatchCondition, logger *slog.Logger) bool {
+func retryWatchConditions(watcher *fsnotify.Watcher, roots []watchRoot, conditions map[string]index.WatchCondition, logger *slog.Logger) bool {
 	changed := false
 	for _, root := range roots {
 		if _, failed := conditions[root.name]; !failed {

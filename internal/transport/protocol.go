@@ -21,6 +21,7 @@ import (
 	"sort"
 	"strings"
 	"syscall"
+	"time"
 
 	"l2syncd/internal/config"
 	"l2syncd/internal/connection"
@@ -28,6 +29,7 @@ import (
 	"l2syncd/internal/metadata"
 	"l2syncd/internal/peername"
 	"l2syncd/internal/sharepath"
+	"l2syncd/internal/vector"
 )
 
 const (
@@ -50,6 +52,7 @@ const (
 	messageApplyDir      = "apply-directory"
 	messageDeleteDir     = "delete-directory"
 	messageReuseFile     = "reuse-file"
+	messageMergeVector   = "merge-vector"
 	messageShare         = "share"
 	messageFile          = "file"
 	messageEnd           = "end"
@@ -120,6 +123,15 @@ type message struct {
 	Created   bool              `json:"created,omitempty"`
 	Exists    bool              `json:"exists,omitempty"`
 	Actions   int               `json:"actions,omitempty"`
+	// Version is the version vector attached to a listing entry, or the
+	// resulting vector a mutation's target path must hold once it lands
+	// (implementation-plan.md Phase C: every action carries its result
+	// vector so the receiving side never has to re-derive one).
+	Version vector.Vector `json:"version,omitempty"`
+	// Deleted marks a listing entry as a tombstone: no content fields are
+	// meaningful when this is set (concept.md 4.2).
+	Deleted   bool      `json:"deleted,omitempty"`
+	DeletedAt time.Time `json:"deleted_at"`
 }
 
 // Endpoint is a pinned peer and the local installation credential used for
@@ -140,32 +152,44 @@ type Handshake struct {
 	LocalPublicKey  string
 }
 
-// PeerFile is one regular file reported by a peer listing.
+// PeerFile is one entry reported by a peer listing: a live regular file, a
+// directory, or a tombstone. A tombstone (Deleted true) carries no content
+// fields (concept.md 4.2).
 type PeerFile struct {
 	Path      string
 	Size      int64
 	Hash      string
 	Metadata  metadata.Manifest
 	Directory bool
+	Deleted   bool
+	DeletedAt time.Time
+	Version   vector.Vector
 }
 
 // Callbacks are the filesystem operations available to the peer protocol.
-// A nil field disables its corresponding request.
+// A nil field disables its corresponding request. Every mutation callback
+// that persists an index entry receives the exact vector.Vector that entry
+// must hold once the mutation lands, so the receiving side never re-derives
+// one (implementation-plan.md Phase C).
 type Callbacks struct {
 	ListShares         func() ([]string, error)
 	BindShare          func(string) (bool, error)
 	UnbindShare        func(string) error
 	ListFiles          func(share, expectedID string) ([]PeerFile, string, error)
 	ReadFile           func(string, string) (io.ReadCloser, error)
-	WriteFile          func(string, string, string, metadata.Manifest, io.Reader) error
-	DeleteFile         func(string, string) error
-	WriteConflict      func(string, string, string, string, metadata.Manifest, io.Reader) error
-	WriteConflictCopy  func(string, string, string, string, metadata.Manifest, io.Reader) error
+	WriteFile          func(share, relative, expectedHash string, manifest metadata.Manifest, vec vector.Vector, contents io.Reader) error
+	DeleteFile         func(share, relative string, vec vector.Vector) error
+	WriteConflict      func(share, relative, loser, expectedHash string, manifest metadata.Manifest, vec vector.Vector, contents io.Reader) error
+	WriteConflictCopy  func(share, relative, suffix, expectedHash string, manifest metadata.Manifest, contents io.Reader) error
 	ConflictCopyExists func(string, string, string) (bool, error)
 	RequestCycle       func(string) (int, error)
-	ReuseFile          func(string, string, string, metadata.Manifest) (bool, error)
+	ReuseFile          func(share, relative, expectedHash string, manifest metadata.Manifest, vec vector.Vector) (bool, error)
 	ApplyDirectory     func(string, string, metadata.Manifest) error
 	DeleteDirectory    func(string, string) error
+	// MergeVector advances share's index entry for relative to vec without
+	// moving any bytes: the resolution for a concurrent-but-identical pair
+	// (engine.Merge), where nothing else carries the vector to this peer.
+	MergeVector func(share, relative string, vec vector.Vector) error
 }
 
 type frameWriter struct {
@@ -280,10 +304,13 @@ func readFiles(reader io.Reader) ([]PeerFile, string, error) {
 			if message.Size < 0 {
 				return nil, "", fmt.Errorf("peer returned a negative file size for %q", message.Path)
 			}
-			if err := validateListingEntry(message.Path, message.Hash, message.Directory, seen); err != nil {
+			if err := validateListingEntry(message.Path, message.Hash, message.Directory, message.Deleted, seen); err != nil {
 				return nil, "", err
 			}
-			files = append(files, PeerFile{Path: message.Path, Size: message.Size, Hash: strings.ToLower(message.Hash), Metadata: message.Metadata, Directory: message.Directory})
+			files = append(files, PeerFile{
+				Path: message.Path, Size: message.Size, Hash: strings.ToLower(message.Hash), Metadata: message.Metadata,
+				Directory: message.Directory, Deleted: message.Deleted, DeletedAt: message.DeletedAt, Version: message.Version,
+			})
 		case messageEnd:
 			return files, message.Id, nil
 		default:
@@ -385,25 +412,30 @@ func ReadFile(ctx context.Context, endpoint Endpoint, share, relative, expectedH
 	}
 }
 
-// WriteFile sends one regular file to a peer. The peer must acknowledge the
-// complete stream with an end marker before this returns successfully.
-func WriteFile(ctx context.Context, endpoint Endpoint, share, relative string, data []byte, expectedHash string, manifest metadata.Manifest) error {
-	return writeFile(ctx, endpoint, messageWriteFile, share, relative, data, expectedHash, "", manifest)
+// WriteFile sends one regular file to a peer, along with the version vector
+// the peer's index entry for relative must hold once the write lands. The
+// peer must acknowledge the complete stream with an end marker before this
+// returns successfully.
+func WriteFile(ctx context.Context, endpoint Endpoint, share, relative string, data []byte, expectedHash string, manifest metadata.Manifest, vec vector.Vector) error {
+	return writeFile(ctx, endpoint, messageWriteFile, share, relative, data, expectedHash, "", manifest, vec)
 }
 
 // WriteConflictFile preserves the peer's existing version under a conflict
-// name before installing the winning content.
-func WriteConflictFile(ctx context.Context, endpoint Endpoint, share, relative string, data []byte, expectedHash, loser string, manifest metadata.Manifest) error {
-	return writeFile(ctx, endpoint, messageWriteFile, share, relative, data, expectedHash, loser, manifest)
+// name before installing the winning content, along with the merged version
+// vector the peer's entry must hold once it lands.
+func WriteConflictFile(ctx context.Context, endpoint Endpoint, share, relative string, data []byte, expectedHash, loser string, manifest metadata.Manifest, vec vector.Vector) error {
+	return writeFile(ctx, endpoint, messageWriteFile, share, relative, data, expectedHash, loser, manifest, vec)
 }
 
 // WriteConflictCopy sends a losing version without replacing the canonical
-// winner on the peer.
+// winner on the peer. The copy lands at a new path neither side has tracked
+// before, so it carries no vector: the peer's next local scan picks it up as
+// an ordinary creation.
 func WriteConflictCopy(ctx context.Context, endpoint Endpoint, share, relative string, data []byte, expectedHash, suffix string, manifest metadata.Manifest) error {
-	return writeFile(ctx, endpoint, messageConflictCopy, share, relative, data, expectedHash, suffix, manifest)
+	return writeFile(ctx, endpoint, messageConflictCopy, share, relative, data, expectedHash, suffix, manifest, nil)
 }
 
-func writeFile(ctx context.Context, endpoint Endpoint, requestType, share, relative string, data []byte, expectedHash, loser string, manifest metadata.Manifest) error {
+func writeFile(ctx context.Context, endpoint Endpoint, requestType, share, relative string, data []byte, expectedHash, loser string, manifest metadata.Manifest, vec vector.Vector) error {
 	if endpoint.Address == "" || share == "" {
 		return errors.New("peer address and share are required")
 	}
@@ -424,7 +456,7 @@ func writeFile(ctx context.Context, endpoint Endpoint, requestType, share, relat
 	var request bytes.Buffer
 	frames := frameWriter{w: &request}
 	expectedHash = strings.ToLower(expectedHash)
-	if err := frames.write(message{Type: requestType, Share: share, Path: relative, Size: int64(len(data)), Hash: expectedHash, Peer: loser, Metadata: manifest}); err != nil {
+	if err := frames.write(message{Type: requestType, Share: share, Path: relative, Size: int64(len(data)), Hash: expectedHash, Peer: loser, Metadata: manifest, Version: vec}); err != nil {
 		return err
 	}
 	for offset := 0; offset < len(data); offset += fileChunkSize {
@@ -442,9 +474,10 @@ func writeFile(ctx context.Context, endpoint Endpoint, requestType, share, relat
 	return runMutation(ctx, endpoint, request.Bytes(), true)
 }
 
-// ReuseFile asks the peer to satisfy a write from a matching local baseline
-// file. A false result means the caller must send the bytes normally.
-func ReuseFile(ctx context.Context, endpoint Endpoint, share, relative, expectedHash string, manifest metadata.Manifest) (bool, error) {
+// ReuseFile asks the peer to satisfy a write from a matching local index
+// file, along with the version vector the peer's entry must hold once
+// reused. A false result means the caller must send the bytes normally.
+func ReuseFile(ctx context.Context, endpoint Endpoint, share, relative, expectedHash string, manifest metadata.Manifest, vec vector.Vector) (bool, error) {
 	if endpoint.Address == "" || share == "" || expectedHash == "" {
 		return false, errors.New("peer address, share, and hash are required")
 	}
@@ -456,7 +489,7 @@ func ReuseFile(ctx context.Context, endpoint Endpoint, share, relative, expected
 	}
 	expectedHash = strings.ToLower(expectedHash)
 	var request bytes.Buffer
-	if err := (frameWriter{w: &request}).write(message{Type: messageReuseFile, Share: share, Path: relative, Hash: expectedHash, Metadata: manifest}); err != nil {
+	if err := (frameWriter{w: &request}).write(message{Type: messageReuseFile, Share: share, Path: relative, Hash: expectedHash, Metadata: manifest, Version: vec}); err != nil {
 		return false, err
 	}
 	output, err := runSSH(ctx, endpoint, false, request.Bytes())
@@ -477,8 +510,9 @@ func ReuseFile(ctx context.Context, endpoint Endpoint, share, relative, expected
 	}
 }
 
-// DeleteFile asks a peer to move a file to its configured trash.
-func DeleteFile(ctx context.Context, endpoint Endpoint, share, relative string) error {
+// DeleteFile asks a peer to move a file to its configured trash and record
+// the given tombstone vector for it.
+func DeleteFile(ctx context.Context, endpoint Endpoint, share, relative string, vec vector.Vector) error {
 	if endpoint.Address == "" || share == "" {
 		return errors.New("peer address and share are required")
 	}
@@ -486,7 +520,7 @@ func DeleteFile(ctx context.Context, endpoint Endpoint, share, relative string) 
 		return err
 	}
 	var request bytes.Buffer
-	if err := (frameWriter{w: &request}).write(message{Type: messageDeleteFile, Share: share, Path: relative}); err != nil {
+	if err := (frameWriter{w: &request}).write(message{Type: messageDeleteFile, Share: share, Path: relative, Version: vec}); err != nil {
 		return err
 	}
 	return runMutation(ctx, endpoint, request.Bytes(), false)
@@ -500,6 +534,16 @@ func ApplyDirectory(ctx context.Context, endpoint Endpoint, share, relative stri
 // DeleteDirectory asks a peer to trash an empty directory.
 func DeleteDirectory(ctx context.Context, endpoint Endpoint, share, relative string) error {
 	return runSimpleMutation(ctx, endpoint, message{Type: messageDeleteDir, Share: share, Path: relative})
+}
+
+// MergeVector asks a peer to advance its index entry for relative to vec
+// without moving any bytes: the resolution for a concurrent-but-identical
+// pair (engine.Merge), where no mutation RPC carries the vector otherwise.
+func MergeVector(ctx context.Context, endpoint Endpoint, share, relative string, vec vector.Vector) error {
+	if share == "" {
+		return errors.New("share name is empty")
+	}
+	return runSimpleMutation(ctx, endpoint, message{Type: messageMergeVector, Share: share, Path: relative, Version: vec})
 }
 
 func runSimpleMutation(ctx context.Context, endpoint Endpoint, requestMessage message) error {
@@ -702,7 +746,7 @@ func Serve(reader io.Reader, writer io.Writer, callbacks Callbacks, handshake *H
 		if request.Peer != "" && callbacks.WriteConflict == nil {
 			return errors.New("conflict writer is not configured")
 		}
-		return readAndWriteFile(requestReader, writer, request.Share, request.Path, request.Peer, strings.ToLower(request.Hash), request.Size, request.Metadata, callbacks.WriteFile, callbacks.WriteConflict)
+		return readAndWriteFile(requestReader, writer, request.Share, request.Path, request.Peer, strings.ToLower(request.Hash), request.Size, request.Metadata, request.Version, callbacks.WriteFile, callbacks.WriteConflict)
 	case messageConflictCopy:
 		if callbacks.WriteConflictCopy == nil {
 			return errors.New("conflict copy writer is not configured")
@@ -719,7 +763,21 @@ func Serve(reader io.Reader, writer io.Writer, callbacks Callbacks, handshake *H
 		if err := peername.Validate(request.Peer); err != nil {
 			return err
 		}
-		return readAndWriteFile(requestReader, writer, request.Share, request.Path, request.Peer, strings.ToLower(request.Hash), request.Size, request.Metadata, nil, callbacks.WriteConflictCopy)
+		conflictCopyWriter := func(share, relative, suffix, expectedHash string, manifest metadata.Manifest, _ vector.Vector, contents io.Reader) error {
+			return callbacks.WriteConflictCopy(share, relative, suffix, expectedHash, manifest, contents)
+		}
+		return readAndWriteFile(requestReader, writer, request.Share, request.Path, request.Peer, strings.ToLower(request.Hash), request.Size, request.Metadata, nil, nil, conflictCopyWriter)
+	case messageMergeVector:
+		if callbacks.MergeVector == nil {
+			return errors.New("vector merge is not configured")
+		}
+		if err := ValidateRelativePath(request.Path); err != nil {
+			return err
+		}
+		if err := callbacks.MergeVector(request.Share, request.Path, request.Version); err != nil {
+			return err
+		}
+		return (frameWriter{w: writer}).write(message{Type: messageEnd})
 	case messageReuseFile:
 		if callbacks.ReuseFile == nil {
 			return errors.New("file reuse is not configured")
@@ -730,7 +788,7 @@ func Serve(reader io.Reader, writer io.Writer, callbacks Callbacks, handshake *H
 		if err := validateSHA256(request.Hash); err != nil {
 			return fmt.Errorf("invalid reuse hash: %w", err)
 		}
-		reused, err := callbacks.ReuseFile(request.Share, request.Path, strings.ToLower(request.Hash), request.Metadata)
+		reused, err := callbacks.ReuseFile(request.Share, request.Path, strings.ToLower(request.Hash), request.Metadata, request.Version)
 		if err != nil {
 			return err
 		}
@@ -746,7 +804,7 @@ func Serve(reader io.Reader, writer io.Writer, callbacks Callbacks, handshake *H
 		if err := ValidateRelativePath(request.Path); err != nil {
 			return err
 		}
-		if err := callbacks.DeleteFile(request.Share, request.Path); err != nil {
+		if err := callbacks.DeleteFile(request.Share, request.Path, request.Version); err != nil {
 			return err
 		}
 		return (frameWriter{w: writer}).write(message{Type: messageEnd})
@@ -777,7 +835,9 @@ func Serve(reader io.Reader, writer io.Writer, callbacks Callbacks, handshake *H
 	}
 }
 
-func readAndWriteFile(reader frameReader, writer io.Writer, share, relative, loser, expectedHash string, declaredSize int64, manifest metadata.Manifest, fileWriter func(string, string, string, metadata.Manifest, io.Reader) error, conflictWriter func(string, string, string, string, metadata.Manifest, io.Reader) error) error {
+func readAndWriteFile(reader frameReader, writer io.Writer, share, relative, loser, expectedHash string, declaredSize int64, manifest metadata.Manifest, vec vector.Vector,
+	fileWriter func(share, relative, expectedHash string, manifest metadata.Manifest, vec vector.Vector, contents io.Reader) error,
+	conflictWriter func(share, relative, loser, expectedHash string, manifest metadata.Manifest, vec vector.Vector, contents io.Reader) error) error {
 	contents, err := os.CreateTemp("", ".l2sync-receive-*")
 	if err != nil {
 		return fmt.Errorf("create receive buffer: %w", err)
@@ -812,9 +872,9 @@ func readAndWriteFile(reader frameReader, writer io.Writer, share, relative, los
 			}
 			var writeErr error
 			if loser != "" {
-				writeErr = conflictWriter(share, relative, loser, expectedHash, manifest, contents)
+				writeErr = conflictWriter(share, relative, loser, expectedHash, manifest, vec, contents)
 			} else {
-				writeErr = fileWriter(share, relative, expectedHash, manifest, contents)
+				writeErr = fileWriter(share, relative, expectedHash, manifest, vec, contents)
 			}
 			if writeErr != nil {
 				return writeErr
@@ -846,10 +906,13 @@ func writeFiles(writer io.Writer, share, id string, files []PeerFile) error {
 		if file.Size < 0 {
 			return fmt.Errorf("invalid peer file %q", file.Path)
 		}
-		if err := validateListingEntry(file.Path, file.Hash, file.Directory, seen); err != nil {
+		if err := validateListingEntry(file.Path, file.Hash, file.Directory, file.Deleted, seen); err != nil {
 			return err
 		}
-		if err := responseWriter.write(message{Type: messageFile, Path: file.Path, Size: file.Size, Hash: strings.ToLower(file.Hash), Metadata: file.Metadata, Directory: file.Directory}); err != nil {
+		if err := responseWriter.write(message{
+			Type: messageFile, Path: file.Path, Size: file.Size, Hash: strings.ToLower(file.Hash), Metadata: file.Metadata,
+			Directory: file.Directory, Deleted: file.Deleted, DeletedAt: file.DeletedAt, Version: file.Version,
+		}); err != nil {
 			return err
 		}
 	}
@@ -866,7 +929,10 @@ func validateSHA256(value string) error {
 	return nil
 }
 
-func validateListingEntry(value, hash string, directory bool, seen map[string]bool) error {
+// validateListingEntry validates one listing entry. A tombstone (deleted
+// true) carries no content, so it is exempt from the hash check that every
+// other non-directory entry requires (concept.md 4.2).
+func validateListingEntry(value, hash string, directory, deleted bool, seen map[string]bool) error {
 	if _, exists := seen[value]; exists {
 		return fmt.Errorf("duplicate peer listing path %q", value)
 	}
@@ -875,20 +941,30 @@ func validateListingEntry(value, hash string, directory bool, seen map[string]bo
 			return fmt.Errorf("peer listing path %q descends from file %q", value, ancestor)
 		}
 	}
-	if !directory {
-		prefix := value + "/"
-		for existing := range seen {
-			if strings.HasPrefix(existing, prefix) {
-				return fmt.Errorf("peer listing file %q collides with descendant %q", value, existing)
-			}
+	if directory {
+		if hash != "" {
+			return fmt.Errorf("peer directory %q has a content hash", value)
 		}
-		if err := validateSHA256(hash); err != nil {
-			return fmt.Errorf("invalid hash for peer file %q: %w", value, err)
+		if deleted {
+			return fmt.Errorf("peer directory %q cannot be a tombstone", value)
 		}
-	} else if hash != "" {
-		return fmt.Errorf("peer directory %q has a content hash", value)
+		seen[value] = true
+		return nil
 	}
-	seen[value] = directory
+	prefix := value + "/"
+	for existing := range seen {
+		if strings.HasPrefix(existing, prefix) {
+			return fmt.Errorf("peer listing file %q collides with descendant %q", value, existing)
+		}
+	}
+	if deleted {
+		if hash != "" {
+			return fmt.Errorf("peer tombstone %q has a content hash", value)
+		}
+	} else if err := validateSHA256(hash); err != nil {
+		return fmt.Errorf("invalid hash for peer file %q: %w", value, err)
+	}
+	seen[value] = false
 	return nil
 }
 

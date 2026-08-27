@@ -22,6 +22,7 @@ import (
 	"l2syncd/internal/lock"
 	"l2syncd/internal/metadata"
 	"l2syncd/internal/sharepath"
+	"l2syncd/internal/vector"
 )
 
 var protocolTestHash = strings.Repeat("a", 64)
@@ -61,6 +62,74 @@ func TestFileListingCarriesMetadataAndDirectories(t *testing.T) {
 	}
 }
 
+func TestFileListingCarriesTombstonesWithNoContent(t *testing.T) {
+	var stream bytes.Buffer
+	writer := frameWriter{w: &stream}
+	deletedAt := time.Unix(500, 0).UTC()
+	if err := writer.write(message{Type: messageFile, Path: "gone.txt", Deleted: true, DeletedAt: deletedAt, Version: vector.Vector{"a": 2}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.write(message{Type: messageEnd}); err != nil {
+		t.Fatal(err)
+	}
+	entries, _, err := readFiles(&stream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || !entries[0].Deleted || entries[0].Hash != "" || entries[0].Version["a"] != 2 {
+		t.Fatalf("entries = %#v, want one tombstone with no content and its vector", entries)
+	}
+}
+
+func TestReadFilesRejectsTombstoneWithHash(t *testing.T) {
+	var stream bytes.Buffer
+	writer := frameWriter{w: &stream}
+	if err := writer.write(message{Type: messageFile, Path: "gone.txt", Deleted: true, Hash: protocolTestHash}); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.write(message{Type: messageEnd}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := readFiles(&stream); err == nil {
+		t.Fatal("readFiles accepted a tombstone carrying a content hash")
+	}
+}
+
+func TestServeMergeVectorDispatchesShareRelativeAndVector(t *testing.T) {
+	var request bytes.Buffer
+	vec := vector.Vector{"a": 3, "b": 1}
+	if err := (frameWriter{w: &request}).write(message{Type: messageMergeVector, Share: "notes", Path: "same.txt", Version: vec}); err != nil {
+		t.Fatal(err)
+	}
+	var gotShare, gotPath string
+	var gotVec vector.Vector
+	var response bytes.Buffer
+	err := Serve(&request, &response, Callbacks{MergeVector: func(share, relative string, v vector.Vector) error {
+		gotShare, gotPath, gotVec = share, relative, v
+		return nil
+	}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotShare != "notes" || gotPath != "same.txt" || gotVec["a"] != 3 || gotVec["b"] != 1 {
+		t.Fatalf("merge-vector dispatch = %q %q %v", gotShare, gotPath, gotVec)
+	}
+	reply, err := (frameReader{r: bufio.NewReader(&response)}).read()
+	if err != nil || reply.Type != messageEnd {
+		t.Fatalf("merge-vector reply = %#v, %v", reply, err)
+	}
+}
+
+func TestServeMergeVectorRequiresConfiguredCallback(t *testing.T) {
+	var request bytes.Buffer
+	if err := (frameWriter{w: &request}).write(message{Type: messageMergeVector, Share: "notes", Path: "same.txt"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := Serve(&request, io.Discard, Callbacks{}, nil); err == nil {
+		t.Fatal("Serve accepted merge-vector with no callback configured")
+	}
+}
+
 func TestServePeerReuseTransfersNoContentFrames(t *testing.T) {
 	manifest := metadata.Manifest{Mode: 0o600, Mtime: time.Unix(100, 0)}
 	var request bytes.Buffer
@@ -70,7 +139,7 @@ func TestServePeerReuseTransfersNoContentFrames(t *testing.T) {
 	var response bytes.Buffer
 	called := false
 	err := Serve(&request, &response, Callbacks{
-		ReuseFile: func(share, path, hash string, got metadata.Manifest) (bool, error) {
+		ReuseFile: func(share, path, hash string, got metadata.Manifest, vec vector.Vector) (bool, error) {
 			called = true
 			if share != "notes" || path != "new" || hash != protocolTestHash || !metadata.Equal(got, manifest) {
 				t.Fatalf("reuse request = %q %q %q %#v", share, path, hash, got)
@@ -326,10 +395,10 @@ func TestReadFilesRejectsInvalidHashesDuplicatesAndTypeCollisions(t *testing.T) 
 }
 
 func TestWriteAndReuseRequireSHA256HashesBeforeConnecting(t *testing.T) {
-	if err := WriteFile(context.Background(), Endpoint{Address: "peer"}, "notes", "a", nil, "short", metadata.Manifest{}); err == nil {
+	if err := WriteFile(context.Background(), Endpoint{Address: "peer"}, "notes", "a", nil, "short", metadata.Manifest{}, nil); err == nil {
 		t.Fatal("WriteFile accepted invalid hash")
 	}
-	if _, err := ReuseFile(context.Background(), Endpoint{Address: "peer"}, "notes", "a", "short", metadata.Manifest{}); err == nil {
+	if _, err := ReuseFile(context.Background(), Endpoint{Address: "peer"}, "notes", "a", "short", metadata.Manifest{}, nil); err == nil {
 		t.Fatal("ReuseFile accepted invalid hash")
 	}
 }
@@ -352,11 +421,11 @@ func TestServeWriteRejectsUnsafePeerAndDeclaredSizeOverflow(t *testing.T) {
 		return request
 	}
 	callbacks := Callbacks{
-		WriteFile: func(string, string, string, metadata.Manifest, io.Reader) error {
+		WriteFile: func(string, string, string, metadata.Manifest, vector.Vector, io.Reader) error {
 			t.Fatal("write callback called for invalid request")
 			return nil
 		},
-		WriteConflict: func(string, string, string, string, metadata.Manifest, io.Reader) error {
+		WriteConflict: func(string, string, string, string, metadata.Manifest, vector.Vector, io.Reader) error {
 			t.Fatal("conflict callback called for invalid request")
 			return nil
 		},

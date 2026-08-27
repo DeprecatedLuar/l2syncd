@@ -15,11 +15,11 @@ import (
 
 type fakeReplica struct {
 	name    string
-	current ReplicaState
+	current index.Index
 }
 
-func (fake fakeReplica) Name() string                   { return fake.name }
-func (fake fakeReplica) Current() (ReplicaState, error) { return fake.current, nil }
+func (fake fakeReplica) Name() string                  { return fake.name }
+func (fake fakeReplica) Current() (index.Index, error) { return fake.current, nil }
 
 func entry(hash string, v vector.Vector) index.Entry {
 	return index.Entry{Hash: hash, Version: v, Metadata: metadata.Manifest{Mode: 0o600}}
@@ -29,10 +29,16 @@ func tombstone(v vector.Vector) index.Entry {
 	return index.Entry{Deleted: true, Version: v}
 }
 
-func state(entries map[string]index.Entry) ReplicaState {
+func state(entries map[string]index.Entry) index.Index {
 	idx := index.New("test")
 	idx.Entries = entries
-	return ReplicaState{Index: idx}
+	return idx
+}
+
+// plan calls PlanStates with no previous-directories input, for tests that
+// only care about file-entry decisions.
+func plan(leftName string, left index.Index, rightName string, right index.Index) Plan {
+	return PlanStates(leftName, left, rightName, right, nil)
 }
 
 func TestDecisionTableAcrossVectorComparisons(t *testing.T) {
@@ -58,27 +64,27 @@ func TestDecisionTableAcrossVectorComparisons(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			plan := PlanStates("left", state(map[string]index.Entry{"x": test.left}), "right", state(map[string]index.Entry{"x": test.right}))
+			got := plan("left", state(map[string]index.Entry{"x": test.left}), "right", state(map[string]index.Entry{"x": test.right}))
 			if test.want == "" {
-				if len(plan.Actions) != 0 {
-					t.Fatalf("actions = %#v, want none", plan.Actions)
+				if len(got.Actions) != 0 {
+					t.Fatalf("actions = %#v, want none", got.Actions)
 				}
 				return
 			}
-			if len(plan.Actions) != 1 || plan.Actions[0].Kind != test.want {
-				t.Fatalf("actions = %#v, want %s", plan.Actions, test.want)
+			if len(got.Actions) != 1 || got.Actions[0].Kind != test.want {
+				t.Fatalf("actions = %#v, want %s", got.Actions, test.want)
 			}
-			if test.wantSource != "" && plan.Actions[0].Source != test.wantSource {
-				t.Fatalf("source = %q, want %q", plan.Actions[0].Source, test.wantSource)
+			if test.wantSource != "" && got.Actions[0].Source != test.wantSource {
+				t.Fatalf("source = %q, want %q", got.Actions[0].Source, test.wantSource)
 			}
 		})
 	}
 }
 
 func TestCreationOnAPeerNeverSeenIsCreatedNotDeleted(t *testing.T) {
-	plan := PlanStates("left", state(map[string]index.Entry{"new.txt": entry("bytes", vector.Vector{"l": 1})}), "right", state(nil))
-	if len(plan.Actions) != 1 || plan.Actions[0].Kind != Push || plan.Actions[0].Source != "left" {
-		t.Fatalf("plan = %#v, want a push creation, never a delete", plan.Actions)
+	got := plan("left", state(map[string]index.Entry{"new.txt": entry("bytes", vector.Vector{"l": 1})}), "right", state(nil))
+	if len(got.Actions) != 1 || got.Actions[0].Kind != Push || got.Actions[0].Source != "left" {
+		t.Fatalf("plan = %#v, want a push creation, never a delete", got.Actions)
 	}
 }
 
@@ -94,12 +100,12 @@ func TestThreePeerResurrectionNeverHappens(t *testing.T) {
 	bTombstone := tombstone(vector.Vector{"a": 2})
 	cStaleFile := entry("original-bytes", vector.Vector{"a": 1})
 
-	planAC := PlanStates("a", state(map[string]index.Entry{"shared.txt": aTombstone}), "c", state(map[string]index.Entry{"shared.txt": cStaleFile}))
+	planAC := plan("a", state(map[string]index.Entry{"shared.txt": aTombstone}), "c", state(map[string]index.Entry{"shared.txt": cStaleFile}))
 	if len(planAC.Actions) != 1 || planAC.Actions[0].Kind != Delete || planAC.Actions[0].Source != "a" {
 		t.Fatalf("A-C plan = %#v, want the tombstone to win and the file to stay deleted", planAC.Actions)
 	}
 
-	planBC := PlanStates("b", state(map[string]index.Entry{"shared.txt": bTombstone}), "c", state(map[string]index.Entry{"shared.txt": cStaleFile}))
+	planBC := plan("b", state(map[string]index.Entry{"shared.txt": bTombstone}), "c", state(map[string]index.Entry{"shared.txt": cStaleFile}))
 	if len(planBC.Actions) != 1 || planBC.Actions[0].Kind != Delete || planBC.Actions[0].Source != "b" {
 		t.Fatalf("B-C plan = %#v, want the tombstone to win and the file to stay deleted", planBC.Actions)
 	}
@@ -111,8 +117,8 @@ func TestConflictTieBreakIsIndependentOfArgumentOrder(t *testing.T) {
 	left := entry("left-bytes", vector.Vector{leftIdentity: 1})
 	right := entry("right-bytes", vector.Vector{rightIdentity: 1})
 
-	first := PlanStates(leftIdentity, state(map[string]index.Entry{"x": left}), rightIdentity, state(map[string]index.Entry{"x": right}))
-	second := PlanStates(rightIdentity, state(map[string]index.Entry{"x": right}), leftIdentity, state(map[string]index.Entry{"x": left}))
+	first := plan(leftIdentity, state(map[string]index.Entry{"x": left}), rightIdentity, state(map[string]index.Entry{"x": right}))
+	second := plan(rightIdentity, state(map[string]index.Entry{"x": right}), leftIdentity, state(map[string]index.Entry{"x": left}))
 	if len(first.Actions) != 1 || len(second.Actions) != 1 {
 		t.Fatalf("actions = %#v / %#v", first.Actions, second.Actions)
 	}
@@ -123,13 +129,13 @@ func TestConflictTieBreakIsIndependentOfArgumentOrder(t *testing.T) {
 
 func TestPlanStatesHaltsForEqualOrEmptyIdentities(t *testing.T) {
 	identity := strings.Repeat("a", 64)
-	plan := PlanStates(identity, state(nil), identity, state(nil))
-	if !plan.Halted || !strings.Contains(plan.Reason, "distinct") {
-		t.Fatalf("plan = %#v", plan)
+	got := plan(identity, state(nil), identity, state(nil))
+	if !got.Halted || !strings.Contains(got.Reason, "distinct") {
+		t.Fatalf("plan = %#v", got)
 	}
-	plan = PlanStates("", state(nil), "right", state(nil))
-	if !plan.Halted {
-		t.Fatalf("plan = %#v, want halted for empty identity", plan)
+	got = plan("", state(nil), "right", state(nil))
+	if !got.Halted {
+		t.Fatalf("plan = %#v, want halted for empty identity", got)
 	}
 }
 
@@ -151,7 +157,7 @@ func TestDeletionThresholdCountsDeleteActionsInThePlan(t *testing.T) {
 		tombstoned[path] = tombstone(vector.Vector{"left": 2})
 		count++
 	}
-	halted := PlanStates("left", state(tombstoned), "right", state(entries))
+	halted := plan("left", state(tombstoned), "right", state(entries))
 	if !halted.Halted {
 		t.Fatal("genuine 31 percent net deletion did not halt")
 	}
@@ -168,49 +174,66 @@ func TestDeletionThresholdCountsDeleteActionsInThePlan(t *testing.T) {
 		fewDeletes[path] = tombstone(vector.Vector{"left": 2})
 		deleteCount++
 	}
-	notHalted := PlanStates("left", state(fewDeletes), "right", state(entries))
+	notHalted := plan("left", state(fewDeletes), "right", state(entries))
 	if notHalted.Halted {
 		t.Fatalf("5 percent deletion halted: %s", notHalted.Reason)
 	}
 }
 
-func TestDirectoryMetadataUsesPerReplicaPreviousManifest(t *testing.T) {
+func TestDirectoryMetadataUsesPreviouslyCommittedManifest(t *testing.T) {
 	old := metadata.Manifest{Mode: 0o700, Mtime: time.Unix(10, 0)}
 	changed := metadata.Manifest{Mode: 0o750, Mtime: time.Unix(20, 0)}
-	left := ReplicaState{Index: index.New("left"), PreviousDirectories: map[string]metadata.Manifest{"folder": old}}
-	left.Index.Directories = map[string]metadata.Manifest{"folder": changed}
-	right := ReplicaState{Index: index.New("right"), PreviousDirectories: map[string]metadata.Manifest{"folder": old}}
-	right.Index.Directories = map[string]metadata.Manifest{"folder": old}
+	left := index.New("left")
+	left.Directories = map[string]metadata.Manifest{"folder": changed}
+	right := index.New("right")
+	right.Directories = map[string]metadata.Manifest{"folder": old}
+	previous := map[string]metadata.Manifest{"folder": old}
 
-	plan := PlanStates("left", left, "right", right)
-	if len(plan.DirectoryActions) != 1 || plan.DirectoryActions[0].Kind != Push || !plan.DirectoryActions[0].Directory {
-		t.Fatalf("directory actions = %#v", plan.DirectoryActions)
+	got := PlanStates("left", left, "right", right, previous)
+	if len(got.DirectoryActions) != 1 || got.DirectoryActions[0].Kind != Push || !got.DirectoryActions[0].Directory {
+		t.Fatalf("directory actions = %#v", got.DirectoryActions)
 	}
 }
 
 func TestDirectoryUnchangedProducesNoAction(t *testing.T) {
 	manifest := metadata.Manifest{Mode: 0o700, Mtime: time.Unix(10, 0)}
-	left := ReplicaState{Index: index.New("left"), PreviousDirectories: map[string]metadata.Manifest{"folder": manifest}}
-	left.Index.Directories = map[string]metadata.Manifest{"folder": manifest}
-	right := ReplicaState{Index: index.New("right"), PreviousDirectories: map[string]metadata.Manifest{"folder": manifest}}
-	right.Index.Directories = map[string]metadata.Manifest{"folder": manifest}
+	left := index.New("left")
+	left.Directories = map[string]metadata.Manifest{"folder": manifest}
+	right := index.New("right")
+	right.Directories = map[string]metadata.Manifest{"folder": manifest}
+	previous := map[string]metadata.Manifest{"folder": manifest}
 
-	plan := PlanStates("left", left, "right", right)
-	if len(plan.DirectoryActions) != 0 {
-		t.Fatalf("directory actions = %#v, want none", plan.DirectoryActions)
+	got := PlanStates("left", left, "right", right, previous)
+	if len(got.DirectoryActions) != 0 {
+		t.Fatalf("directory actions = %#v, want none", got.DirectoryActions)
+	}
+}
+
+func TestDirectoryBothSidesChangedToSameValueConverges(t *testing.T) {
+	old := metadata.Manifest{Mode: 0o700, Mtime: time.Unix(10, 0)}
+	changed := metadata.Manifest{Mode: 0o750, Mtime: time.Unix(20, 0)}
+	left := index.New("left")
+	left.Directories = map[string]metadata.Manifest{"folder": changed}
+	right := index.New("right")
+	right.Directories = map[string]metadata.Manifest{"folder": changed}
+	previous := map[string]metadata.Manifest{"folder": old}
+
+	got := PlanStates("left", left, "right", right, previous)
+	if len(got.DirectoryActions) != 0 {
+		t.Fatalf("directory actions = %#v, want none: both sides already agree", got.DirectoryActions)
 	}
 }
 
 func TestReconcileUsesReplicaInterfaces(t *testing.T) {
-	plan, err := Reconcile(
+	got, err := Reconcile(
 		fakeReplica{"left", state(map[string]index.Entry{"x": entry("l", vector.Vector{"left": 2})})},
 		fakeReplica{"right", state(map[string]index.Entry{"x": entry("b", vector.Vector{"left": 1})})},
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(plan.Actions) != 1 || plan.Actions[0].Kind != Push {
-		t.Fatalf("plan = %#v", plan)
+	if len(got.Actions) != 1 || got.Actions[0].Kind != Push {
+		t.Fatalf("plan = %#v", got)
 	}
 }
 

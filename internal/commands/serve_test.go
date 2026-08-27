@@ -18,9 +18,10 @@ import (
 	"l2syncd/internal/config"
 	"l2syncd/internal/connection"
 	"l2syncd/internal/guard"
+	"l2syncd/internal/index"
 	"l2syncd/internal/lock"
 	"l2syncd/internal/metadata"
-	"l2syncd/internal/state"
+	"l2syncd/internal/vector"
 )
 
 func TestServeResolverRevalidatesMarkerForEveryOperation(t *testing.T) {
@@ -310,13 +311,14 @@ func TestServeRefusesPeerWithoutPublicKey(t *testing.T) {
 	}
 }
 
-func TestServedMutationWaitsForLiveOwnerThenCommitsBaseline(t *testing.T) {
+func TestServedMutationWaitsForLiveOwnerThenCommitsIndex(t *testing.T) {
 	home := t.TempDir()
 	root := filepath.Join(home, "notes")
 	if err := os.Mkdir(root, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := guard.WriteMarker(root, newTestMarker(t, "notes")); err != nil {
+	marker := newTestMarker(t, "notes")
+	if err := guard.WriteMarker(root, marker); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("HOME", home)
@@ -334,9 +336,10 @@ func TestServedMutationWaitsForLiveOwnerThenCommitsBaseline(t *testing.T) {
 	data := []byte("serialized")
 	hash := fmt.Sprintf("%x", sha256.Sum256(data))
 	manifest := metadata.Manifest{Mode: 0o600, Mtime: time.Unix(100, 200)}
+	vec := vector.Vector{"peer-fingerprint": 1}
 	done := make(chan error, 1)
 	go func() {
-		done <- callbacks.WriteFile("notes", "a.txt", hash, manifest, bytes.NewReader(data))
+		done <- callbacks.WriteFile("notes", "a.txt", hash, manifest, vec, bytes.NewReader(data))
 	}()
 	select {
 	case err := <-done:
@@ -354,12 +357,13 @@ func TestServedMutationWaitsForLiveOwnerThenCommitsBaseline(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("mutation did not continue after lock release")
 	}
-	baseline, err := state.Load("notes")
+	idx, err := index.Load(marker.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if baseline.Files["a.txt"].Hash != hash {
-		t.Fatalf("baseline = %#v, want committed file", baseline.Files)
+	entry := idx.Entries["a.txt"]
+	if entry.Hash != hash || vector.Compare(entry.Version, vec) != vector.Equal {
+		t.Fatalf("index = %#v, want committed entry with the given hash and vector", idx.Entries)
 	}
 }
 
