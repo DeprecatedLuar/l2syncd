@@ -23,6 +23,7 @@ func Run(args []string) {
 			gohelp.Item("status", "Show synchronization status"),
 			gohelp.Item("join <name> <path>", "Join a folder offered by a peer"),
 			gohelp.Item("leave <name>", "Detach from a joined folder"),
+			gohelp.Item("ignore <name> [add|rm <pattern>...]", "View or edit a folder's local ignore rules"),
 			gohelp.Item("run", "Run synchronization"),
 		).
 		Section("Help",
