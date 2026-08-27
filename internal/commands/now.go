@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"l2syncd/internal/apply"
 	"l2syncd/internal/config"
@@ -637,7 +638,7 @@ func applyLocalDelete(ctx context.Context, share, folderID, root, relative strin
 		if err := apply.Delete(root, relative); err != nil {
 			return err
 		}
-		return commitLocalEntry(folderID, relative, index.Entry{Version: vec, Deleted: true})
+		return commitLocalEntry(folderID, relative, index.Entry{Version: vec, Deleted: true, DeletedAt: time.Now().UTC()})
 	})
 }
 
