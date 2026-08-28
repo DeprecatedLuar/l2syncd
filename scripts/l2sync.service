@@ -1,0 +1,14 @@
+[Unit]
+Description=l2sync two-way directory synchronization daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust to wherever l2sync is installed (e.g. ~/bin/l2sync, ~/.local/bin/l2sync).
+ExecStart=%h/.local/bin/l2sync run
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

@@ -17,6 +17,11 @@ const (
 	exitError = 1
 )
 
+const githubRepo = "DeprecatedLuar/l2syncd"
+
+// version is set at build time via -ldflags "-X main.version=...".
+var version = "dev"
+
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
 }
@@ -28,6 +33,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 
 	switch args[0] {
+	case "version", "--version", "-v":
+		fmt.Fprintf(stdout, "l2sync %s (%s)\n", version, githubRepo)
+		return exitOK
 	case "config", "conf":
 		return commands.ConfigEdit(args[1:], stderr)
 	case "add", "a":

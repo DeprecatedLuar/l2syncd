@@ -28,6 +28,7 @@ func Run(args []string) {
 		).
 		Section("Help",
 			gohelp.Item("help, -h, --help", "Show this help message"),
+			gohelp.Item("version, -v, --version", "Show the l2sync version"),
 		)
 
 	gohelp.Run(args, root)
