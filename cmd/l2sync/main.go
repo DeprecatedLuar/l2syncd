@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"slices"
 
 	"l2syncd/internal/commands"
 	"l2syncd/internal/commands/help"
@@ -19,11 +21,40 @@ const (
 
 const githubRepo = "DeprecatedLuar/l2syncd"
 
+// Android forbids executing files under an app's data directory, so Termux
+// runs them through the system dynamic linker instead. Its exec interceptor
+// builds the argument list as [original argv[0], resolved executable path,
+// original argv[1:]...] (termux-exec's modifyExecArgs), and the linker does not
+// strip the path it was handed, so the process sees it ahead of the first real
+// argument. os.Executable() resolves to the linker on such a launch, which is
+// what distinguishes it from a direct exec.
+var androidLinkerNames = []string{"linker64", "linker"}
+
 // version is set at build time via -ldflags "-X main.version=...".
 var version = "dev"
 
 func main() {
-	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
+	executable, err := os.Executable()
+	if err != nil {
+		executable = ""
+	}
+	args := normalizeArgs(os.Args, executable)
+	os.Exit(run(args[1:], os.Stdout, os.Stderr))
+}
+
+// normalizeArgs removes the executable path that the Android system linker
+// inserts at argv[1], so argv has the same shape on every supported platform.
+// It rewrites argv only when the executable resolves to the linker rather than
+// to us and the inserted element is the absolute path it has to be. On a direct
+// exec, and on every non-Android platform, argv is returned unchanged.
+func normalizeArgs(argv []string, executable string) []string {
+	if len(argv) < 2 || !filepath.IsAbs(argv[1]) {
+		return argv
+	}
+	if !slices.Contains(androidLinkerNames, filepath.Base(executable)) {
+		return argv
+	}
+	return append(argv[:1:1], argv[2:]...)
 }
 
 func run(args []string, stdout, stderr io.Writer) int {
