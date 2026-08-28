@@ -17,38 +17,39 @@ import (
 )
 
 const (
-	addExitOK      = 0
-	addExitError   = 1
-	addExitInvalid = 2
+	shareExitOK      = 0
+	shareExitError   = 1
+	shareExitInvalid = 2
 )
 
-func add(args []string, stderr io.Writer) int {
-	if len(args) != 2 {
-		fmt.Fprintln(stderr, "usage: l2sync add <name> <path>")
-		return addExitError
+func share(args []string, stderr io.Writer) int {
+	name, rawPath, createMissing, err := parseSharePath(args)
+	if err != nil {
+		fmt.Fprintln(stderr, "usage: l2sync folder share <name> <path> [-p]")
+		return shareExitError
 	}
-	name := strings.ToLower(args[0])
+	name = strings.ToLower(name)
 	if err := sharename.Validate(name); err != nil {
 		fmt.Fprintf(stderr, "l2sync: %v\n", err)
-		return addExitError
+		return shareExitError
 	}
-	path, err := filepath.Abs(args[1])
+	path, err := filepath.Abs(rawPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "l2sync: resolve folder path: %v\n", err)
-		return addExitError
+		return shareExitError
 	}
-	info, err := os.Stat(path)
+	info, err := resolveFolderPath(path, rawPath, createMissing, stderr)
 	if err != nil {
-		fmt.Fprintf(stderr, "l2sync: folder %q: %v\n", args[1], err)
-		return addExitError
+		fmt.Fprintf(stderr, "l2sync: folder %q: %v\n", rawPath, err)
+		return shareExitError
 	}
 	if !info.IsDir() {
-		fmt.Fprintf(stderr, "l2sync: folder %q is not a directory\n", args[1])
-		return addExitError
+		fmt.Fprintf(stderr, "l2sync: folder %q is not a directory\n", rawPath)
+		return shareExitError
 	}
 	if err := guard.Filesystem(path); err != nil {
 		fmt.Fprintf(stderr, "l2sync: folder filesystem: %v\n", err)
-		return addExitError
+		return shareExitError
 	}
 	if err := withConfigLocked(context.Background(), func(current *config.Config) error {
 		if _, exists := current.Shared[name]; exists {
@@ -57,7 +58,7 @@ func add(args []string, stderr io.Writer) int {
 		if _, exists := current.Remote[name]; exists {
 			return fmt.Errorf("folder %q already exists as remote", name)
 		}
-		markerCreated, err := prepareJoinMarker(path, name, "")
+		markerCreated, err := prepareAttachMarker(path, name, "")
 		if err != nil {
 			return fmt.Errorf("write folder marker: %w", err)
 		}
@@ -76,14 +77,31 @@ func add(args []string, stderr io.Writer) int {
 	}); err != nil {
 		fmt.Fprintf(stderr, "l2sync: save config: %v\n", err)
 		if errors.Is(err, errInvalidConfig) {
-			return addExitInvalid
+			return shareExitInvalid
 		}
-		return addExitError
+		return shareExitError
 	}
-	return addExitOK
+	return shareExitOK
 }
 
-// Add registers a local shared directory.
-func Add(args []string, stderr io.Writer) int {
-	return add(args, stderr)
+// parseSharePath parses the <name> <path> [-p] arguments shared by share and
+// attach: -p may appear anywhere among the arguments.
+func parseSharePath(args []string) (name, path string, createMissing bool, err error) {
+	var positional []string
+	for _, arg := range args {
+		if arg == "-p" {
+			createMissing = true
+			continue
+		}
+		positional = append(positional, arg)
+	}
+	if len(positional) != 2 {
+		return "", "", false, fmt.Errorf("expected <name> <path>")
+	}
+	return positional[0], positional[1], createMissing, nil
+}
+
+// Share registers a local shared directory.
+func Share(args []string, stderr io.Writer) int {
+	return share(args, stderr)
 }

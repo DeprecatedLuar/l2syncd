@@ -50,7 +50,7 @@ func TestAddListAndRemoveShare(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
 
 	var stdout, stderr bytes.Buffer
-	if got := Add([]string{"NOTES", sharePath}, &stderr); got != successExitCode {
+	if got := Share([]string{"NOTES", sharePath}, &stderr); got != successExitCode {
 		t.Fatalf("add exit code = %d, stderr = %q", got, stderr.String())
 	}
 	if stdout.Len() != 0 || stderr.Len() != 0 {
@@ -71,7 +71,7 @@ func TestAddListAndRemoveShare(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
-	if got := Remove([]string{"notes"}, &stderr); got != successExitCode {
+	if got := Unshare([]string{"notes"}, &stderr); got != successExitCode {
 		t.Fatalf("rm exit code = %d, stderr = %q", got, stderr.String())
 	}
 	if _, err := os.Stat(sharePath); err != nil {
@@ -83,6 +83,27 @@ func TestAddListAndRemoveShare(t *testing.T) {
 	}
 	if _, exists := cfg.Shared["notes"]; exists {
 		t.Fatal("share remains in config after rm")
+	}
+}
+
+func TestShareCreateMissingPath(t *testing.T) {
+	root := t.TempDir()
+	sharePath := filepath.Join(root, "notes")
+	t.Setenv("HOME", root)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
+
+	var stderr bytes.Buffer
+	if got := Share([]string{"notes", sharePath}, &stderr); got == successExitCode {
+		t.Fatalf("share succeeded on missing path without -p, stderr = %q", stderr.String())
+	}
+
+	stderr.Reset()
+	if got := Share([]string{"notes", sharePath, "-p"}, &stderr); got != successExitCode {
+		t.Fatalf("share -p exit code = %d, stderr = %q", got, stderr.String())
+	}
+	if info, err := os.Stat(sharePath); err != nil || !info.IsDir() {
+		t.Fatalf("share -p created path = %v, %v, want directory", info, err)
 	}
 }
 
@@ -107,7 +128,7 @@ func TestAddRollsBackOnlyMarkerCreatedByFailedCommit(t *testing.T) {
 			saveConfig = func(config.Config) error { return errors.New("injected save failure") }
 			t.Cleanup(func() { saveConfig = originalSave })
 			var stderr bytes.Buffer
-			if code := Add([]string{"notes", folder}, &stderr); code == addExitOK {
+			if code := Share([]string{"notes", folder}, &stderr); code == shareExitOK {
 				t.Fatal("Add succeeded after save failure")
 			}
 			marker, err := guard.ReadMarker(folder)
@@ -158,10 +179,10 @@ func TestLeaveUnbindsProviderBeforeLocalRegistration(t *testing.T) {
 	if err := index.Save(index.New(marker.ID)); err != nil {
 		t.Fatal(err)
 	}
-	original := leaveUnbindShare
-	t.Cleanup(func() { leaveUnbindShare = original })
+	original := detachUnbindShare
+	t.Cleanup(func() { detachUnbindShare = original })
 	unbound := false
-	leaveUnbindShare = func(_ context.Context, endpoint transport.Endpoint, share string) error {
+	detachUnbindShare = func(_ context.Context, endpoint transport.Endpoint, share string) error {
 		if endpoint.Name != "phone" || share != "notes" {
 			return fmt.Errorf("unexpected unbind %q/%q", endpoint.Name, share)
 		}
@@ -169,7 +190,7 @@ func TestLeaveUnbindsProviderBeforeLocalRegistration(t *testing.T) {
 		return nil
 	}
 	var stderr bytes.Buffer
-	if code := Leave([]string{"notes"}, &stderr); code != leaveExitOK {
+	if code := Detach([]string{"notes"}, &stderr); code != detachExitOK {
 		t.Fatalf("Leave = %d, stderr = %q", code, stderr.String())
 	}
 	loaded, err := config.Load()
@@ -206,11 +227,11 @@ func TestLeaveOfflineRetainsRetryableLocalRegistration(t *testing.T) {
 	if err := config.Save(cfg); err != nil {
 		t.Fatal(err)
 	}
-	original := leaveUnbindShare
-	t.Cleanup(func() { leaveUnbindShare = original })
-	leaveUnbindShare = func(context.Context, transport.Endpoint, string) error { return errors.New("offline") }
+	original := detachUnbindShare
+	t.Cleanup(func() { detachUnbindShare = original })
+	detachUnbindShare = func(context.Context, transport.Endpoint, string) error { return errors.New("offline") }
 	var stderr bytes.Buffer
-	if code := Leave([]string{"notes"}, &stderr); code == leaveExitOK {
+	if code := Detach([]string{"notes"}, &stderr); code == detachExitOK {
 		t.Fatal("Leave succeeded while provider was offline")
 	}
 	loaded, err := config.Load()
@@ -245,7 +266,7 @@ func TestRemovePrunesIndexWhileBound(t *testing.T) {
 		t.Fatal(err)
 	}
 	var stderr bytes.Buffer
-	if code := Remove([]string{"notes"}, &stderr); code != removeExitOK {
+	if code := Unshare([]string{"notes"}, &stderr); code != unshareExitOK {
 		t.Fatalf("Remove = %d, stderr = %q", code, stderr.String())
 	}
 	if _, err := os.Stat(folder); err != nil {
@@ -497,7 +518,7 @@ func TestCommitJoinedFolderRejectsExistingRemoteWithoutExpectedBinding(t *testin
 	if err := config.Save(cfg); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := commitJoinedFolder("notes", folder, "phone", cfg.Peers["phone"], ""); err == nil || !strings.Contains(err.Error(), "bind") {
+	if _, err := commitAttachedFolder("notes", folder, "phone", cfg.Peers["phone"], ""); err == nil || !strings.Contains(err.Error(), "bind") {
 		t.Fatalf("existing malformed remote registration = %v", err)
 	}
 }
@@ -550,34 +571,34 @@ func TestFreshJoinBindsBeforeAuthorizedListing(t *testing.T) {
 	if err := config.Save(cfg); err != nil {
 		t.Fatal(err)
 	}
-	originalFind, originalBind, originalUnbind, originalList := joinFindProvider, joinBindShare, joinUnbindShare, joinListFiles
+	originalFind, originalBind, originalUnbind, originalList := attachFindProvider, attachBindShare, attachUnbindShare, attachListFiles
 	t.Cleanup(func() {
-		joinFindProvider, joinBindShare, joinUnbindShare, joinListFiles = originalFind, originalBind, originalUnbind, originalList
+		attachFindProvider, attachBindShare, attachUnbindShare, attachListFiles = originalFind, originalBind, originalUnbind, originalList
 	})
 	bound := false
 	wantProviderID, err := guard.NewMarkerID()
 	if err != nil {
 		t.Fatal(err)
 	}
-	joinFindProvider = func(context.Context, config.Config, string) (string, transport.Endpoint, error) {
+	attachFindProvider = func(context.Context, config.Config, string) (string, transport.Endpoint, error) {
 		return "phone", transport.Endpoint{Name: "phone"}, nil
 	}
-	joinBindShare = func(context.Context, transport.Endpoint, string) (bool, error) {
+	attachBindShare = func(context.Context, transport.Endpoint, string) (bool, error) {
 		bound = true
 		return true, nil
 	}
-	joinUnbindShare = func(context.Context, transport.Endpoint, string) error {
+	attachUnbindShare = func(context.Context, transport.Endpoint, string) error {
 		bound = false
 		return nil
 	}
-	joinListFiles = func(context.Context, transport.Endpoint, string, string) ([]transport.PeerFile, string, error) {
+	attachListFiles = func(context.Context, transport.Endpoint, string, string) ([]transport.PeerFile, string, error) {
 		if !bound {
 			return nil, "", errors.New("listing reached before binding authorization")
 		}
 		return nil, wantProviderID, nil
 	}
 	var stderr bytes.Buffer
-	if code := Join([]string{"notes", folder}, &stderr); code != joinExitOK {
+	if code := Attach([]string{"notes", folder}, &stderr); code != attachExitOK {
 		t.Fatalf("Join = %d, stderr = %q", code, stderr.String())
 	}
 	loaded, err := config.Load()
@@ -593,6 +614,48 @@ func TestFreshJoinBindsBeforeAuthorizedListing(t *testing.T) {
 	}
 	if marker.ID != wantProviderID {
 		t.Fatalf("joined marker id = %q, want provider id %q", marker.ID, wantProviderID)
+	}
+}
+
+func TestAttachCreateMissingPath(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
+	folder := filepath.Join(root, "notes")
+	cfg := config.New()
+	cfg.Peers["phone"] = config.Peer{Address: "phone", PublicKey: generatedPublicKey(t, filepath.Join(root, "remote-key"))}
+	if err := config.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	var stderr bytes.Buffer
+	if code := Attach([]string{"notes", folder}, &stderr); code == attachExitOK {
+		t.Fatalf("attach succeeded on missing path without -p, stderr = %q", stderr.String())
+	}
+
+	originalFind, originalBind, originalUnbind, originalList := attachFindProvider, attachBindShare, attachUnbindShare, attachListFiles
+	t.Cleanup(func() {
+		attachFindProvider, attachBindShare, attachUnbindShare, attachListFiles = originalFind, originalBind, originalUnbind, originalList
+	})
+	wantProviderID, err := guard.NewMarkerID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	attachFindProvider = func(context.Context, config.Config, string) (string, transport.Endpoint, error) {
+		return "phone", transport.Endpoint{Name: "phone"}, nil
+	}
+	attachBindShare = func(context.Context, transport.Endpoint, string) (bool, error) { return true, nil }
+	attachUnbindShare = func(context.Context, transport.Endpoint, string) error { return nil }
+	attachListFiles = func(context.Context, transport.Endpoint, string, string) ([]transport.PeerFile, string, error) {
+		return nil, wantProviderID, nil
+	}
+	stderr.Reset()
+	if code := Attach([]string{"notes", folder, "-p"}, &stderr); code != attachExitOK {
+		t.Fatalf("attach -p exit code = %d, stderr = %q", code, stderr.String())
+	}
+	if info, err := os.Stat(folder); err != nil || !info.IsDir() {
+		t.Fatalf("attach -p created path = %v, %v, want directory", info, err)
 	}
 }
 
@@ -625,21 +688,21 @@ func joinDivergenceTestSetup(t *testing.T) (folder, extraPath, providerID string
 func TestJoinDivergenceMergeKeepsLocalExtras(t *testing.T) {
 	folder, extraPath, providerID := joinDivergenceTestSetup(t)
 	originalFind, originalBind, originalUnbind, originalList, originalResolve :=
-		joinFindProvider, joinBindShare, joinUnbindShare, joinListFiles, joinResolveDivergence
+		attachFindProvider, attachBindShare, attachUnbindShare, attachListFiles, attachResolveDivergence
 	t.Cleanup(func() {
-		joinFindProvider, joinBindShare, joinUnbindShare, joinListFiles, joinResolveDivergence =
+		attachFindProvider, attachBindShare, attachUnbindShare, attachListFiles, attachResolveDivergence =
 			originalFind, originalBind, originalUnbind, originalList, originalResolve
 	})
-	joinFindProvider = func(context.Context, config.Config, string) (string, transport.Endpoint, error) {
+	attachFindProvider = func(context.Context, config.Config, string) (string, transport.Endpoint, error) {
 		return "phone", transport.Endpoint{Name: "phone"}, nil
 	}
-	joinBindShare = func(context.Context, transport.Endpoint, string) (bool, error) { return true, nil }
-	joinUnbindShare = func(context.Context, transport.Endpoint, string) error { return nil }
-	joinListFiles = func(context.Context, transport.Endpoint, string, string) ([]transport.PeerFile, string, error) {
+	attachBindShare = func(context.Context, transport.Endpoint, string) (bool, error) { return true, nil }
+	attachUnbindShare = func(context.Context, transport.Endpoint, string) error { return nil }
+	attachListFiles = func(context.Context, transport.Endpoint, string, string) ([]transport.PeerFile, string, error) {
 		return nil, providerID, nil
 	}
 	prompted := false
-	joinResolveDivergence = func(_ io.Writer, _ string, extras []string) (divergenceChoice, error) {
+	attachResolveDivergence = func(_ io.Writer, _ string, extras []string) (divergenceChoice, error) {
 		prompted = true
 		if len(extras) != 1 || extras[0] != "local-only.txt" {
 			t.Fatalf("prompted extras = %v", extras)
@@ -647,7 +710,7 @@ func TestJoinDivergenceMergeKeepsLocalExtras(t *testing.T) {
 		return divergenceMerge, nil
 	}
 	var stderr bytes.Buffer
-	if code := Join([]string{"notes", folder}, &stderr); code != joinExitOK {
+	if code := Attach([]string{"notes", folder}, &stderr); code != attachExitOK {
 		t.Fatalf("Join = %d, stderr = %q", code, stderr.String())
 	}
 	if !prompted {
@@ -661,24 +724,24 @@ func TestJoinDivergenceMergeKeepsLocalExtras(t *testing.T) {
 func TestJoinDivergenceDropTrashesLocalExtras(t *testing.T) {
 	folder, extraPath, providerID := joinDivergenceTestSetup(t)
 	originalFind, originalBind, originalUnbind, originalList, originalResolve :=
-		joinFindProvider, joinBindShare, joinUnbindShare, joinListFiles, joinResolveDivergence
+		attachFindProvider, attachBindShare, attachUnbindShare, attachListFiles, attachResolveDivergence
 	t.Cleanup(func() {
-		joinFindProvider, joinBindShare, joinUnbindShare, joinListFiles, joinResolveDivergence =
+		attachFindProvider, attachBindShare, attachUnbindShare, attachListFiles, attachResolveDivergence =
 			originalFind, originalBind, originalUnbind, originalList, originalResolve
 	})
-	joinFindProvider = func(context.Context, config.Config, string) (string, transport.Endpoint, error) {
+	attachFindProvider = func(context.Context, config.Config, string) (string, transport.Endpoint, error) {
 		return "phone", transport.Endpoint{Name: "phone"}, nil
 	}
-	joinBindShare = func(context.Context, transport.Endpoint, string) (bool, error) { return true, nil }
-	joinUnbindShare = func(context.Context, transport.Endpoint, string) error { return nil }
-	joinListFiles = func(context.Context, transport.Endpoint, string, string) ([]transport.PeerFile, string, error) {
+	attachBindShare = func(context.Context, transport.Endpoint, string) (bool, error) { return true, nil }
+	attachUnbindShare = func(context.Context, transport.Endpoint, string) error { return nil }
+	attachListFiles = func(context.Context, transport.Endpoint, string, string) ([]transport.PeerFile, string, error) {
 		return nil, providerID, nil
 	}
-	joinResolveDivergence = func(io.Writer, string, []string) (divergenceChoice, error) {
+	attachResolveDivergence = func(io.Writer, string, []string) (divergenceChoice, error) {
 		return divergenceDrop, nil
 	}
 	var stderr bytes.Buffer
-	if code := Join([]string{"notes", folder}, &stderr); code != joinExitOK {
+	if code := Attach([]string{"notes", folder}, &stderr); code != attachExitOK {
 		t.Fatalf("Join = %d, stderr = %q", code, stderr.String())
 	}
 	if _, err := os.Stat(extraPath); !errors.Is(err, os.ErrNotExist) {
@@ -688,21 +751,21 @@ func TestJoinDivergenceDropTrashesLocalExtras(t *testing.T) {
 
 func TestJoinDivergenceNonInteractiveErrorsAndCompensates(t *testing.T) {
 	folder, extraPath, providerID := joinDivergenceTestSetup(t)
-	originalFind, originalBind, originalUnbind, originalList := joinFindProvider, joinBindShare, joinUnbindShare, joinListFiles
+	originalFind, originalBind, originalUnbind, originalList := attachFindProvider, attachBindShare, attachUnbindShare, attachListFiles
 	t.Cleanup(func() {
-		joinFindProvider, joinBindShare, joinUnbindShare, joinListFiles = originalFind, originalBind, originalUnbind, originalList
+		attachFindProvider, attachBindShare, attachUnbindShare, attachListFiles = originalFind, originalBind, originalUnbind, originalList
 	})
-	joinFindProvider = func(context.Context, config.Config, string) (string, transport.Endpoint, error) {
+	attachFindProvider = func(context.Context, config.Config, string) (string, transport.Endpoint, error) {
 		return "phone", transport.Endpoint{Name: "phone"}, nil
 	}
-	joinBindShare = func(context.Context, transport.Endpoint, string) (bool, error) { return true, nil }
+	attachBindShare = func(context.Context, transport.Endpoint, string) (bool, error) { return true, nil }
 	unbound := false
-	joinUnbindShare = func(context.Context, transport.Endpoint, string) error { unbound = true; return nil }
-	joinListFiles = func(context.Context, transport.Endpoint, string, string) ([]transport.PeerFile, string, error) {
+	attachUnbindShare = func(context.Context, transport.Endpoint, string) error { unbound = true; return nil }
+	attachListFiles = func(context.Context, transport.Endpoint, string, string) ([]transport.PeerFile, string, error) {
 		return nil, providerID, nil
 	}
 	var stderr bytes.Buffer
-	if code := Join([]string{"notes", folder}, &stderr); code == joinExitOK {
+	if code := Attach([]string{"notes", folder}, &stderr); code == attachExitOK {
 		t.Fatal("Join succeeded on a divergence with no interactive answer")
 	}
 	if !unbound {
@@ -734,21 +797,21 @@ func TestFreshJoinListingFailureCompensatesOnlyNewRemoteBinding(t *testing.T) {
 	if err := config.Save(cfg); err != nil {
 		t.Fatal(err)
 	}
-	originalFind, originalBind, originalUnbind, originalList := joinFindProvider, joinBindShare, joinUnbindShare, joinListFiles
+	originalFind, originalBind, originalUnbind, originalList := attachFindProvider, attachBindShare, attachUnbindShare, attachListFiles
 	t.Cleanup(func() {
-		joinFindProvider, joinBindShare, joinUnbindShare, joinListFiles = originalFind, originalBind, originalUnbind, originalList
+		attachFindProvider, attachBindShare, attachUnbindShare, attachListFiles = originalFind, originalBind, originalUnbind, originalList
 	})
-	joinFindProvider = func(context.Context, config.Config, string) (string, transport.Endpoint, error) {
+	attachFindProvider = func(context.Context, config.Config, string) (string, transport.Endpoint, error) {
 		return "phone", transport.Endpoint{Name: "phone"}, nil
 	}
-	joinBindShare = func(context.Context, transport.Endpoint, string) (bool, error) { return true, nil }
+	attachBindShare = func(context.Context, transport.Endpoint, string) (bool, error) { return true, nil }
 	unbound := false
-	joinUnbindShare = func(context.Context, transport.Endpoint, string) error { unbound = true; return nil }
-	joinListFiles = func(context.Context, transport.Endpoint, string, string) ([]transport.PeerFile, string, error) {
+	attachUnbindShare = func(context.Context, transport.Endpoint, string) error { unbound = true; return nil }
+	attachListFiles = func(context.Context, transport.Endpoint, string, string) ([]transport.PeerFile, string, error) {
 		return nil, "", errors.New("authorization verification failed")
 	}
 	var stderr bytes.Buffer
-	if code := Join([]string{"notes", folder}, &stderr); code == joinExitOK {
+	if code := Attach([]string{"notes", folder}, &stderr); code == attachExitOK {
 		t.Fatal("Join succeeded after listing failure")
 	}
 	loaded, err := config.Load()
@@ -777,17 +840,17 @@ func TestFreshJoinPeerIdentityChangeCompensates(t *testing.T) {
 	if err := config.Save(cfg); err != nil {
 		t.Fatal(err)
 	}
-	originalFind, originalBind, originalUnbind, originalList := joinFindProvider, joinBindShare, joinUnbindShare, joinListFiles
+	originalFind, originalBind, originalUnbind, originalList := attachFindProvider, attachBindShare, attachUnbindShare, attachListFiles
 	t.Cleanup(func() {
-		joinFindProvider, joinBindShare, joinUnbindShare, joinListFiles = originalFind, originalBind, originalUnbind, originalList
+		attachFindProvider, attachBindShare, attachUnbindShare, attachListFiles = originalFind, originalBind, originalUnbind, originalList
 	})
-	joinFindProvider = func(context.Context, config.Config, string) (string, transport.Endpoint, error) {
+	attachFindProvider = func(context.Context, config.Config, string) (string, transport.Endpoint, error) {
 		return "phone", transport.Endpoint{Name: "phone"}, nil
 	}
-	joinBindShare = func(context.Context, transport.Endpoint, string) (bool, error) { return true, nil }
+	attachBindShare = func(context.Context, transport.Endpoint, string) (bool, error) { return true, nil }
 	unbound := false
-	joinUnbindShare = func(context.Context, transport.Endpoint, string) error { unbound = true; return nil }
-	joinListFiles = func(context.Context, transport.Endpoint, string, string) ([]transport.PeerFile, string, error) {
+	attachUnbindShare = func(context.Context, transport.Endpoint, string) error { unbound = true; return nil }
+	attachListFiles = func(context.Context, transport.Endpoint, string, string) ([]transport.PeerFile, string, error) {
 		changed, err := config.Load()
 		if err != nil {
 			return nil, "", err
@@ -798,7 +861,7 @@ func TestFreshJoinPeerIdentityChangeCompensates(t *testing.T) {
 		return nil, "", config.Save(changed)
 	}
 	var stderr bytes.Buffer
-	if code := Join([]string{"notes", folder}, &stderr); code == joinExitOK {
+	if code := Attach([]string{"notes", folder}, &stderr); code == attachExitOK {
 		t.Fatal("Join accepted changed RPC endpoint identity")
 	}
 	loaded, err := config.Load()
@@ -826,7 +889,7 @@ func TestJoinMarkerAndLocalBindingRegistrationAreIdempotent(t *testing.T) {
 	if err := guard.WriteMarker(folder, wantMarker); err != nil {
 		t.Fatal(err)
 	}
-	created, err := prepareJoinMarker(folder, "notes", wantMarker.ID)
+	created, err := prepareAttachMarker(folder, "notes", wantMarker.ID)
 	if err != nil || created {
 		t.Fatalf("prepare existing marker = %v, %v", created, err)
 	}
@@ -835,10 +898,10 @@ func TestJoinMarkerAndLocalBindingRegistrationAreIdempotent(t *testing.T) {
 	if err := config.Save(cfg); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := commitJoinedFolder("notes", folder, "phone", cfg.Peers["phone"], wantMarker.ID); err != nil {
+	if _, err := commitAttachedFolder("notes", folder, "phone", cfg.Peers["phone"], wantMarker.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := commitJoinedFolder("notes", folder, "phone", cfg.Peers["phone"], wantMarker.ID); err != nil {
+	if _, err := commitAttachedFolder("notes", folder, "phone", cfg.Peers["phone"], wantMarker.ID); err != nil {
 		t.Fatalf("idempotent registration: %v", err)
 	}
 	marker, err := guard.ReadMarker(folder)
@@ -903,7 +966,7 @@ func TestNowAndAddPreserveInvalidConfigExitClassification(t *testing.T) {
 		t.Fatalf("now exit = %d, stderr = %q", got, stderr.String())
 	}
 	stderr.Reset()
-	if got := Add([]string{"notes", folder}, &stderr); got != addExitInvalid {
+	if got := Share([]string{"notes", folder}, &stderr); got != shareExitInvalid {
 		t.Fatalf("add exit = %d, stderr = %q", got, stderr.String())
 	}
 	if _, err := os.Stat(guard.MarkerPath(folder)); !os.IsNotExist(err) {
@@ -1138,7 +1201,7 @@ func TestAddRejectsUnsafeName(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
 
 	var stderr bytes.Buffer
-	if got := add([]string{"My Project", sharePath}, &stderr); got != 1 {
+	if got := share([]string{"My Project", sharePath}, &stderr); got != 1 {
 		t.Fatalf("add exit code = %d, stderr = %q", got, stderr.String())
 	}
 	if !strings.Contains(stderr.String(), "folder name must contain only") {
@@ -1146,7 +1209,7 @@ func TestAddRejectsUnsafeName(t *testing.T) {
 	}
 
 	stderr.Reset()
-	if got := add([]string{"My_Project", sharePath}, &stderr); got != successExitCode {
+	if got := share([]string{"My_Project", sharePath}, &stderr); got != successExitCode {
 		t.Fatalf("add exit code = %d, stderr = %q", got, stderr.String())
 	}
 	loaded, err := config.Load()
@@ -1171,7 +1234,7 @@ func TestIndexCommitAndStatus(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
 	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
 	var stdout, stderr bytes.Buffer
-	if got := Add([]string{"notes", sharePath}, &stderr); got != successExitCode {
+	if got := Share([]string{"notes", sharePath}, &stderr); got != successExitCode {
 		t.Fatalf("add exit code = %d, stderr = %q", got, stderr.String())
 	}
 	stderr.Reset()
@@ -1203,7 +1266,7 @@ func TestIndexCommitDoesNotRewriteUnsupportedVersion(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
 	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
 	var stderr bytes.Buffer
-	if got := Add([]string{"notes", sharePath}, &stderr); got != successExitCode {
+	if got := Share([]string{"notes", sharePath}, &stderr); got != successExitCode {
 		t.Fatalf("add exit code = %d, stderr = %q", got, stderr.String())
 	}
 	marker, err := guard.ReadMarker(sharePath)

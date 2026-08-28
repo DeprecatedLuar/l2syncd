@@ -14,30 +14,30 @@ import (
 )
 
 const (
-	removeExitOK      = 0
-	removeExitError   = 1
-	removeExitInvalid = 2
+	unshareExitOK      = 0
+	unshareExitError   = 1
+	unshareExitInvalid = 2
 )
 
-// remove is the provider-side unilateral withdrawal of an offered folder
+// unshare is the provider-side unilateral withdrawal of an offered folder
 // (concept.md 8.1). It no longer refuses while consumers are bound: the
 // provider does not need their cooperation or reachability, and consumers
 // discover the withdrawal on their own next successful connection. It never
 // touches files, and it prunes the folder's index.
-func remove(cfg config.Config, args []string, stderr io.Writer) int {
+func unshare(cfg config.Config, args []string, stderr io.Writer) int {
 	if len(args) != 1 {
-		fmt.Fprintln(stderr, "usage: l2sync remove <name>")
-		return removeExitError
+		fmt.Fprintln(stderr, "usage: l2sync folder unshare <name>")
+		return unshareExitError
 	}
 	name := args[0]
 	if _, isRemote := cfg.Remote[name]; isRemote {
-		fmt.Fprintf(stderr, "l2sync: folder %q is a remote folder; use leave\n", name)
-		return removeExitError
+		fmt.Fprintf(stderr, "l2sync: folder %q is a remote folder; use folder detach\n", name)
+		return unshareExitError
 	}
 	sharedFolder, exists := cfg.Shared[name]
 	if !exists {
 		fmt.Fprintf(stderr, "l2sync: share %q not found\n", name)
-		return removeExitError
+		return unshareExitError
 	}
 	var folderID string
 	if marker, markerErr := guard.ReadMarker(sharedFolder.Path); markerErr == nil {
@@ -56,36 +56,36 @@ func remove(cfg config.Config, args []string, stderr io.Writer) int {
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "l2sync: save config: %v\n", err)
-		return removeExitError
+		return unshareExitError
 	}
 	if folderID != "" {
 		if err := pruneIndex(folderID); err != nil {
 			fmt.Fprintf(stderr, "l2sync: folder %q removed, but prune its index: %v\n", name, err)
-			return removeExitError
+			return unshareExitError
 		}
 	}
-	return removeExitOK
+	return unshareExitOK
 }
 
-// Remove withdraws a local shared folder offer without touching its files.
-func Remove(args []string, stderr io.Writer) (exitCode int) {
+// Unshare withdraws a local shared folder offer without touching its files.
+func Unshare(args []string, stderr io.Writer) (exitCode int) {
 	transactionLock, err := lock.AcquireJoinWait(context.Background(), lock.DefaultWait)
 	if err != nil {
 		fmt.Fprintf(stderr, "l2sync: acquire folder transaction lock: %v\n", err)
-		return removeExitError
+		return unshareExitError
 	}
 	defer func() {
 		if releaseErr := lock.Release(transactionLock); releaseErr != nil {
 			fmt.Fprintf(stderr, "l2sync: release folder transaction lock: %v\n", releaseErr)
-			if exitCode == removeExitOK {
-				exitCode = removeExitError
+			if exitCode == unshareExitOK {
+				exitCode = unshareExitError
 			}
 		}
 	}()
 	cfg, err := preflight.LoadConfig()
 	if err != nil {
 		fmt.Fprintf(stderr, "l2sync: %v\n", err)
-		return removeExitInvalid
+		return unshareExitInvalid
 	}
-	return remove(cfg, args, stderr)
+	return unshare(cfg, args, stderr)
 }

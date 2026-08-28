@@ -23,8 +23,8 @@ func setupIgnoreShare(t *testing.T) (name, sharePath string) {
 	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
 
 	var stderr bytes.Buffer
-	if got := Add([]string{"notes", sharePath}, &stderr); got != successExitCode {
-		t.Fatalf("add exit code = %d, stderr = %q", got, stderr.String())
+	if got := Share([]string{"notes", sharePath}, &stderr); got != successExitCode {
+		t.Fatalf("share exit code = %d, stderr = %q", got, stderr.String())
 	}
 	return "notes", sharePath
 }

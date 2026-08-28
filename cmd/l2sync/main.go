@@ -72,10 +72,16 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return exitOK
 	case "config", "conf":
 		return commands.ConfigEdit(args[1:], stderr)
-	case "add", "a":
-		return commands.Add(args[1:], stderr)
-	case "remove", "rm":
-		return commands.Remove(args[1:], stderr)
+	case "folder":
+		return commands.Folder(args[1:], stdout, stderr)
+	case "share":
+		return commands.Share(args[1:], stderr)
+	case "unshare":
+		return commands.Unshare(args[1:], stderr)
+	case "attach":
+		return commands.Attach(args[1:], stderr)
+	case "detach":
+		return commands.Detach(args[1:], stderr)
 	case "list", "ls":
 		if len(args) > 1 && args[1] == "connections" {
 			return commands.Connection(append([]string{"ls"}, args[2:]...), stdout, stderr)
@@ -84,10 +90,6 @@ func run(args []string, stdout, stderr io.Writer) int {
 			return commands.ListPeer(args[1:], stdout, stderr)
 		}
 		return commands.List(stdout, stderr)
-	case "join":
-		return commands.Join(args[1:], stderr)
-	case "leave":
-		return commands.Leave(args[1:], stderr)
 	case "ignore":
 		return commands.Ignore(args[1:], stdout, stderr)
 	case "serve":

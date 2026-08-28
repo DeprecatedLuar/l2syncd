@@ -24,136 +24,137 @@ import (
 )
 
 const (
-	joinExitOK          = 0
-	joinExitError       = 1
-	joinExitInvalid     = 2
-	joinExitUnreachable = 3
+	attachExitOK          = 0
+	attachExitError       = 1
+	attachExitInvalid     = 2
+	attachExitUnreachable = 3
 )
 
 var (
-	joinFindProvider = findProvider
-	joinBindShare    = transport.BindShare
-	joinUnbindShare  = transport.UnbindShare
-	joinListFiles    = transport.ListFiles
+	attachFindProvider = findProvider
+	attachBindShare    = transport.BindShare
+	attachUnbindShare  = transport.UnbindShare
+	attachListFiles    = transport.ListFiles
 )
 
-// Join finds exactly one peer offering a folder and registers its local path.
-func Join(args []string, stderr io.Writer) (exitCode int) {
-	if len(args) != 2 {
-		fmt.Fprintln(stderr, "usage: l2sync join <name> <path>")
-		return joinExitError
+// Attach finds exactly one peer offering a folder and registers its local path.
+func Attach(args []string, stderr io.Writer) (exitCode int) {
+	name, rawPath, createMissing, parseErr := parseSharePath(args)
+	if parseErr != nil {
+		fmt.Fprintln(stderr, "usage: l2sync folder attach <name> <path> [-p]")
+		return attachExitError
 	}
 	transactionLock, err := lock.AcquireJoinWait(context.Background(), lock.DefaultWait)
 	if err != nil {
-		fmt.Fprintf(stderr, "l2sync: acquire join transaction lock: %v\n", err)
-		return joinExitError
+		fmt.Fprintf(stderr, "l2sync: acquire attach transaction lock: %v\n", err)
+		return attachExitError
 	}
 	defer func() {
 		if releaseErr := lock.Release(transactionLock); releaseErr != nil {
-			fmt.Fprintf(stderr, "l2sync: release join transaction lock: %v\n", releaseErr)
-			if exitCode == joinExitOK {
-				exitCode = joinExitError
+			fmt.Fprintf(stderr, "l2sync: release attach transaction lock: %v\n", releaseErr)
+			if exitCode == attachExitOK {
+				exitCode = attachExitError
 			}
 		}
 	}()
 	cfg, err := preflight.LoadConfig()
 	if err != nil {
 		fmt.Fprintf(stderr, "l2sync: %v\n", err)
-		return joinExitInvalid
+		return attachExitInvalid
 	}
-	name := strings.ToLower(args[0])
+	name = strings.ToLower(name)
 	if err := sharename.Validate(name); err != nil {
 		fmt.Fprintf(stderr, "l2sync: %v\n", err)
-		return joinExitError
+		return attachExitError
 	}
-	path, err := filepath.Abs(args[1])
+	path, err := filepath.Abs(rawPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "l2sync: resolve folder path: %v\n", err)
-		return joinExitError
+		return attachExitError
 	}
-	info, err := os.Stat(path)
+	info, err := resolveFolderPath(path, rawPath, createMissing, stderr)
 	if err != nil {
-		fmt.Fprintf(stderr, "l2sync: folder %q: %v\n", args[1], err)
-		return joinExitError
+		fmt.Fprintf(stderr, "l2sync: folder %q: %v\n", rawPath, err)
+		return attachExitError
 	}
 	if !info.IsDir() {
-		fmt.Fprintf(stderr, "l2sync: folder %q is not a directory\n", args[1])
-		return joinExitError
+		fmt.Fprintf(stderr, "l2sync: folder %q is not a directory\n", rawPath)
+		return attachExitError
 	}
 	if _, exists := cfg.Shared[name]; exists {
 		fmt.Fprintf(stderr, "l2sync: folder %q already exists as shared\n", name)
-		return joinExitError
+		return attachExitError
 	}
 	if existing, exists := cfg.Remote[name]; exists {
 		if existing.Path != path {
 			fmt.Fprintf(stderr, "l2sync: folder %q already exists at %q\n", name, existing.Path)
-			return joinExitError
+			return attachExitError
 		}
 		if len(existing.Peers) != 1 {
 			fmt.Fprintf(stderr, "l2sync: folder %q has no recoverable peer binding\n", name)
-			return joinExitError
+			return attachExitError
 		}
 		boundPeer := existing.Peers[0]
 		endpoint, endpointErr := peerEndpoint(context.Background(), cfg, boundPeer)
 		if endpointErr != nil {
 			fmt.Fprintf(stderr, "l2sync: resume folder %q binding: %v\n", name, endpointErr)
-			return joinExitUnreachable
+			return attachExitUnreachable
 		}
 		expectedPeer := cfg.Peers[boundPeer]
-		created, bindErr := joinBindShare(context.Background(), endpoint, name)
+		created, bindErr := attachBindShare(context.Background(), endpoint, name)
 		if bindErr != nil {
 			fmt.Fprintf(stderr, "l2sync: resume folder %q binding to peer %q: %v\n", name, boundPeer, bindErr)
-			return joinExitUnreachable
+			return attachExitUnreachable
 		}
 		validated := false
 		validateErr := withConfigLocked(context.Background(), func(current *config.Config) error {
 			currentFolder := current.Remote[name]
 			if current.Peers[boundPeer] != expectedPeer || currentFolder.Path != path {
-				return fmt.Errorf("folder %q or peer %q changed during resumed join", name, boundPeer)
+				return fmt.Errorf("folder %q or peer %q changed during resumed attach", name, boundPeer)
 			}
 			if len(currentFolder.Peers) != 1 || currentFolder.Peers[0] != boundPeer {
-				return fmt.Errorf("folder %q binding changed during resumed join", name)
+				return fmt.Errorf("folder %q binding changed during resumed attach", name)
 			}
 			validated = true
 			return nil
 		})
 		if validateErr != nil {
 			if created && !validated {
-				validateErr = errors.Join(validateErr, joinUnbindShare(context.Background(), endpoint, name))
+				validateErr = errors.Join(validateErr, attachUnbindShare(context.Background(), endpoint, name))
 			}
 			fmt.Fprintf(stderr, "l2sync: validate resumed folder %q binding: %v\n", name, validateErr)
-			return joinExitError
+			return attachExitError
 		}
-		return joinExitOK
+		return attachExitOK
 	}
-	peerName, endpoint, err := joinFindProvider(context.Background(), cfg, name)
+	peerName, endpoint, err := attachFindProvider(context.Background(), cfg, name)
 	if err != nil {
 		fmt.Fprintf(stderr, "l2sync: %v\n", err)
 		if strings.Contains(err.Error(), "unreachable") {
-			return joinExitUnreachable
+			return attachExitUnreachable
 		}
-		return joinExitError
+		return attachExitError
 	}
 	expectedPeer := cfg.Peers[peerName]
-	remoteBindingCreated, err := joinBindShare(context.Background(), endpoint, name)
+	remoteBindingCreated, err := attachBindShare(context.Background(), endpoint, name)
 	if err != nil {
 		fmt.Fprintf(stderr, "l2sync: bind folder %q to peer %q: %v\n", name, peerName, err)
-		return joinExitUnreachable
+		return attachExitUnreachable
 	}
 	compensateRemote := func(cause error) error {
 		if !remoteBindingCreated {
 			return cause
 		}
-		return errors.Join(cause, joinUnbindShare(context.Background(), endpoint, name))
+		return errors.Join(cause, attachUnbindShare(context.Background(), endpoint, name))
 	}
-	remoteFiles, providerID, err := joinListFiles(context.Background(), endpoint, name, "")
+	remoteFiles, providerID, err := attachListFiles(context.Background(), endpoint, name, "")
 	if err != nil {
 		fmt.Fprintf(stderr, "l2sync: verify newly bound folder %q on peer %q: %v\n", name, peerName, compensateRemote(err))
-		return joinExitUnreachable
+		return attachExitUnreachable
 	}
 	if providerID == "" {
 		fmt.Fprintf(stderr, "l2sync: peer %q returned no folder identity for %q: %v\n", peerName, name, compensateRemote(errors.New("empty folder identity")))
-		return joinExitUnreachable
+		return attachExitUnreachable
 	}
 	var localIgnore []string
 	if existingMarker, markerErr := guard.ReadMarker(path); markerErr == nil {
@@ -162,40 +163,40 @@ func Join(args []string, stderr io.Writer) (exitCode int) {
 	extras, err := divergentLocalPaths(path, localIgnore, remoteFiles)
 	if err != nil {
 		fmt.Fprintf(stderr, "l2sync: compare folder %q against provider %q: %v\n", name, peerName, compensateRemote(err))
-		return joinExitError
+		return attachExitError
 	}
 	if len(extras) > 0 {
-		choice, promptErr := joinResolveDivergence(stderr, name, extras)
+		choice, promptErr := attachResolveDivergence(stderr, name, extras)
 		if promptErr != nil {
 			fmt.Fprintf(stderr, "l2sync: %v\n", compensateRemote(promptErr))
-			return joinExitError
+			return attachExitError
 		}
 		if choice == divergenceDrop {
 			if dropErr := dropLocalExtras(path, extras); dropErr != nil {
 				fmt.Fprintf(stderr, "l2sync: drop diverged local paths for folder %q: %v\n", name, compensateRemote(dropErr))
-				return joinExitError
+				return attachExitError
 			}
 		}
 	}
-	installed, err := commitJoinedFolder(name, path, peerName, expectedPeer, providerID)
+	installed, err := commitAttachedFolder(name, path, peerName, expectedPeer, providerID)
 	if err != nil {
 		if !installed {
 			err = compensateRemote(err)
 		}
 		fmt.Fprintf(stderr, "l2sync: save local folder binding: %v\n", err)
-		return joinExitError
+		return attachExitError
 	}
-	return joinExitOK
+	return attachExitOK
 }
 
-// prepareJoinMarker installs or validates the local marker for a folder being
-// registered at path under name. id is the folder's authoritative identity:
-// for add, a freshly generated id to use only if no marker exists yet
-// (add never overrides an existing marker's id, mirroring the existing
-// name-reuse behavior); for join, the provider's id, which an existing local
-// marker must already match -- a mismatch is a hard error naming both, never
-// resolved by preference (concept.md 5.9).
-func prepareJoinMarker(path, name, id string) (bool, error) {
+// prepareAttachMarker installs or validates the local marker for a folder
+// being registered at path under name. id is the folder's authoritative
+// identity: for share, a freshly generated id to use only if no marker
+// exists yet (share never overrides an existing marker's id, mirroring the
+// existing name-reuse behavior); for attach, the provider's id, which an
+// existing local marker must already match -- a mismatch is a hard error
+// naming both, never resolved by preference (concept.md 5.9).
+func prepareAttachMarker(path, name, id string) (bool, error) {
 	if _, err := os.Lstat(guard.MarkerPath(path)); err == nil {
 		marker, readErr := guard.ReadMarker(path)
 		if readErr != nil {
@@ -224,14 +225,14 @@ func prepareJoinMarker(path, name, id string) (bool, error) {
 	return true, nil
 }
 
-func commitJoinedFolder(name, path, peerName string, expectedPeer config.Peer, providerID string) (installed bool, err error) {
+func commitAttachedFolder(name, path, peerName string, expectedPeer config.Peer, providerID string) (installed bool, err error) {
 	err = withConfigLocked(context.Background(), func(current *config.Config) error {
 		peer, exists := current.Peers[peerName]
 		if !exists || peer.PublicKey == "" {
 			return fmt.Errorf("peer %q has no configured public key for binding", peerName)
 		}
 		if peer != expectedPeer {
-			return fmt.Errorf("peer %q connection identity changed during join", peerName)
+			return fmt.Errorf("peer %q connection identity changed during attach", peerName)
 		}
 		if _, exists := current.Shared[name]; exists {
 			return fmt.Errorf("folder %q already exists as shared", name)
@@ -249,7 +250,7 @@ func commitJoinedFolder(name, path, peerName string, expectedPeer config.Peer, p
 		if missingMatchingBinding {
 			return fmt.Errorf("existing remote folder %q has no matching peer binding", name)
 		}
-		markerCreated, err := prepareJoinMarker(path, name, providerID)
+		markerCreated, err := prepareAttachMarker(path, name, providerID)
 		if err != nil {
 			return fmt.Errorf("write folder marker: %w", err)
 		}
@@ -278,7 +279,7 @@ const (
 	divergenceMerge
 )
 
-var joinResolveDivergence = promptDivergenceInteractive
+var attachResolveDivergence = promptDivergenceInteractive
 
 // divergentLocalPaths walks root and returns, sorted, every regular file
 // path the provider's listing does not carry live. Symlinks and other
