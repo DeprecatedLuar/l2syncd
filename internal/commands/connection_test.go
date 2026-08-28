@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -14,6 +15,8 @@ import (
 
 	"l2syncd/internal/config"
 	connectionpkg "l2syncd/internal/connection"
+	"l2syncd/internal/guard"
+	"l2syncd/internal/index"
 	"l2syncd/internal/transport"
 )
 
@@ -94,7 +97,7 @@ func TestConnectionAddWithoutAccessRecordsPendingAndPrintsInvite(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
 	originalProbe := connectionProbe
 	originalInstall := connectionInstall
-	connectionProbe = func(context.Context, string) error { return errors.New("unreachable") }
+	connectionProbe = func(context.Context, string) error { return errors.New("Permission denied (publickey)") }
 	connectionInstall = func(context.Context, string, string, string, string) error {
 		t.Fatal("remote state was written")
 		return nil
@@ -114,6 +117,34 @@ func TestConnectionAddWithoutAccessRecordsPendingAndPrintsInvite(t *testing.T) {
 	}
 	if peer := cfg.Peers["friend"]; peer.PublicKey != "" {
 		t.Fatalf("pending peer = %#v", peer)
+	}
+}
+
+func TestConnectionAddUnreachableFailsWithoutWritingConfig(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
+	originalProbe := connectionProbe
+	originalInstall := connectionInstall
+	connectionProbe = func(context.Context, string) error {
+		return fmt.Errorf("%w: ssh: Could not resolve hostname bogus: Name or service not known", errSSHUnreachable)
+	}
+	connectionInstall = func(context.Context, string, string, string, string) error {
+		t.Fatal("remote state was written")
+		return nil
+	}
+	t.Cleanup(func() { connectionProbe, connectionInstall = originalProbe, originalInstall })
+
+	var stdout, stderr bytes.Buffer
+	if code := connectionAdd([]string{"bogus"}, strings.NewReader(""), &stdout, &stderr); code != connectionExitError {
+		t.Fatalf("connectionAdd = %d, stdout %q", code, stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "unreachable") {
+		t.Fatalf("stderr = %q", stderr.String())
+	}
+	if _, err := config.Load(); !errors.Is(err, config.ErrNotFound) {
+		t.Fatalf("config after unreachable probe = %v", err)
 	}
 }
 
@@ -154,11 +185,31 @@ func TestConnectionAddWithAccessActivatesPinnedPeer(t *testing.T) {
 	}
 }
 
-func TestConnectionRemoveRefusesBoundPeer(t *testing.T) {
+// forceNonInteractiveStdin points os.Stdin at a regular file for the
+// duration of the test: a regular file is never a character device, unlike
+// a real terminal (or /dev/null), so this deterministically forces the
+// non-interactive path regardless of how the test binary itself was invoked.
+func forceNonInteractiveStdin(t *testing.T, root string) {
+	t.Helper()
+	stdinFile, err := os.CreateTemp(root, "stdin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { stdinFile.Close() })
+	oldStdin := os.Stdin
+	os.Stdin = stdinFile
+	t.Cleanup(func() { os.Stdin = oldStdin })
+}
+
+// TestConnectionRemoveRefusesBoundPeerWithoutForce covers the non-interactive
+// path: connection rm never silently guesses a decision when folders are
+// bound to the peer, and tells the caller to use --force.
+func TestConnectionRemoveRefusesBoundPeerWithoutForce(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("HOME", root)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
 	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
+	forceNonInteractiveStdin(t, root)
 	cfg := config.New()
 	cfg.Peers["phone"] = config.Peer{Address: "phone"}
 	cfg.Shared["notes"] = config.Folder{Path: "/unused", Peers: []string{"phone"}}
@@ -166,8 +217,193 @@ func TestConnectionRemoveRefusesBoundPeer(t *testing.T) {
 		t.Fatal(err)
 	}
 	var stderr bytes.Buffer
-	if code := connectionRemove([]string{"phone"}, &stderr); code == connectionExitOK || !strings.Contains(stderr.String(), "still bound") {
+	code := connectionRemove([]string{"phone"}, &stderr)
+	if code == connectionExitOK || !strings.Contains(stderr.String(), "notes") || !strings.Contains(stderr.String(), "--force") {
 		t.Fatalf("connectionRemove = %d, stderr %q", code, stderr.String())
+	}
+	loaded, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := loaded.Peers["phone"]; !exists {
+		t.Fatal("peer was removed despite refusal")
+	}
+	if folder := loaded.Shared["notes"]; len(folder.Peers) != 1 || folder.Peers[0] != "phone" {
+		t.Fatalf("shared folder binding changed despite refusal: %#v", folder)
+	}
+}
+
+// TestConnectionRemoveForceUnbindsSharedFolder covers --force revoking a peer
+// bound to a shared folder: the peer and its grant are gone, but the shared
+// folder registration survives with its peers cleared (an unbound folder is
+// refused to everyone, so this alone cuts access).
+func TestConnectionRemoveForceUnbindsSharedFolder(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
+	key := generatedPublicKey(t, filepath.Join(root, "remote"))
+	paths, err := connectionpkg.DefaultPaths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := connectionpkg.AddGrant(paths.AuthorizedKeys, "phone", key); err != nil {
+		t.Fatal(err)
+	}
+	folder := filepath.Join(root, "notes")
+	if err := os.Mkdir(folder, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := guard.WriteMarker(folder, newTestMarker(t, "notes")); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.New()
+	cfg.Peers["phone"] = config.Peer{Address: "phone", PublicKey: key}
+	cfg.Shared["notes"] = config.Folder{Path: folder, Peers: []string{"phone"}}
+	if err := config.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	if code := connectionRemove([]string{"phone", "--force"}, &stderr); code != connectionExitOK {
+		t.Fatalf("connectionRemove = %d, stderr %q", code, stderr.String())
+	}
+	loaded, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := loaded.Peers["phone"]; exists {
+		t.Fatalf("peer remains: %#v", loaded.Peers["phone"])
+	}
+	sharedFolder, exists := loaded.Shared["notes"]
+	if !exists {
+		t.Fatal("shared folder registration was dropped, not unbound")
+	}
+	if len(sharedFolder.Peers) != 0 {
+		t.Fatalf("shared folder still bound: %#v", sharedFolder)
+	}
+	authorized, err := os.ReadFile(paths.AuthorizedKeys)
+	if err != nil || strings.Contains(string(authorized), "l2sync:phone") {
+		t.Fatalf("authorized_keys = %q, %v", authorized, err)
+	}
+}
+
+// TestConnectionRemoveForceDropsRemoteFolderAndPrunesIndex covers --force
+// revoking a peer bound to a remote folder: since that registration only
+// existed as the peer's offer, it is dropped (mirroring leave) and its index
+// is pruned.
+func TestConnectionRemoveForceDropsRemoteFolderAndPrunesIndex(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
+	folder := filepath.Join(root, "docs")
+	if err := os.Mkdir(folder, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	marker := newTestMarker(t, "docs")
+	if err := guard.WriteMarker(folder, marker); err != nil {
+		t.Fatal(err)
+	}
+	key := generatedPublicKey(t, filepath.Join(root, "remote"))
+	cfg := config.New()
+	cfg.Peers["phone"] = config.Peer{Address: "phone", PublicKey: key}
+	cfg.Remote["docs"] = config.Folder{Path: folder, Peers: []string{"phone"}}
+	if err := config.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := index.Save(index.New(marker.ID)); err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	if code := connectionRemove([]string{"phone", "--force"}, &stderr); code != connectionExitOK {
+		t.Fatalf("connectionRemove = %d, stderr %q", code, stderr.String())
+	}
+	loaded, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := loaded.Peers["phone"]; exists {
+		t.Fatalf("peer remains: %#v", loaded.Peers["phone"])
+	}
+	if _, exists := loaded.Remote["docs"]; exists {
+		t.Fatal("remote folder registration remains")
+	}
+	if _, err := os.Stat(folder); err != nil {
+		t.Fatalf("remote folder files were touched: %v", err)
+	}
+	indexPath, err := index.Path(marker.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(indexPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("connection rm left an index file behind: %v", err)
+	}
+}
+
+// TestConnectionRemoveConfigCommitFailureLeavesGrantRemovedForRetry covers
+// the crash-between-grant-removal-and-config-update window: the grant must
+// already be gone (access cut is not undone), and re-running must finish the
+// job.
+func TestConnectionRemoveConfigCommitFailureLeavesGrantRemovedForRetry(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
+	key := generatedPublicKey(t, filepath.Join(root, "remote"))
+	paths, err := connectionpkg.DefaultPaths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := connectionpkg.AddGrant(paths.AuthorizedKeys, "phone", key); err != nil {
+		t.Fatal(err)
+	}
+	folder := filepath.Join(root, "notes")
+	if err := os.Mkdir(folder, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := guard.WriteMarker(folder, newTestMarker(t, "notes")); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.New()
+	cfg.Peers["phone"] = config.Peer{Address: "phone", PublicKey: key}
+	cfg.Shared["notes"] = config.Folder{Path: folder, Peers: []string{"phone"}}
+	if err := config.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	originalSave := saveConfig
+	saveConfig = func(config.Config) error { return errors.New("injected save failure") }
+	var stderr bytes.Buffer
+	if code := connectionRemove([]string{"phone", "--force"}, &stderr); code == connectionExitOK {
+		t.Fatalf("connectionRemove succeeded despite injected save failure: %q", stderr.String())
+	}
+	saveConfig = originalSave
+
+	authorized, err := os.ReadFile(paths.AuthorizedKeys)
+	if err != nil || strings.Contains(string(authorized), "l2sync:phone") {
+		t.Fatalf("grant survived failed commit: authorized_keys = %q, %v", authorized, err)
+	}
+	loaded, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := loaded.Peers["phone"]; !exists {
+		t.Fatal("peer entry missing before retry")
+	}
+
+	stderr.Reset()
+	if code := connectionRemove([]string{"phone", "--force"}, &stderr); code != connectionExitOK {
+		t.Fatalf("retry connectionRemove = %d, stderr %q", code, stderr.String())
+	}
+	loaded, err = config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := loaded.Peers["phone"]; exists {
+		t.Fatalf("peer remains after retry: %#v", loaded.Peers["phone"])
+	}
+	if folder := loaded.Shared["notes"]; len(folder.Peers) != 0 {
+		t.Fatalf("shared folder still bound after retry: %#v", folder)
 	}
 }
 

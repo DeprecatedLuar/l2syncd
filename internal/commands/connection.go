@@ -3,13 +3,13 @@
 package commands
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"os/user"
 	"path/filepath"
 	"sort"
@@ -19,8 +19,11 @@ import (
 
 	"golang.org/x/term"
 
+	"l2syncd/internal/androidexec"
 	"l2syncd/internal/config"
 	connectionpkg "l2syncd/internal/connection"
+	"l2syncd/internal/guard"
+	"l2syncd/internal/lock"
 	"l2syncd/internal/peername"
 	"l2syncd/internal/transport"
 )
@@ -142,19 +145,27 @@ func connectionAdd(args []string, stdin io.Reader, stdout, stderr io.Writer) int
 		fmt.Fprintf(stderr, "l2sync: resolve destination: %v\n", err)
 		return connectionExitError
 	}
-	available := connectionProbe(context.Background(), resolved) == nil
+	probeErr := connectionProbe(context.Background(), resolved)
+	if probeErr != nil && errors.Is(probeErr, errSSHUnreachable) {
+		fmt.Fprintf(stderr, "l2sync: %s is unreachable via SSH: %v\n", resolved, probeErr)
+		return connectionExitError
+	}
+	available := probeErr == nil
 	if !available {
 		cfg.Peers[name] = config.Peer{Address: address}
 		if err := storePeerLocked(name, cfg.Peers[name]); err != nil {
 			fmt.Fprintf(stderr, "l2sync: save pending peer: %v\n", err)
 			return connectionExitError
 		}
-		localName, localAddress := installationAddress()
+		localName, localAddress, addressKnownGood := installationAddress()
 		command := fmt.Sprintf("l2sync connection add %s %s --key %q", localName, localAddress, localKey)
 		if isTerminalWriter(stdout) {
 			command = ansiBlue + command + ansiReset
 		}
-		fmt.Fprintf(stdout, "%s isn't reachable via SSH yet. Have someone run this there:\n\n  %s\n\n", resolved, command)
+		fmt.Fprintf(stdout, "%s is reachable but doesn't have your key yet. Have someone run this there:\n\n  %s\n\n", resolved, command)
+		if !addressKnownGood {
+			fmt.Fprintf(stdout, "warning: this machine's hostname (%q) won't resolve from another host — replace %q above with an address or hostname that actually reaches this machine.\n\n", localAddress, localAddress)
+		}
 		return connectionExitOK
 	}
 	peer := config.Peer{Address: address}
@@ -163,7 +174,7 @@ func connectionAdd(args []string, stdin io.Reader, stdout, stderr io.Writer) int
 		fmt.Fprintf(stderr, "l2sync: save pending peer: %v\n", err)
 		return connectionExitError
 	}
-	localName, localAddress := installationAddress()
+	localName, localAddress, _ := installationAddress()
 	if err := connectionInstall(context.Background(), resolved, localName, localAddress, localKey); err != nil {
 		fmt.Fprintf(stderr, "l2sync: install remote restricted grant: %v\n", err)
 		return connectionExitError
@@ -300,12 +311,34 @@ func connectionStatusSymbol(cfg config.Config, name string, peer config.Peer) st
 	return connectionStatusHealthy
 }
 
-func connectionRemove(args []string, stderr io.Writer) int {
-	if len(args) != 1 {
-		fmt.Fprintln(stderr, "usage: l2sync connection rm <name>")
+// connectionRemove always revokes: it cuts the peer's restricted SSH grant
+// first, then reconciles folder bookkeeping to match. A shared folder is
+// ours to keep, so it is only unbound (an unbound folder is refused to
+// everyone, concept.md 830-835); a remote folder existed only as that peer's
+// offer, so its registration and index are dropped, mirroring leave. It
+// never contacts the peer — revocation must work even when the peer is
+// unreachable or hostile.
+func connectionRemove(args []string, stderr io.Writer) (exitCode int) {
+	name, force, err := parseConnectionRemove(args)
+	if err != nil {
+		fmt.Fprintf(stderr, "l2sync: %v\n", err)
 		return connectionExitError
 	}
-	name := args[0]
+
+	transactionLock, err := lock.AcquireJoinWait(context.Background(), lock.DefaultWait)
+	if err != nil {
+		fmt.Fprintf(stderr, "l2sync: acquire folder transaction lock: %v\n", err)
+		return connectionExitError
+	}
+	defer func() {
+		if releaseErr := lock.Release(transactionLock); releaseErr != nil {
+			fmt.Fprintf(stderr, "l2sync: release folder transaction lock: %v\n", releaseErr)
+			if exitCode == connectionExitOK {
+				exitCode = connectionExitError
+			}
+		}
+	}()
+
 	cfg, err := loadConfigWithoutFolderPreflight()
 	if err != nil {
 		fmt.Fprintf(stderr, "l2sync: %v\n", err)
@@ -316,10 +349,30 @@ func connectionRemove(args []string, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "l2sync: peer %q not found\n", name)
 		return connectionExitError
 	}
-	if folder, bound := boundFolder(cfg, name); bound {
-		fmt.Fprintf(stderr, "l2sync: peer %q is still bound to folder %q\n", name, folder)
-		return connectionExitError
+
+	sharedTargets, remoteTargets := revocationTargets(cfg, name)
+	if !force && (len(sharedTargets) > 0 || len(remoteTargets) > 0) {
+		proceed, promptErr := promptRevocationInteractive(stderr, name, sharedTargets, remoteTargets)
+		if promptErr != nil {
+			fmt.Fprintf(stderr, "l2sync: %v\n", promptErr)
+			return connectionExitError
+		}
+		if !proceed {
+			fmt.Fprintln(stderr, "l2sync: revocation cancelled")
+			return connectionExitError
+		}
 	}
+
+	// Folder ids must be captured before the grant or config are touched:
+	// once the remote registration is gone, its marker can no longer be
+	// resolved from config alone.
+	folderIDs := make(map[string]string, len(remoteTargets))
+	for _, remoteName := range remoteTargets {
+		if marker, markerErr := guard.ReadMarker(cfg.Remote[remoteName].Path); markerErr == nil {
+			folderIDs[remoteName] = marker.ID
+		}
+	}
+
 	if peer.PublicKey != "" {
 		paths, err := connectionpkg.DefaultPaths()
 		if err != nil {
@@ -331,6 +384,7 @@ func connectionRemove(args []string, stderr io.Writer) int {
 			return connectionExitError
 		}
 	}
+
 	if err := updateConfigLocked(func(current *config.Config) error {
 		latest, exists := current.Peers[name]
 		if !exists {
@@ -339,30 +393,108 @@ func connectionRemove(args []string, stderr io.Writer) int {
 		if latest.PublicKey != peer.PublicKey || latest.Address != peer.Address {
 			return fmt.Errorf("peer %q changed during removal", name)
 		}
-		if folder, bound := boundFolder(*current, name); bound {
-			return fmt.Errorf("peer %q is still bound to folder %q", name, folder)
+		for _, sharedName := range sharedTargets {
+			folder, exists := current.Shared[sharedName]
+			if !exists {
+				continue
+			}
+			if len(folder.Peers) != 1 || folder.Peers[0] != name {
+				return fmt.Errorf("shared folder %q binding changed concurrently", sharedName)
+			}
+			folder.Peers = nil
+			current.Shared[sharedName] = folder
+		}
+		for _, remoteName := range remoteTargets {
+			folder, exists := current.Remote[remoteName]
+			if !exists {
+				continue
+			}
+			if len(folder.Peers) != 1 || folder.Peers[0] != name {
+				return fmt.Errorf("remote folder %q binding changed concurrently", remoteName)
+			}
+			delete(current.Remote, remoteName)
 		}
 		delete(current.Peers, name)
 		return nil
 	}); err != nil {
-		fmt.Fprintf(stderr, "l2sync: restricted grant removed, but remove peer entry: %v\n", err)
+		fmt.Fprintf(stderr, "l2sync: restricted grant removed, but update config: %v; folders left bound: %s\n", err, strings.Join(append(append([]string{}, sharedTargets...), remoteTargets...), ", "))
 		return connectionExitError
 	}
+
+	for _, remoteName := range remoteTargets {
+		id := folderIDs[remoteName]
+		if id == "" {
+			continue
+		}
+		if err := pruneIndex(id); err != nil {
+			fmt.Fprintf(stderr, "l2sync: peer %q revoked, but prune index for folder %q: %v\n", name, remoteName, err)
+			return connectionExitError
+		}
+	}
+
 	return connectionExitOK
 }
 
-func boundFolder(cfg config.Config, peerName string) (string, bool) {
+func parseConnectionRemove(args []string) (name string, force bool, err error) {
+	const usage = "usage: l2sync connection rm <name> [--force]"
+	switch len(args) {
+	case 1:
+		return args[0], false, nil
+	case 2:
+		if args[1] != "--force" {
+			return "", false, errors.New(usage)
+		}
+		return args[0], true, nil
+	default:
+		return "", false, errors.New(usage)
+	}
+}
+
+// promptRevocationInteractive asks for confirmation before revoking a peer
+// bound to folders. It never prompts when stdin is not a terminal: concept.md
+// 8.1 requires a non-interactive invocation needing a decision to be an
+// error, never a silently chosen default — the caller must pass --force.
+func promptRevocationInteractive(stderr io.Writer, peerName string, sharedTargets, remoteTargets []string) (bool, error) {
+	info, statErr := os.Stdin.Stat()
+	if statErr != nil || info.Mode()&os.ModeCharDevice == 0 {
+		names := append(append([]string{}, sharedTargets...), remoteTargets...)
+		return false, fmt.Errorf("peer %q is still bound to folder(s) %s; rerun interactively or pass --force to revoke anyway", peerName, strings.Join(names, ", "))
+	}
+	fmt.Fprintf(stderr, "%s bound to:\n", peerName)
+	for _, sharedName := range sharedTargets {
+		fmt.Fprintf(stderr, "  %s\n", sharedName)
+	}
+	for _, remoteName := range remoteTargets {
+		fmt.Fprintf(stderr, "  %s\n", remoteName)
+	}
+	fmt.Fprint(stderr, "revoke? [y/N]: ")
+	line, readErr := bufio.NewReader(os.Stdin).ReadString('\n')
+	answer := strings.ToLower(strings.TrimSpace(line))
+	if readErr != nil && answer == "" {
+		return false, nil
+	}
+	return answer == "y" || answer == "yes", nil
+}
+
+// revocationTargets reports the folders that will be affected by revoking
+// peerName, split by table: at most one shared folder and one remote folder
+// can bind a single peer (preflight.Validate enforces exactly-one/at-most-one
+// peer per folder), but both collections are returned in full for a stable,
+// readable confirmation listing.
+func revocationTargets(cfg config.Config, peerName string) (sharedTargets, remoteTargets []string) {
 	for name, folder := range cfg.Shared {
 		if len(folder.Peers) == 1 && folder.Peers[0] == peerName {
-			return name, true
+			sharedTargets = append(sharedTargets, name)
 		}
 	}
 	for name, folder := range cfg.Remote {
 		if len(folder.Peers) == 1 && folder.Peers[0] == peerName {
-			return name, true
+			remoteTargets = append(remoteTargets, name)
 		}
 	}
-	return "", false
+	sort.Strings(sharedTargets)
+	sort.Strings(remoteTargets)
+	return sharedTargets, remoteTargets
 }
 
 func parseConnectionAdd(args []string, stdin io.Reader) (string, string, string, error) {
@@ -432,9 +564,29 @@ func rejectDuplicatePeerKey(cfg config.Config, name, publicKey string) error {
 	return nil
 }
 
+// errSSHUnreachable marks a probe failure that ssh could not even get a
+// connection refused/accepted answer for (DNS failure, connection refused,
+// timeout, host key mismatch) as opposed to a clean auth rejection, which
+// means the destination is up but this installation's key isn't trusted yet.
+var errSSHUnreachable = errors.New("ssh destination unreachable")
+
 func probeExistingAccess(ctx context.Context, destination string) error {
-	cmd := exec.CommandContext(ctx, connectionSSH, "-T", "-o", "BatchMode=yes", "-o", "ControlMaster=no", "-o", "ControlPath=none", destination, "true")
-	return cmd.Run()
+	cmd, err := androidexec.CommandContext(ctx, connectionSSH, "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ControlMaster=no", "-o", "ControlPath=none", destination, "true")
+	if err != nil {
+		return fmt.Errorf("%w: %w", errSSHUnreachable, err)
+	}
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		return nil
+	}
+	detail := strings.TrimSpace(string(output))
+	if detail == "" {
+		detail = err.Error()
+	}
+	if strings.Contains(detail, "Permission denied") {
+		return fmt.Errorf("%s", detail)
+	}
+	return fmt.Errorf("%w: %s", errSSHUnreachable, detail)
 }
 
 func installRemoteGrant(ctx context.Context, destination, localName, localAddress, publicKey string) error {
@@ -444,7 +596,10 @@ func installRemoteGrant(ctx context.Context, destination, localName, localAddres
 	if !safeBootstrapAddress(localAddress) {
 		return errors.New("local bootstrap address contains unsafe characters")
 	}
-	cmd := exec.CommandContext(ctx, connectionSSH, "-T", "-o", "ControlMaster=no", "-o", "ControlPath=none", destination, connectionBinary, "connection", "add", localName, localAddress, "--key", "-")
+	cmd, err := androidexec.CommandContext(ctx, connectionSSH, "-T", "-o", "ControlMaster=no", "-o", "ControlPath=none", destination, connectionBinary, "connection", "add", localName, localAddress, "--key", "-")
+	if err != nil {
+		return err
+	}
 	cmd.Stdin = strings.NewReader(publicKey + "\n")
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -453,7 +608,23 @@ func installRemoteGrant(ctx context.Context, destination, localName, localAddres
 	return nil
 }
 
-func installationAddress() (string, string) {
+// unadvertisableHostnames are hostnames that resolve to "this machine" only
+// from the machine itself; printed as a peer address they would send the
+// remote side back to itself instead of to us.
+var unadvertisableHostnames = map[string]bool{
+	"localhost":     true,
+	"127.0.0.1":     true,
+	"::1":           true,
+	"ip6-localhost": true,
+}
+
+// installationAddress returns this installation's peer name and the address
+// to advertise it under, plus whether that address is actually likely to
+// reach this machine from elsewhere. os.Hostname() commonly returns
+// "localhost" (notably under Termux) or a bare LAN name a remote peer can't
+// resolve, so callers must surface the false case rather than presenting
+// the address as trustworthy.
+func installationAddress() (string, string, bool) {
 	host, err := os.Hostname()
 	if err != nil || host == "" {
 		host = "localhost"
@@ -465,7 +636,8 @@ func installationAddress() (string, string) {
 		}
 		return '-'
 	}, name)
-	return name, host
+	knownGood := !unadvertisableHostnames[strings.ToLower(host)]
+	return name, host, knownGood
 }
 
 func safeBootstrapAddress(value string) bool {

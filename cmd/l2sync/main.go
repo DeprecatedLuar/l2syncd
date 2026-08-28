@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"slices"
 
+	"l2syncd/internal/androidexec"
 	"l2syncd/internal/commands"
 	"l2syncd/internal/commands/help"
 )
@@ -28,7 +29,9 @@ const githubRepo = "DeprecatedLuar/l2syncd"
 // strip the path it was handed, so the process sees it ahead of the first real
 // argument. os.Executable() resolves to the linker on such a launch, which is
 // what distinguishes it from a direct exec.
-var androidLinkerNames = []string{"linker64", "linker"}
+//
+// internal/androidexec is the outbound half of the same mechanism, applied to
+// the subprocesses l2sync itself starts, and owns the linker names.
 
 // version is set at build time via -ldflags "-X main.version=...".
 var version = "dev"
@@ -51,7 +54,7 @@ func normalizeArgs(argv []string, executable string) []string {
 	if len(argv) < 2 || !filepath.IsAbs(argv[1]) {
 		return argv
 	}
-	if !slices.Contains(androidLinkerNames, filepath.Base(executable)) {
+	if !slices.Contains(androidexec.LinkerNames, filepath.Base(executable)) {
 		return argv
 	}
 	return append(argv[:1:1], argv[2:]...)
@@ -104,7 +107,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "l2sync: unknown index command")
 		return exitError
 	default:
-		fmt.Fprintf(stderr, "l2sync: command %q is not implemented yet\n", args[0])
+		fmt.Fprintf(stderr, "l2sync: unknown command %q\n", args[0])
 		return exitError
 	}
 }

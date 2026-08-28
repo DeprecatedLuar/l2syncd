@@ -23,6 +23,7 @@ import (
 	"syscall"
 	"time"
 
+	"l2syncd/internal/androidexec"
 	"l2syncd/internal/config"
 	"l2syncd/internal/connection"
 	"l2syncd/internal/lock"
@@ -1108,7 +1109,12 @@ func sshProcess(ctx context.Context, address, privateKey string, bulk bool) (*ex
 	if !bulk {
 		controlPath = safeControlSocketPath()
 	}
-	return exec.CommandContext(ctx, sshCommand, sshArguments(configPath, controlPath, privateKey, bulk)...), cleanup, nil
+	command, err := androidexec.CommandContext(ctx, sshCommand, sshArguments(configPath, controlPath, privateKey, bulk)...)
+	if err != nil {
+		cleanup()
+		return nil, nil, err
+	}
+	return command, cleanup, nil
 }
 
 func sshArguments(configPath, controlPath, privateKey string, bulk bool) []string {
@@ -1133,7 +1139,10 @@ func sshArguments(configPath, controlPath, privateKey string, bulk bool) []strin
 }
 
 func sanitizedSSHConfig(ctx context.Context, address string) (string, func(), error) {
-	command := exec.CommandContext(ctx, sshCommand, "-G", address)
+	command, err := androidexec.CommandContext(ctx, sshCommand, "-G", address)
+	if err != nil {
+		return "", nil, err
+	}
 	var output boundedBuffer
 	output.limit = sshConfigLimit
 	var stderr boundedBuffer
