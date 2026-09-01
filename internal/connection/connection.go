@@ -22,40 +22,58 @@ import (
 	"syscall"
 
 	"golang.org/x/sys/unix"
+	"l2syncd/internal/config"
 	"l2syncd/internal/peername"
 )
 
 const (
-	sshDirectoryMode = 0o700
-	privateKeyMode   = 0o600
-	publicKeyMode    = 0o644
-	authorizedMode   = 0o600
-	keyFilename      = "id_l2sync"
-	keyType          = "ssh-ed25519"
-	commentPrefix    = "l2sync:"
-	forcedBinary     = "l2sync"
-	fingerprintBytes = 12
+	credentialDirMode = 0o700
+	privateKeyMode    = 0o600
+	publicKeyMode     = 0o644
+	authorizedMode    = 0o600
+	keyFilename       = "id_l2sync"
+	keyType           = "ssh-ed25519"
+	commentPrefix     = "l2sync:"
+	forcedBinary      = "l2sync"
+	fingerprintBytes  = 12
 )
 
 // Paths identifies the installation key and grant files. It is explicit so
-// bootstrap behavior can be tested without touching a real SSH directory.
+// bootstrap behavior can be tested without touching real SSH or state
+// directories. The keypair and the grant file are deliberately not colocated:
+// the keypair is l2sync's own credential and lives under its XDG state
+// directory, while the grant file is sshd's authorized_keys, which only ever
+// lives at ~/.ssh/authorized_keys.
 type Paths struct {
 	PrivateKey     string
 	PublicKey      string
 	AuthorizedKeys string
 }
 
-// DefaultPaths returns paths under the current user's ~/.ssh directory.
+// DefaultPaths returns the installation keypair under the current user's
+// l2sync state directory and the grant file at ~/.ssh/authorized_keys.
+//
+// The keypair does not live in ~/.ssh. A key placed there next to its .pub
+// file is auto-loaded by ssh-agent implementations (e.g. gcr-ssh-agent) that
+// scan ~/.ssh for key pairs. Since this key is offered to every SSH
+// destination once loaded, and every peer's authorized_keys grant for it
+// carries a forced command and `restrict` (no shell, no PTY), an agent
+// offering it ahead of the user's real keys silently hijacks the user's own
+// interactive logins. Keeping the keypair out of ~/.ssh removes the
+// precondition entirely; do not move it back.
 func DefaultPaths() (Paths, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return Paths{}, fmt.Errorf("find home directory: %w", err)
 	}
-	sshDir := filepath.Join(home, ".ssh")
+	stateDir, err := config.StateDir()
+	if err != nil {
+		return Paths{}, err
+	}
 	return Paths{
-		PrivateKey:     filepath.Join(sshDir, keyFilename),
-		PublicKey:      filepath.Join(sshDir, keyFilename+".pub"),
-		AuthorizedKeys: filepath.Join(sshDir, "authorized_keys"),
+		PrivateKey:     filepath.Join(stateDir, keyFilename),
+		PublicKey:      filepath.Join(stateDir, keyFilename+".pub"),
+		AuthorizedKeys: filepath.Join(home, ".ssh", "authorized_keys"),
 	}, nil
 }
 
@@ -113,8 +131,8 @@ func EnsureKey(paths Paths) (string, error) {
 		}
 		return normalized, nil
 	}
-	if err := os.MkdirAll(filepath.Dir(paths.PrivateKey), sshDirectoryMode); err != nil {
-		return "", fmt.Errorf("create SSH directory: %w", err)
+	if err := os.MkdirAll(filepath.Dir(paths.PrivateKey), credentialDirMode); err != nil {
+		return "", fmt.Errorf("create credential directory: %w", err)
 	}
 	if err := validateCredentialDirectory(filepath.Dir(paths.PrivateKey)); err != nil {
 		return "", err
@@ -137,14 +155,14 @@ func EnsureKey(paths Paths) (string, error) {
 	}
 	directory, err := os.Open(filepath.Dir(paths.PrivateKey))
 	if err != nil {
-		return "", fmt.Errorf("open SSH directory for sync: %w", err)
+		return "", fmt.Errorf("open credential directory for sync: %w", err)
 	}
 	if err := directory.Sync(); err != nil {
 		directory.Close()
-		return "", fmt.Errorf("sync SSH directory: %w", err)
+		return "", fmt.Errorf("sync credential directory: %w", err)
 	}
 	if err := directory.Close(); err != nil {
-		return "", fmt.Errorf("close SSH directory: %w", err)
+		return "", fmt.Errorf("close credential directory: %w", err)
 	}
 	return publicLine, nil
 }
@@ -238,7 +256,7 @@ func addGrant(path, peer, publicKey string) error {
 			return errors.New("public key already exists in an unmanaged or differently restricted authorized_keys line")
 		}
 	}
-	if err := os.MkdirAll(filepath.Dir(path), sshDirectoryMode); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), credentialDirMode); err != nil {
 		return fmt.Errorf("create SSH directory: %w", err)
 	}
 	updated := append([]byte(nil), contents...)
@@ -329,14 +347,14 @@ func validateCredentialDirectory(path string) error {
 		return err
 	}
 	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("SSH credential directory %q is not a real directory", path)
+		return fmt.Errorf("credential directory %q is not a real directory", path)
 	}
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	if !ok || int(stat.Uid) != os.Geteuid() {
-		return fmt.Errorf("SSH credential directory %q is not owned by the current user", path)
+		return fmt.Errorf("credential directory %q is not owned by the current user", path)
 	}
 	if info.Mode().Perm()&0o022 != 0 {
-		return fmt.Errorf("SSH credential directory %q is group- or other-writable", path)
+		return fmt.Errorf("credential directory %q is group- or other-writable", path)
 	}
 	return nil
 }
@@ -416,7 +434,7 @@ func replaceFile(path string, contents []byte, mode fs.FileMode) error {
 }
 
 func withAuthorizedLock(path string, operation func() error) error {
-	if err := os.MkdirAll(filepath.Dir(path), sshDirectoryMode); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), credentialDirMode); err != nil {
 		return fmt.Errorf("create SSH directory: %w", err)
 	}
 	if err := validateCredentialDirectory(filepath.Dir(path)); err != nil {

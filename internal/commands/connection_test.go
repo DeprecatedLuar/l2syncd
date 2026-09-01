@@ -20,12 +20,21 @@ import (
 	"l2syncd/internal/transport"
 )
 
+// fixtureKeyDir is where generatedPublicKey stages a keypair for use as
+// fixture material (typically a peer's public key). It is deliberately not
+// ".ssh": these files are test scaffolding, not the on-disk locations
+// production code resolves via connection.DefaultPaths(). A test that needs
+// the generated key discoverable as this machine's own installation
+// identity must additionally install it at DefaultPaths() itself (see
+// installLocalFixtureKey in commands_test.go).
+const fixtureKeyDir = ".fixture-key"
+
 func generatedPublicKey(t *testing.T, root string) string {
 	t.Helper()
 	paths := connectionpkg.Paths{
-		PrivateKey:     filepath.Join(root, ".ssh", "id_l2sync"),
-		PublicKey:      filepath.Join(root, ".ssh", "id_l2sync.pub"),
-		AuthorizedKeys: filepath.Join(root, ".ssh", "authorized_keys"),
+		PrivateKey:     filepath.Join(root, fixtureKeyDir, "id_l2sync"),
+		PublicKey:      filepath.Join(root, fixtureKeyDir, "id_l2sync.pub"),
+		AuthorizedKeys: filepath.Join(root, fixtureKeyDir, "authorized_keys"),
 	}
 	key, err := connectionpkg.EnsureKey(paths)
 	if err != nil {

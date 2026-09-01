@@ -10,10 +10,12 @@ import (
 	"testing"
 )
 
+// testPaths mirrors production: the keypair lives under a state-like
+// directory separate from ~/.ssh, which holds only authorized_keys.
 func testPaths(root string) Paths {
 	return Paths{
-		PrivateKey:     filepath.Join(root, ".ssh", "id_l2sync"),
-		PublicKey:      filepath.Join(root, ".ssh", "id_l2sync.pub"),
+		PrivateKey:     filepath.Join(root, "state", "id_l2sync"),
+		PublicKey:      filepath.Join(root, "state", "id_l2sync.pub"),
 		AuthorizedKeys: filepath.Join(root, ".ssh", "authorized_keys"),
 	}
 }
@@ -118,6 +120,9 @@ func TestGrantRejectsExistingUnrestrictedKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := os.MkdirAll(filepath.Dir(paths.AuthorizedKeys), 0o700); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(paths.AuthorizedKeys, []byte(key+" login-key\n"), authorizedMode); err != nil {
 		t.Fatal(err)
 	}
@@ -130,6 +135,9 @@ func TestGrantParserIgnoresKeyWordsInsideQuotedOptions(t *testing.T) {
 	paths := testPaths(t.TempDir())
 	key, err := EnsureKey(paths)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(paths.AuthorizedKeys), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	line := `command="printf ssh-ed25519 harmless",environment="NOTE=ssh-ed25519" ` + key + " unrestricted\n"
@@ -178,6 +186,9 @@ func TestGrantRejectsUnsafeAuthorizedKeysPaths(t *testing.T) {
 			paths := testPaths(t.TempDir())
 			key, err := EnsureKey(paths)
 			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(filepath.Dir(paths.AuthorizedKeys), 0o700); err != nil {
 				t.Fatal(err)
 			}
 			test.setup(t, paths)

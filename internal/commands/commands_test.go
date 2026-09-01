@@ -549,12 +549,41 @@ func cycleTestConfig(t *testing.T, localInitiator bool) (string, config.Config) 
 	t.Setenv("HOME", root)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
 	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
+	installLocalFixtureKey(t, root)
 	if err := os.Mkdir(filepath.Join(root, "notes"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	cfg := config.New()
 	cfg.Peers["phone"] = config.Peer{Address: "phone", PublicKey: remoteKey}
 	return root, cfg
+}
+
+// installLocalFixtureKey copies the keypair generatedPublicKey already
+// generated under root's fixture path into wherever DefaultPaths() resolves
+// for the environment just configured for root, so the fingerprint computed
+// above for role resolution matches the key EnsureKey finds at runtime.
+func installLocalFixtureKey(t *testing.T, root string) {
+	t.Helper()
+	paths, err := connection.DefaultPaths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(paths.PrivateKey), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	copyFixtureFile(t, filepath.Join(root, fixtureKeyDir, "id_l2sync"), paths.PrivateKey, 0o600)
+	copyFixtureFile(t, filepath.Join(root, fixtureKeyDir, "id_l2sync.pub"), paths.PublicKey, 0o644)
+}
+
+func copyFixtureFile(t *testing.T, src, dst string, mode os.FileMode) {
+	t.Helper()
+	data, err := os.ReadFile(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dst, data, mode); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestFreshJoinBindsBeforeAuthorizedListing(t *testing.T) {
