@@ -299,6 +299,12 @@ func TestReconcileSkipsIgnoredFilesAndSymlinks(t *testing.T) {
 	if err := os.Symlink("/outside", filepath.Join(root, "link")); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(root, ".gitignore"), []byte("*.secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "leaked.secret"), []byte("token"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 
 	result, err := Reconcile(root, index.New("test-id"), []string{"custom.txt"}, testFingerprint)
 	if err != nil {
@@ -307,12 +313,15 @@ func TestReconcileSkipsIgnoredFilesAndSymlinks(t *testing.T) {
 	if _, found := result.Index.Entries["node_modules/package.json"]; found {
 		t.Fatal("ignored file entered the index")
 	}
+	if _, found := result.Index.Entries["leaked.secret"]; found {
+		t.Fatal("gitignored file entered the index")
+	}
 	if len(result.Skipped) != 1 || result.Skipped[0] != "link" {
 		t.Fatalf("skipped = %#v, want [link]", result.Skipped)
 	}
 }
 
-func TestReconcileDropsNowIgnoredEntryWithoutReportingADeletion(t *testing.T) {
+func TestReconcileCarriesNowIgnoredEntryForwardWithoutReportingADeletion(t *testing.T) {
 	root := t.TempDir()
 	writeTestMarker(t, root)
 	if err := os.WriteFile(filepath.Join(root, "keep.txt"), []byte("keep"), 0o600); err != nil {
@@ -330,10 +339,50 @@ func TestReconcileDropsNowIgnoredEntryWithoutReportingADeletion(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(second.Changes) != 0 {
-		t.Fatalf("changes = %#v, want none: a newly ignored path is dropped, not reported deleted", second.Changes)
+		t.Fatalf("changes = %#v, want none: a newly ignored path is carried forward, not reported deleted", second.Changes)
 	}
-	if _, ok := second.Index.Entries["keep.txt"]; ok {
-		t.Fatal("now-ignored entry was carried forward")
+	carried, ok := second.Index.Entries["keep.txt"]
+	if !ok {
+		t.Fatal("now-ignored entry was dropped instead of carried forward")
+	}
+	// Carrying the exact prior version (not a fresh one) is what keeps this
+	// entry causally Equal to whatever a peer still holds for it, so an
+	// ignore-only local change can never trigger a pull-back of the file a
+	// peer already has (concept.md 5.8).
+	if vector.Compare(carried.Version, first.Index.Entries["keep.txt"].Version) != vector.Equal {
+		t.Fatalf("carried version = %v, want unchanged from before it became ignored", carried.Version)
+	}
+}
+
+func TestReconcileCarriesNowGitignoredEntryForward(t *testing.T) {
+	root := t.TempDir()
+	writeTestMarker(t, root)
+	if err := os.WriteFile(filepath.Join(root, "secret.env"), []byte("token"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	first, err := Reconcile(root, index.New("test-id"), nil, testFingerprint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := first.Index.Entries["secret.env"]; !ok {
+		t.Fatal("setup failed: secret.env was not tracked")
+	}
+	if err := os.WriteFile(filepath.Join(root, ".gitignore"), []byte("secret.env\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	second, err := Reconcile(root, first.Index, nil, testFingerprint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// .gitignore itself is an ordinary tracked file: it is added, secret.env
+	// is carried forward untouched, nothing is reported deleted.
+	if len(second.Changes) != 1 || second.Changes[0].Path != ".gitignore" || second.Changes[0].Kind != Added {
+		t.Fatalf("changes = %#v, want only .gitignore added", second.Changes)
+	}
+	carried, ok := second.Index.Entries["secret.env"]
+	if !ok || vector.Compare(carried.Version, first.Index.Entries["secret.env"].Version) != vector.Equal {
+		t.Fatalf("carried secret.env = %#v, want unchanged version", carried)
 	}
 }
 

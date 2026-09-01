@@ -290,6 +290,7 @@ func divergentLocalPaths(root string, patterns []string, providerFiles []transpo
 	if err != nil {
 		return nil, err
 	}
+	gitignore := guard.NewGitIgnore(root)
 	providerPaths := make(map[string]bool, len(providerFiles))
 	for _, file := range providerFiles {
 		if file.Deleted || file.Directory {
@@ -316,7 +317,11 @@ func divergentLocalPaths(root string, patterns []string, providerFiles []transpo
 			}
 			return nil
 		}
-		if guard.DefaultIgnorePath(relative) || ignore.Match(relative, entry.IsDir()) {
+		gitIgnored, err := gitignore.Match(relative, entry.IsDir())
+		if err != nil {
+			return fmt.Errorf("match gitignore for %q: %w", relative, err)
+		}
+		if guard.DefaultIgnorePath(relative) || ignore.Match(relative, entry.IsDir()) || gitIgnored {
 			if entry.IsDir() {
 				return filepath.SkipDir
 			}

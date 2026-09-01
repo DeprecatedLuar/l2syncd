@@ -50,19 +50,26 @@ func (ignore Ignore) Match(relative string, isDir bool) bool {
 		if candidate.directory && !isDir {
 			continue
 		}
-		if candidate.anySegment {
-			for _, part := range parts {
-				if matchSegment(candidate.parts[0], part) {
-					return true
-				}
-			}
-			continue
-		}
-		if matchParts(candidate.parts, parts) {
+		if matchPatternParts(candidate, parts) {
 			return true
 		}
 	}
 	return false
+}
+
+// matchPatternParts reports whether parts match p, dispatching to the
+// any-depth basename form or the full anchored form. Shared with GitIgnore,
+// whose rules reuse the same pattern representation.
+func matchPatternParts(p pattern, parts []string) bool {
+	if p.anySegment {
+		for _, part := range parts {
+			if matchSegment(p.parts[0], part) {
+				return true
+			}
+		}
+		return false
+	}
+	return matchParts(p.parts, parts)
 }
 
 func matchParts(patterns, values []string) bool {

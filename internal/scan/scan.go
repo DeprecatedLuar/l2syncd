@@ -97,6 +97,7 @@ func Reconcile(root string, previous index.Index, patterns []string, fingerprint
 	if err != nil {
 		return Result{}, err
 	}
+	gitignore := guard.NewGitIgnore(root)
 	next := index.New(previous.ID)
 	changes := make([]Change, 0)
 	skipped := make([]string, 0)
@@ -120,7 +121,11 @@ func Reconcile(root string, previous index.Index, patterns []string, fingerprint
 			}
 			return nil
 		}
-		if guard.DefaultIgnorePath(relative) || ignore.Match(relative, entry.IsDir()) {
+		gitIgnored, err := gitignore.Match(relative, entry.IsDir())
+		if err != nil {
+			return fmt.Errorf("match gitignore for %q: %w", relative, err)
+		}
+		if guard.DefaultIgnorePath(relative) || ignore.Match(relative, entry.IsDir()) || gitIgnored {
 			if entry.IsDir() {
 				return filepath.SkipDir
 			}
@@ -194,7 +199,18 @@ func Reconcile(root string, previous index.Index, patterns []string, fingerprint
 		if seen[path] {
 			continue
 		}
-		if guard.DefaultIgnorePath(path) || ignore.Match(path, false) {
+		gitIgnored, err := gitignore.Match(path, false)
+		if err != nil {
+			return Result{}, fmt.Errorf("match gitignore for %q: %w", path, err)
+		}
+		if guard.DefaultIgnorePath(path) || ignore.Match(path, false) || gitIgnored {
+			// A path that is now ignored (by any layer) is carried forward
+			// unchanged rather than dropped or tombstoned. Dropping it would
+			// leave it at an all-zero version vector; if a peer still holds
+			// the entry with a non-zero vector, the peer's copy would read
+			// as causally ahead and get pulled straight back
+			// (concept.md 5.8).
+			next.Entries[path] = previousEntry
 			continue
 		}
 		if previousEntry.Deleted {
