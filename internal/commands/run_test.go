@@ -18,61 +18,39 @@ import (
 	"l2syncd/internal/index"
 )
 
-func TestExecuteCycleLogsSummary(t *testing.T) {
+func TestExecuteCycleResetsPeerOnSuccess(t *testing.T) {
 	var output bytes.Buffer
-	logger := slog.New(slog.NewTextHandler(&output, nil)).With("component", "daemon")
-	retry := stoppedTimer(t)
-
-	delay := executeCycle(
-		context.Background(),
-		logger,
-		retry,
-		runBackoffMax,
-		cycleTriggerFilesystem,
-		func(context.Context) (CycleSummary, error) {
-			return CycleSummary{Folders: 2, Actions: 3}, nil
-		},
-	)
-
-	if delay != runBackoffStart {
-		t.Fatalf("next delay = %v, want %v", delay, runBackoffStart)
+	logger := slog.New(slog.NewTextHandler(&output, nil))
+	backoff := newPeerBackoff()
+	backoff.Fail("phone", time.Now())
+	executeCycle(context.Background(), logger, stoppedTimer(t), backoff, cycleTriggerFilesystem,
+		func(context.Context, func(string) bool) (CycleSummary, error) {
+			return CycleSummary{Folders: 1, Actions: 3, Outcomes: []FolderOutcome{{Name: "notes", Peer: "phone", Committed: true, Actions: 3}}}, nil
+		})
+	if _, waiting := backoff.Next(time.Now()); waiting {
+		t.Fatal("successful peer still backing off")
 	}
-	assertLogContains(t, output.String(),
-		`level=INFO msg="sync cycle started"`,
-		`trigger=filesystem`,
-		`level=INFO msg="sync cycle completed"`,
-		`folders=2`,
-		`actions=3`,
-	)
+	assertLogContains(t, output.String(), `msg="sync cycle completed"`, `actions=3`)
 }
 
-func TestExecuteCycleLogsFailureAndRetry(t *testing.T) {
+func TestExecuteCycleBacksOffOnlyFailedPeer(t *testing.T) {
 	var output bytes.Buffer
-	logger := slog.New(slog.NewTextHandler(&output, nil)).With("component", "daemon")
-	retry := stoppedTimer(t)
-
-	delay := executeCycle(
-		context.Background(),
-		logger,
-		retry,
-		runBackoffStart,
-		cycleTriggerRetry,
-		func(context.Context) (CycleSummary, error) {
-			return CycleSummary{Folders: 1, Actions: 2}, errors.New("peer unreachable")
-		},
-	)
-
-	if delay != 2*runBackoffStart {
-		t.Fatalf("next delay = %v, want %v", delay, 2*runBackoffStart)
+	logger := slog.New(slog.NewTextHandler(&output, nil))
+	backoff := newPeerBackoff()
+	executeCycle(context.Background(), logger, stoppedTimer(t), backoff, cycleTriggerRetry,
+		func(context.Context, func(string) bool) (CycleSummary, error) {
+			return CycleSummary{Folders: 1, Outcomes: []FolderOutcome{
+				{Name: "notes", Peer: "phone", Committed: true},
+				{Name: "pics", Peer: "raspberries"},
+			}}, errors.New("pics: peer unreachable")
+		})
+	if backoff.Ready("raspberries", time.Now()) {
+		t.Fatal("failed peer not backing off")
 	}
-	assertLogContains(t, output.String(),
-		`level=ERROR msg="sync cycle failed"`,
-		`trigger=retry`,
-		`folders_completed=1`,
-		`actions_completed=2`,
-		`retry_in=1s`,
-		`error="peer unreachable"`,
-	)
+	if !backoff.Ready("phone", time.Now()) {
+		t.Fatal("healthy peer backing off")
+	}
+	assertLogContains(t, output.String(), `msg="sync cycle failed"`, `error="pics: peer unreachable"`)
 }
 
 func stoppedTimer(t *testing.T) *time.Timer {
@@ -265,42 +243,38 @@ func TestBoundCyclePeersDeduplicatesAcrossFolders(t *testing.T) {
 	}
 }
 
-func TestSeedPeerReachabilityDoesNotReportReconnect(t *testing.T) {
-	cfg := config.New()
-	cfg.Peers["phone"] = config.Peer{Address: "phone", PublicKey: "key"}
-	cfg.Remote["photos"] = config.Folder{Path: "/photos", Peers: []string{"phone"}}
-
-	reachable := make(map[string]bool)
-	seedPeerReachability(context.Background(), cfg, reachable, func(context.Context, config.Config, string) bool {
-		return true
-	})
-	if !reachable["phone"] {
-		t.Fatal("seed did not record reachable peer")
+func TestApplyReachabilityReportsOnlyTransitions(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+	reachable := map[string]bool{"phone": false, "vps": true}
+	got := applyReachability(reachable, map[string]bool{"phone": true, "vps": true}, logger)
+	if len(got) != 1 || got[0] != "phone" {
+		t.Fatalf("reconnected = %v, want [phone]", got)
+	}
+	if again := applyReachability(reachable, map[string]bool{"phone": true}, logger); len(again) != 0 {
+		t.Fatalf("already-reachable peer reported again: %v", again)
 	}
 }
 
-func TestPollPeerReachabilityFiresOnlyOnTransition(t *testing.T) {
-	cfg := config.New()
-	cfg.Peers["phone"] = config.Peer{Address: "phone", PublicKey: "key"}
-	cfg.Shared["notes"] = config.Folder{Path: "/notes", Peers: []string{"phone"}}
-	reachable := map[string]bool{"phone": false}
-	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
-
-	unreachable := func(context.Context, config.Config, string) bool { return false }
-	if pollPeerReachability(context.Background(), cfg, reachable, logger, unreachable) {
-		t.Fatal("still-unreachable peer reported as reconnected")
+func TestProbePeersRunsConcurrently(t *testing.T) {
+	release := make(chan struct{})
+	started := make(chan struct{}, 2)
+	probe := func(context.Context, config.Config, string) bool {
+		started <- struct{}{}
+		<-release
+		return true
 	}
-
-	reachableProbe := func(context.Context, config.Config, string) bool { return true }
-	if !pollPeerReachability(context.Background(), cfg, reachable, logger, reachableProbe) {
-		t.Fatal("peer transitioning to reachable was not reported")
+	done := make(chan map[string]bool)
+	go func() { done <- probePeers(context.Background(), config.New(), []string{"a", "b"}, probe) }()
+	for range 2 {
+		select {
+		case <-started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("probes did not start concurrently")
+		}
 	}
-	if !reachable["phone"] {
-		t.Fatal("reachable state not updated after transition")
-	}
-
-	if pollPeerReachability(context.Background(), cfg, reachable, logger, reachableProbe) {
-		t.Fatal("already-reachable peer re-reported as reconnected")
+	close(release)
+	if results := <-done; !results["a"] || !results["b"] {
+		t.Fatalf("results = %v", results)
 	}
 }
 

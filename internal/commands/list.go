@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"sync"
 
 	"l2syncd/internal/config"
 	"l2syncd/internal/guard"
@@ -54,9 +55,22 @@ func listWithLister(cfg config.Config, args []string, stdout, stderr io.Writer, 
 	} else {
 		peerNames = sortedKeys(cfg.Peers)
 	}
-	for _, peerName := range peerNames {
-		shares, err := listShares(context.Background(), peerName)
-		if err != nil {
+	type peerListing struct {
+		shares []string
+		err    error
+	}
+	listings := make([]peerListing, len(peerNames))
+	var group sync.WaitGroup
+	for i, peerName := range peerNames {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			listings[i].shares, listings[i].err = listShares(context.Background(), peerName)
+		}()
+	}
+	group.Wait()
+	for i, peerName := range peerNames {
+		if err := listings[i].err; err != nil {
 			networkFailure = true
 			peerFailed[peerName] = true
 			if len(args) == 1 && args[0] == peerName {
@@ -64,7 +78,7 @@ func listWithLister(cfg config.Config, args []string, stdout, stderr io.Writer, 
 			}
 			continue
 		}
-		peerShares[peerName] = shares
+		peerShares[peerName] = listings[i].shares
 	}
 
 	for _, name := range sortedEntryNames(cfg) {

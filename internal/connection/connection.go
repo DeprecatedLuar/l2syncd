@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -77,10 +78,16 @@ func DefaultPaths() (Paths, error) {
 	}, nil
 }
 
+// ensureKeyMutex serializes in-process callers so concurrent first use
+// generates the key pair once.
+var ensureKeyMutex sync.Mutex
+
 // EnsureKey returns the installation public key, generating the Ed25519 key
 // pair when neither key file exists. Partial or inconsistent key material is
 // an error and is never silently repaired.
 func EnsureKey(paths Paths) (string, error) {
+	ensureKeyMutex.Lock()
+	defer ensureKeyMutex.Unlock()
 	privateExists, err := exists(paths.PrivateKey)
 	if err != nil {
 		return "", err

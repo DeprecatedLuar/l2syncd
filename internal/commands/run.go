@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -31,8 +32,6 @@ const (
 	runExitError          = 1
 	runDebounce           = 500 * time.Millisecond
 	runFullScan           = 15 * time.Minute
-	runBackoffStart       = time.Second
-	runBackoffMax         = time.Minute
 	runWatchRetry         = time.Minute
 	runConfigDirMode      = 0o700
 	runReconnectPoll      = 15 * time.Second
@@ -47,7 +46,7 @@ const (
 	cycleTriggerReconnect  = "reconnect"
 )
 
-type cycleRunner func(context.Context) (CycleSummary, error)
+type cycleRunner func(context.Context, func(string) bool) (CycleSummary, error)
 
 type watchRoot struct {
 	name string
@@ -170,10 +169,11 @@ func Run(args []string, stderr io.Writer) (exitCode int) {
 		<-retry.C
 	}
 	dirty := false
-	backoff := runBackoffStart
-	backoff = executeCycle(ctx, logger, retry, backoff, cycleTriggerStartup, RunCycle)
-	reachable := make(map[string]bool)
-	seedPeerReachability(ctx, cfg, reachable, probePeerReachable)
+	backoff := newPeerBackoff()
+	executeCycle(ctx, logger, retry, backoff, cycleTriggerStartup, RunCycle)
+	reachable := probePeers(ctx, cfg, boundCyclePeers(cfg), probePeerReachable)
+	probeResults := make(chan map[string]bool, 1)
+	probing := false
 	for {
 		select {
 		case <-ctx.Done():
@@ -243,10 +243,10 @@ func Run(args []string, stderr io.Writer) (exitCode int) {
 		case <-debounce.C:
 			if dirty {
 				dirty = false
-				backoff = executeCycle(ctx, logger, retry, backoff, cycleTriggerFilesystem, RunCycle)
+				executeCycle(ctx, logger, retry, backoff, cycleTriggerFilesystem, RunCycle)
 			}
 		case <-periodic.C:
-			backoff = executeCycle(ctx, logger, retry, backoff, cycleTriggerPeriodic, RunCycle)
+			executeCycle(ctx, logger, retry, backoff, cycleTriggerPeriodic, RunCycle)
 		case <-watchRetry.C:
 			if retryWatchConditions(watcher, watchRoots, watchConditions, logger) {
 				if err := index.SaveWatchConditions(watchConditions); err != nil {
@@ -254,10 +254,22 @@ func Run(args []string, stderr io.Writer) (exitCode int) {
 				}
 			}
 		case <-retry.C:
-			backoff = executeCycle(ctx, logger, retry, backoff, cycleTriggerRetry, RunCycle)
+			executeCycle(ctx, logger, retry, backoff, cycleTriggerRetry, RunCycle)
 		case <-reconnectPoll.C:
-			if pollPeerReachability(ctx, cfg, reachable, logger, probePeerReachable) {
-				backoff = executeCycle(ctx, logger, retry, backoff, cycleTriggerReconnect, RunCycle)
+			if probing {
+				continue
+			}
+			probing = true
+			snapshot, peers := cfg, boundCyclePeers(cfg)
+			go func() { probeResults <- probePeers(ctx, snapshot, peers, probePeerReachable) }()
+		case results := <-probeResults:
+			probing = false
+			reconnected := applyReachability(reachable, results, logger)
+			for _, peer := range reconnected {
+				backoff.Reset(peer)
+			}
+			if len(reconnected) > 0 {
+				executeCycle(ctx, logger, retry, backoff, cycleTriggerReconnect, RunCycle)
 			}
 		}
 	}
@@ -322,18 +334,36 @@ func sameWatchRoots(left, right []watchRoot) bool {
 	return true
 }
 
-func executeCycle(ctx context.Context, logger *slog.Logger, retry *time.Timer, delay time.Duration, trigger string, cycle cycleRunner) time.Duration {
+func executeCycle(ctx context.Context, logger *slog.Logger, retry *time.Timer, backoff *peerBackoff, trigger string, cycle cycleRunner) {
 	started := time.Now()
 	logger.Info("sync cycle started", "trigger", trigger)
-	summary, err := cycle(ctx)
+	summary, err := cycle(ctx, func(peer string) bool { return !backoff.Ready(peer, time.Now()) })
 	for _, outcome := range summary.Outcomes {
 		logger.Info("folder cycle outcome",
 			"trigger", trigger,
 			"folder", outcome.Name,
+			"peer", outcome.Peer,
+			"skipped", outcome.Skipped,
 			"initiated_locally", outcome.InitiatedLocally,
 			"actions", outcome.Actions,
 			"committed", outcome.Committed,
 		)
+		switch {
+		case outcome.Skipped:
+		case outcome.Committed:
+			backoff.Reset(outcome.Peer)
+		default:
+			backoff.Fail(outcome.Peer, time.Now())
+		}
+	}
+	wait, waiting := backoff.Next(time.Now())
+	if waiting {
+		resetTimer(retry, wait)
+	} else if !retry.Stop() {
+		select {
+		case <-retry.C:
+		default:
+		}
 	}
 	if err != nil {
 		logger.Error("sync cycle failed",
@@ -341,23 +371,10 @@ func executeCycle(ctx context.Context, logger *slog.Logger, retry *time.Timer, d
 			"duration", time.Since(started),
 			"folders_completed", summary.Folders,
 			"actions_completed", summary.Actions,
-			"retry_in", delay,
+			"retry_in", wait,
 			"error", err,
 		)
-		resetTimer(retry, delay)
-		if delay < runBackoffMax {
-			delay *= 2
-			if delay > runBackoffMax {
-				delay = runBackoffMax
-			}
-		}
-		return delay
-	}
-	if !retry.Stop() {
-		select {
-		case <-retry.C:
-		default:
-		}
+		return
 	}
 	logger.Info("sync cycle completed",
 		"trigger", trigger,
@@ -365,7 +382,6 @@ func executeCycle(ctx context.Context, logger *slog.Logger, retry *time.Timer, d
 		"folders", summary.Folders,
 		"actions", summary.Actions,
 	)
-	return runBackoffStart
 }
 
 func addTree(watcher *fsnotify.Watcher, root string) error {
@@ -500,30 +516,35 @@ func probePeerReachable(ctx context.Context, cfg config.Config, peer string) boo
 	return transport.Exchange(probeCtx, endpoint) == nil
 }
 
-// seedPeerReachability records each bound peer's current reachability
-// without treating any of it as a reconnect, so the daemon's first poll
-// after the startup cycle (which already ran regardless of reachability)
-// does not fire a redundant immediate cycle.
-func seedPeerReachability(ctx context.Context, cfg config.Config, reachable map[string]bool, probe func(context.Context, config.Config, string) bool) {
-	for _, peer := range boundCyclePeers(cfg) {
-		reachable[peer] = probe(ctx, cfg, peer)
+// probePeers probes every peer concurrently and returns who answered.
+func probePeers(ctx context.Context, cfg config.Config, peers []string, probe func(context.Context, config.Config, string) bool) map[string]bool {
+	results := make(map[string]bool, len(peers))
+	var mutex sync.Mutex
+	var group sync.WaitGroup
+	for _, peer := range peers {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			reachable := probe(ctx, cfg, peer)
+			mutex.Lock()
+			results[peer] = reachable
+			mutex.Unlock()
+		}()
 	}
+	group.Wait()
+	return results
 }
 
-// pollPeerReachability updates reachable in place and reports whether any
-// bound peer just transitioned from unreachable to reachable. A change made
-// while the peer was unreachable already fired its filesystem event and was
-// otherwise lost until the periodic backstop; this lets it propagate as
-// soon as the peer comes back.
-func pollPeerReachability(ctx context.Context, cfg config.Config, reachable map[string]bool, logger *slog.Logger, probe func(context.Context, config.Config, string) bool) bool {
-	reconnected := false
-	for _, peer := range boundCyclePeers(cfg) {
-		now := probe(ctx, cfg, peer)
-		if now && !reachable[peer] {
+// applyReachability records results and returns peers that just went from
+// unreachable to reachable.
+func applyReachability(reachable, results map[string]bool, logger *slog.Logger) []string {
+	var reconnected []string
+	for _, peer := range sortedKeys(results) {
+		if results[peer] && !reachable[peer] {
 			logger.Info("peer reconnected", "peer", peer)
-			reconnected = true
+			reconnected = append(reconnected, peer)
 		}
-		reachable[peer] = now
+		reachable[peer] = results[peer]
 	}
 	return reconnected
 }

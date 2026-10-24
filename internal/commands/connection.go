@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"text/tabwriter"
 	"unicode"
 
@@ -245,10 +246,20 @@ func connectionList(args []string, stdout, stderr io.Writer) int {
 		name, symbol string
 		peer         config.Peer
 	}
-	rows := make([]row, 0, len(cfg.Peers))
-	for _, name := range sortedKeys(cfg.Peers) {
-		peer := cfg.Peers[name]
-		rows = append(rows, row{name: name, symbol: connectionStatusSymbol(cfg, name, peer), peer: peer})
+	names := sortedKeys(cfg.Peers)
+	symbols := make([]string, len(names))
+	var group sync.WaitGroup
+	for i, name := range names {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			symbols[i] = connectionStatusSymbol(cfg, name, cfg.Peers[name])
+		}()
+	}
+	group.Wait()
+	rows := make([]row, 0, len(names))
+	for i, name := range names {
+		rows = append(rows, row{name: name, symbol: symbols[i], peer: cfg.Peers[name]})
 	}
 	if len(rows) == 0 {
 		return connectionExitOK

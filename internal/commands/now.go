@@ -54,7 +54,7 @@ func Now(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "usage: l2sync now")
 		return nowExitError
 	}
-	if _, err := RunCycle(context.Background()); err != nil {
+	if _, err := RunCycle(context.Background(), nil); err != nil {
 		fmt.Fprintf(stderr, "l2sync: now: %v\n", err)
 		if errors.Is(err, errInvalidConfig) {
 			return nowExitInvalid
@@ -81,7 +81,9 @@ func Now(args []string, stdout, stderr io.Writer) int {
 // (see serve.go's own commit logging for that side).
 type FolderOutcome struct {
 	Name             string
+	Peer             string
 	InitiatedLocally bool
+	Skipped          bool
 	Actions          int
 	Committed        bool
 }
@@ -118,9 +120,10 @@ var (
 
 // RunCycle dispatches each bound folder to its deterministic fingerprint
 // initiator, running every folder's cycle concurrently so one folder's
-// network-bound work never delays another's. A non-initiator holds no
+// network-bound work never delays another's. Folders whose peer skip
+// reports true are left untouched. A non-initiator holds no
 // mutation lock while requesting work.
-func RunCycle(ctx context.Context) (summary CycleSummary, err error) {
+func RunCycle(ctx context.Context, skip func(peer string) bool) (summary CycleSummary, err error) {
 	cfg, err := preflight.LoadConfig()
 	if err != nil {
 		return summary, errors.Join(errInvalidConfig, err)
@@ -137,14 +140,14 @@ func RunCycle(ctx context.Context) (summary CycleSummary, err error) {
 		wg.Add(1)
 		go func(i int, name string) {
 			defer wg.Done()
-			outcomes[i], errs[i] = runFolderCycle(ctx, localIdentity, name)
+			outcomes[i], errs[i] = runFolderCycle(ctx, localIdentity, name, skip)
 		}(i, name)
 	}
 	wg.Wait()
 	for i, name := range names {
 		if outcomes[i] != nil {
 			summary.Outcomes = append(summary.Outcomes, *outcomes[i])
-			if errs[i] == nil {
+			if !outcomes[i].Skipped && errs[i] == nil {
 				summary.Folders++
 				summary.Actions += outcomes[i].Actions
 			}
@@ -160,13 +163,17 @@ func RunCycle(ctx context.Context) (summary CycleSummary, err error) {
 // RunCycle can dispatch every folder concurrently. A nil outcome means the
 // folder is no longer configured (loadActiveCycleFolder found it absent);
 // that is not an error.
-func runFolderCycle(ctx context.Context, localIdentity, name string) (*FolderOutcome, error) {
+func runFolderCycle(ctx context.Context, localIdentity, name string, skip func(peer string) bool) (*FolderOutcome, error) {
 	cfg, peerName, endpoint, present, loadErr := loadActiveCycleFolder(ctx, name)
 	if loadErr != nil {
 		return nil, loadErr
 	}
 	if !present {
 		return nil, nil
+	}
+	if skip != nil && skip(peerName) {
+		nowLogger.Info("folder cycle skipped; peer backing off", "folder", name, "peer", peerName)
+		return &FolderOutcome{Name: name, Peer: peerName, Skipped: true}, nil
 	}
 	if _, ok := cfg.BoundPeer(name); !ok {
 		return nil, fmt.Errorf("folder %q requires exactly one peer binding", name)
@@ -184,14 +191,14 @@ func runFolderCycle(ctx context.Context, localIdentity, name string) (*FolderOut
 		"initiates_locally", initiates)
 	if initiates {
 		actions, err := runInitiatorFolderCycle(ctx, name, peerName, remoteIdentity)
-		return folderOutcome(name, initiates, actions, err)
+		return folderOutcome(name, peerName, initiates, actions, err)
 	}
 	actions, err := requestPeerCycle(ctx, endpoint, name)
-	return folderOutcome(name, initiates, actions, err)
+	return folderOutcome(name, peerName, initiates, actions, err)
 }
 
-func folderOutcome(name string, initiates bool, actions int, err error) (*FolderOutcome, error) {
-	outcome := FolderOutcome{Name: name, InitiatedLocally: initiates, Actions: actions, Committed: err == nil}
+func folderOutcome(name, peer string, initiates bool, actions int, err error) (*FolderOutcome, error) {
+	outcome := FolderOutcome{Name: name, Peer: peer, InitiatedLocally: initiates, Actions: actions, Committed: err == nil}
 	if err != nil {
 		nowLogger.Error("folder cycle failed", "folder", name, "initiated_locally", initiates, "actions", actions, "error", err)
 		return &outcome, err

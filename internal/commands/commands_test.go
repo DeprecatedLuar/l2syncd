@@ -151,7 +151,7 @@ func TestRunCycleReloadsConfigInsteadOfUsingCallerSnapshot(t *testing.T) {
 	if err := config.Save(config.New()); err != nil {
 		t.Fatal(err)
 	}
-	summary, err := RunCycle(context.Background())
+	summary, err := RunCycle(context.Background(), nil)
 	if err != nil || summary.Folders != 0 {
 		t.Fatalf("RunCycle stale snapshot = %#v, %v", summary, err)
 	}
@@ -331,7 +331,7 @@ func TestRunCycleOverlapsIndependentFolders(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		RunCycle(context.Background())
+		RunCycle(context.Background(), nil)
 		close(done)
 	}()
 
@@ -403,7 +403,7 @@ func TestNonInitiatorRequestsActualCycleResultWithoutMutationLock(t *testing.T) 
 	}
 	t.Cleanup(func() { requestPeerCycle = original })
 
-	summary, err := RunCycle(context.Background())
+	summary, err := RunCycle(context.Background(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1433,5 +1433,49 @@ func TestAttachFailureRemovesCreatedDirectory(t *testing.T) {
 	}
 	if _, err := os.Stat(target); !os.IsNotExist(err) {
 		t.Fatalf("failed attach left %q behind: %v", target, err)
+	}
+}
+
+func TestRunCycleSkipsPeersInBackoff(t *testing.T) {
+	root, cfg := cycleTestConfig(t, true)
+	firstFolder := filepath.Join(root, "notes")
+	secondFolder := filepath.Join(root, "photos")
+	if err := os.Mkdir(secondFolder, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Shared["notes"] = config.Folder{Path: firstFolder, Peers: []string{"phone"}}
+	cfg.Shared["photos"] = config.Folder{Path: secondFolder, Peers: []string{"phone"}}
+	if err := guard.WriteMarker(firstFolder, newTestMarker(t, "notes")); err != nil {
+		t.Fatal(err)
+	}
+	if err := guard.WriteMarker(secondFolder, newTestMarker(t, "photos")); err != nil {
+		t.Fatal(err)
+	}
+	if err := config.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	originalPlan, originalRequest := runBoundFolderPlan, requestPeerCycle
+	runBoundFolderPlan = func(context.Context, config.Config, string, string) (int, error) { calls++; return 0, nil }
+	requestPeerCycle = func(context.Context, transport.Endpoint, string) (int, error) { calls++; return 0, nil }
+	t.Cleanup(func() { runBoundFolderPlan, requestPeerCycle = originalPlan, originalRequest })
+
+	summary, err := RunCycle(context.Background(), func(peer string) bool { return peer == "phone" })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 0 {
+		t.Fatalf("backed-off peer contacted %d times", calls)
+	}
+	if len(summary.Outcomes) == 0 {
+		t.Fatal("no outcomes reported")
+	}
+	for _, outcome := range summary.Outcomes {
+		if !outcome.Skipped || outcome.Peer != "phone" {
+			t.Fatalf("outcome = %+v, want skipped for phone", outcome)
+		}
+	}
+	if summary.Folders != 0 {
+		t.Fatalf("skipped folders counted as completed: %d", summary.Folders)
 	}
 }
