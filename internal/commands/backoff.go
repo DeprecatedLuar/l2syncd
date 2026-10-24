@@ -52,10 +52,14 @@ func (backoff *peerBackoff) Reset(peer string) {
 	delete(backoff.until, peer)
 }
 
-// Next returns the wait until the earliest backed-off peer is ready again.
+// Next returns the wait until the earliest still-backed-off peer is ready
+// again; expired entries have nothing to wait for.
 func (backoff *peerBackoff) Next(now time.Time) (time.Duration, bool) {
 	var earliest time.Time
 	for _, until := range backoff.until {
+		if !until.After(now) {
+			continue
+		}
 		if earliest.IsZero() || until.Before(earliest) {
 			earliest = until
 		}
@@ -63,5 +67,5 @@ func (backoff *peerBackoff) Next(now time.Time) (time.Duration, bool) {
 	if earliest.IsZero() {
 		return 0, false
 	}
-	return max(earliest.Sub(now), 0), true
+	return earliest.Sub(now), true
 }

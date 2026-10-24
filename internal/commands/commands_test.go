@@ -1479,3 +1479,29 @@ func TestRunCycleSkipsPeersInBackoff(t *testing.T) {
 		t.Fatalf("skipped folders counted as completed: %d", summary.Folders)
 	}
 }
+
+func TestListIsolatesConcurrentFirstContactFromSharedConfig(t *testing.T) {
+	remoteKey := generatedPublicKey(t, filepath.Join(t.TempDir(), "remote"))
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
+	cfg := config.New()
+	cfg.Peers["fresh"] = config.Peer{Address: "fresh"}
+	cfg.Peers["active-a"] = config.Peer{Address: "active-a", PublicKey: generatedPublicKey(t, filepath.Join(t.TempDir(), "a"))}
+	cfg.Peers["active-b"] = config.Peer{Address: "active-b", PublicKey: generatedPublicKey(t, filepath.Join(t.TempDir(), "b"))}
+	if err := config.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	originalExchange, originalShares := connectionExchange, connectionListShares
+	connectionExchange = func(_ context.Context, endpoint transport.Endpoint) error {
+		return endpoint.AcceptPublicKey(remoteKey)
+	}
+	connectionListShares = func(context.Context, transport.Endpoint) ([]string, error) { return nil, nil }
+	t.Cleanup(func() { connectionExchange, connectionListShares = originalExchange, originalShares })
+
+	var stdout, stderr bytes.Buffer
+	if got := list(cfg, nil, &stdout, &stderr); got != listExitOK {
+		t.Fatalf("list = %d, stderr %q", got, stderr.String())
+	}
+}

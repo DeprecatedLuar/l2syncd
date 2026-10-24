@@ -54,3 +54,22 @@ func TestPeerBackoffJitterStaysWithinBound(t *testing.T) {
 		t.Fatalf("jittered wait %v outside [%v, +20%%]", wait, peerBackoffStart)
 	}
 }
+
+func TestPeerBackoffNextIgnoresExpiredEntries(t *testing.T) {
+	backoff := newPeerBackoff()
+	backoff.jitter = func(time.Duration) time.Duration { return 0 }
+	now := time.Unix(0, 0)
+	backoff.Fail("gone", now.Add(-time.Hour))
+	if wait, ok := backoff.Next(now); ok {
+		t.Fatalf("Next = %v, %v for an expired entry, want none", wait, ok)
+	}
+	if !backoff.Ready("gone", now) {
+		t.Fatal("expired peer not ready")
+	}
+	backoff.Fail("slow", now)
+	backoff.Fail("slow", now)
+	backoff.Fail("fast", now)
+	if wait, ok := backoff.Next(now); !ok || wait != peerBackoffStart {
+		t.Fatalf("Next = %v, %v, want %v", wait, ok, peerBackoffStart)
+	}
+}

@@ -12,7 +12,6 @@ import (
 	"l2syncd/internal/config"
 	"l2syncd/internal/guard"
 	"l2syncd/internal/preflight"
-	"l2syncd/internal/transport"
 )
 
 const (
@@ -24,11 +23,12 @@ const (
 
 func list(cfg config.Config, args []string, stdout, stderr io.Writer) int {
 	return listWithLister(cfg, args, stdout, stderr, func(ctx context.Context, peer string) ([]string, error) {
-		endpoint, err := peerEndpoint(ctx, cfg, peer)
+		// First-contact activation writes cfg.Peers; each concurrent call needs its own copy.
+		endpoint, err := peerEndpoint(ctx, config.Clone(cfg), peer)
 		if err != nil {
 			return nil, err
 		}
-		return transport.ListShares(ctx, endpoint)
+		return connectionListShares(ctx, endpoint)
 	})
 }
 

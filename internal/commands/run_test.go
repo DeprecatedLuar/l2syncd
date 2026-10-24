@@ -375,3 +375,33 @@ func TestConfiguredWatchRootsResolveSymlinkedRoot(t *testing.T) {
 		t.Fatal("no event for a file created in a subdirectory of a symlinked root")
 	}
 }
+
+func TestExecuteCycleLeavesRetryStoppedForExpiredPeerWithoutOutcome(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+	backoff := newPeerBackoff()
+	backoff.jitter = func(time.Duration) time.Duration { return 0 }
+	backoff.Fail("gone", time.Now().Add(-time.Hour))
+	retry := time.NewTimer(time.Hour)
+	t.Cleanup(func() { retry.Stop() })
+	executeCycle(context.Background(), logger, retry, backoff, cycleTriggerRetry,
+		func(context.Context, func(string) bool) (CycleSummary, error) {
+			return CycleSummary{}, nil
+		})
+	if retry.Stop() {
+		t.Fatal("retry timer still armed for an expired peer")
+	}
+}
+
+func TestExecuteCycleArmsRetryForFailedPeer(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+	backoff := newPeerBackoff()
+	backoff.jitter = func(time.Duration) time.Duration { return 0 }
+	retry := stoppedTimer(t)
+	executeCycle(context.Background(), logger, retry, backoff, cycleTriggerRetry,
+		func(context.Context, func(string) bool) (CycleSummary, error) {
+			return CycleSummary{Outcomes: []FolderOutcome{{Name: "pics", Peer: "phone"}}}, errors.New("unreachable")
+		})
+	if !retry.Stop() {
+		t.Fatal("retry timer not armed for a failed peer")
+	}
+}
