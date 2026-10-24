@@ -87,6 +87,13 @@ func Reconcile(root string, previous index.Index, patterns []string, fingerprint
 	if fingerprint == "" {
 		return Result{}, errors.New("local installation fingerprint is required")
 	}
+	info, err := os.Lstat(root)
+	if err != nil {
+		return Result{}, fmt.Errorf("inspect share root: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return Result{}, fmt.Errorf("share root %q is a symlink; resolve it with guard.ResolveRoot before scanning", root)
+	}
 	if _, err := guard.ReadMarker(root); err != nil {
 		return Result{}, err
 	}

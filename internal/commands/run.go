@@ -114,7 +114,11 @@ func Run(args []string, stderr io.Writer) (exitCode int) {
 		logger.Error("preflight failed", "error", err)
 		return runExitError
 	}
-	watchRoots := configuredWatchRoots(cfg)
+	watchRoots, err := configuredWatchRoots(cfg)
+	if err != nil {
+		logger.Error("resolve watch roots", "error", err)
+		return runExitError
+	}
 	watchConditions := make(map[string]index.WatchCondition)
 	for _, root := range watchRoots {
 		if err := addTree(watcher, root.path); err != nil {
@@ -127,7 +131,12 @@ func Run(args []string, stderr io.Writer) (exitCode int) {
 		logger.Error("revalidate config after watch registration", "error", err)
 		return runExitError
 	}
-	if latestRoots := configuredWatchRoots(latest); !sameWatchRoots(watchRoots, latestRoots) {
+	latestRoots, err := configuredWatchRoots(latest)
+	if err != nil {
+		logger.Error("resolve watch roots", "error", err)
+		return runExitError
+	}
+	if !sameWatchRoots(watchRoots, latestRoots) {
 		logger.Error("configured folder registrations or paths changed during daemon startup; restart l2sync run")
 		return runExitError
 	}
@@ -183,7 +192,11 @@ func Run(args []string, stderr io.Writer) (exitCode int) {
 					logger.Error("reload changed config", "error", loadErr)
 					return runExitError
 				}
-				latestRoots := configuredWatchRoots(latest)
+				latestRoots, rootsErr := configuredWatchRoots(latest)
+				if rootsErr != nil {
+					logger.Error("resolve watch roots", "error", rootsErr)
+					return runExitError
+				}
 				if !sameWatchRoots(watchRoots, latestRoots) {
 					logger.Error("configured folder registrations or paths changed; restart l2sync run to rebuild filesystem watches")
 					return runExitError
@@ -388,16 +401,28 @@ func eventMarksDirty(event fsnotify.Event, configPath string) bool {
 	return !guard.DefaultIgnorePath(event.Name)
 }
 
-func configuredWatchRoots(cfg config.Config) []watchRoot {
+func configuredWatchRoots(cfg config.Config) ([]watchRoot, error) {
 	roots := make([]watchRoot, 0, len(cfg.Shared)+len(cfg.Remote))
+	add := func(name, path string) error {
+		resolved, err := guard.ResolveRoot(path)
+		if err != nil {
+			return fmt.Errorf("folder %q: %w", name, err)
+		}
+		roots = append(roots, watchRoot{name: name, path: resolved})
+		return nil
+	}
 	for name, folder := range cfg.Shared {
-		roots = append(roots, watchRoot{name: name, path: folder.Path})
+		if err := add(name, folder.Path); err != nil {
+			return nil, err
+		}
 	}
 	for name, folder := range cfg.Remote {
-		roots = append(roots, watchRoot{name: name, path: folder.Path})
+		if err := add(name, folder.Path); err != nil {
+			return nil, err
+		}
 	}
 	sort.Slice(roots, func(left, right int) bool { return roots[left].name < roots[right].name })
-	return roots
+	return roots, nil
 }
 
 func newWatchCondition(path string, watchErr error) index.WatchCondition {

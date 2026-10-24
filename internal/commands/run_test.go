@@ -364,3 +364,40 @@ func TestCycleConfigurationIgnoresUnchangedRewritesAndUnboundPeers(t *testing.T)
 		t.Fatal("bound peer key change did not schedule a cycle")
 	}
 }
+
+func TestConfiguredWatchRootsResolveSymlinkedRoot(t *testing.T) {
+	base := t.TempDir()
+	target := filepath.Join(base, "real")
+	if err := os.MkdirAll(filepath.Join(target, "sub"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(base, "link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.New()
+	cfg.Shared["notes"] = config.Folder{Path: link}
+	roots, err := configuredWatchRoots(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer watcher.Close()
+	if err := addTree(watcher, roots[0].path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(target, "sub", "new"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case event := <-watcher.Events:
+		if !strings.HasSuffix(event.Name, filepath.Join("sub", "new")) {
+			t.Fatalf("event = %v, want sub/new", event)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no event for a file created in a subdirectory of a symlinked root")
+	}
+}

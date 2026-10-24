@@ -67,7 +67,11 @@ func IndexCommit(args []string, stderr io.Writer) int {
 		if !found {
 			return fmt.Errorf("share %q not found", args[0])
 		}
-		marker, err := guard.ReadMarker(folder.Path)
+		root, err := guard.ResolveRoot(folder.Path)
+		if err != nil {
+			return err
+		}
+		marker, err := guard.ReadMarker(root)
 		if err != nil {
 			return fmt.Errorf("read marker: %w", err)
 		}
@@ -79,7 +83,7 @@ func IndexCommit(args []string, stderr io.Writer) int {
 		if err != nil {
 			return fmt.Errorf("load index: %w", err)
 		}
-		result, err := scan.Reconcile(folder.Path, previous, marker.Ignore, localIdentity)
+		result, err := scan.Reconcile(root, previous, marker.Ignore, localIdentity)
 		if err != nil {
 			return fmt.Errorf("scan folder: %w", err)
 		}
@@ -101,7 +105,11 @@ func IndexCommit(args []string, stderr io.Writer) int {
 }
 
 func printStatus(stdout io.Writer, name, path string) error {
-	marker, err := guard.ReadMarker(path)
+	root, err := guard.ResolveRoot(path)
+	if err != nil {
+		return err
+	}
+	marker, err := guard.ReadMarker(root)
 	if err != nil {
 		return err
 	}
@@ -113,7 +121,7 @@ func printStatus(stdout io.Writer, name, path string) error {
 	if err != nil {
 		return err
 	}
-	result, err := scan.Reconcile(path, previous, marker.Ignore, localIdentity)
+	result, err := scan.Reconcile(root, previous, marker.Ignore, localIdentity)
 	if err != nil {
 		return err
 	}

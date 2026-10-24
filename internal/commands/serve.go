@@ -446,7 +446,10 @@ func resolveFolder(cfg config.Config, peer, authenticatedFingerprint, name strin
 	if !exists {
 		return resolvedFolder{}, fmt.Errorf("folder %q is not registered", name)
 	}
-	path := folder.Path
+	path, err := guard.ResolveRoot(folder.Path)
+	if err != nil {
+		return resolvedFolder{}, fmt.Errorf("folder %q: %w", name, err)
+	}
 	marker, err := guard.ReadMarker(path)
 	if err != nil {
 		return resolvedFolder{}, fmt.Errorf("folder %q marker: %w", name, err)

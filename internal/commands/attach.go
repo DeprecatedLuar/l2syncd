@@ -156,11 +156,16 @@ func Attach(args []string, stderr io.Writer) (exitCode int) {
 		fmt.Fprintf(stderr, "l2sync: peer %q returned no folder identity for %q: %v\n", peerName, name, compensateRemote(errors.New("empty folder identity")))
 		return attachExitUnreachable
 	}
+	root, err := guard.ResolveRoot(path)
+	if err != nil {
+		fmt.Fprintf(stderr, "l2sync: folder %q: %v\n", name, compensateRemote(err))
+		return attachExitError
+	}
 	var localIgnore []string
 	if existingMarker, markerErr := guard.ReadMarker(path); markerErr == nil {
 		localIgnore = existingMarker.Ignore
 	}
-	extras, err := divergentLocalPaths(path, localIgnore, remoteFiles)
+	extras, err := divergentLocalPaths(root, localIgnore, remoteFiles)
 	if err != nil {
 		fmt.Fprintf(stderr, "l2sync: compare folder %q against provider %q: %v\n", name, peerName, compensateRemote(err))
 		return attachExitError
@@ -172,7 +177,7 @@ func Attach(args []string, stderr io.Writer) (exitCode int) {
 			return attachExitError
 		}
 		if choice == divergenceDrop {
-			if dropErr := dropLocalExtras(path, extras); dropErr != nil {
+			if dropErr := dropLocalExtras(root, extras); dropErr != nil {
 				fmt.Fprintf(stderr, "l2sync: drop diverged local paths for folder %q: %v\n", name, compensateRemote(dropErr))
 				return attachExitError
 			}

@@ -317,21 +317,29 @@ func withFolderLock(ctx context.Context, folder string, fn func() error) (err er
 
 func planBoundFolder(ctx context.Context, cfg config.Config, name, expectedPeer string) (int, error) {
 	if folder, exists := cfg.Shared[name]; exists {
+		root, err := guard.ResolveRoot(folder.Path)
+		if err != nil {
+			return 0, err
+		}
 		peer, endpoint, err := findPeerForShared(ctx, cfg, name)
 		if err != nil {
 			return 0, err
 		}
-		return planFolder(ctx, cfg, name, folder.Path, peer, endpoint)
+		return planFolder(ctx, cfg, name, root, peer, endpoint)
 	}
 	folder, exists := cfg.Remote[name]
 	if !exists {
 		return 0, fmt.Errorf("folder %q is not registered", name)
 	}
+	root, err := guard.ResolveRoot(folder.Path)
+	if err != nil {
+		return 0, err
+	}
 	provider, endpoint, err := findProvider(ctx, cfg, name)
 	if err != nil {
 		return 0, err
 	}
-	return planFolder(ctx, cfg, name, folder.Path, provider, endpoint)
+	return planFolder(ctx, cfg, name, root, provider, endpoint)
 }
 
 // planFolder reconciles one folder against its bound peer. Unlike the

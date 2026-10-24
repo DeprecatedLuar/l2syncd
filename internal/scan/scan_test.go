@@ -417,3 +417,23 @@ func TestListEntriesProjectsLiveFilesDirectoriesAndTombstones(t *testing.T) {
 func metadataWithMode(mode uint32) metadata.Manifest {
 	return metadata.Manifest{Mode: mode}
 }
+
+func TestReconcileRefusesSymlinkRoot(t *testing.T) {
+	base := t.TempDir()
+	target := filepath.Join(base, "real")
+	if err := os.Mkdir(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeTestMarker(t, target)
+	if err := os.WriteFile(filepath.Join(target, "a.txt"), []byte("a"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(base, "link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Reconcile(link, index.New("test-id"), nil, testFingerprint)
+	if err == nil || !strings.Contains(err.Error(), "is a symlink") {
+		t.Fatalf("Reconcile(symlink root) error = %v, want symlink refusal", err)
+	}
+}
