@@ -19,7 +19,6 @@ import (
 
 	"golang.org/x/term"
 
-	"l2syncd/internal/androidexec"
 	"l2syncd/internal/config"
 	connectionpkg "l2syncd/internal/connection"
 	"l2syncd/internal/guard"
@@ -31,7 +30,6 @@ import (
 const (
 	connectionExitOK    = 0
 	connectionExitError = 1
-	connectionSSH       = "ssh"
 	connectionBinary    = "l2sync"
 )
 
@@ -140,14 +138,9 @@ func connectionAdd(args []string, stdin io.Reader, stdout, stderr io.Writer) int
 	if !ok {
 		return connectionExitError
 	}
-	resolved, err := config.ResolvePeerAddress(address)
-	if err != nil {
-		fmt.Fprintf(stderr, "l2sync: resolve destination: %v\n", err)
-		return connectionExitError
-	}
-	probeErr := connectionProbe(context.Background(), resolved)
+	probeErr := connectionProbe(context.Background(), address)
 	if probeErr != nil && errors.Is(probeErr, errSSHUnreachable) {
-		fmt.Fprintf(stderr, "l2sync: %s is unreachable via SSH: %v\n", resolved, probeErr)
+		fmt.Fprintf(stderr, "l2sync: %s is unreachable via SSH: %v\n", address, probeErr)
 		return connectionExitError
 	}
 	available := probeErr == nil
@@ -162,7 +155,7 @@ func connectionAdd(args []string, stdin io.Reader, stdout, stderr io.Writer) int
 		if isTerminalWriter(stdout) {
 			command = ansiBlue + command + ansiReset
 		}
-		fmt.Fprintf(stdout, "%s is reachable but doesn't have your key yet. Have someone run this there:\n\n  %s\n\n", resolved, command)
+		fmt.Fprintf(stdout, "%s is reachable but doesn't have your key yet. Have someone run this there:\n\n  %s\n\n", address, command)
 		if !addressKnownGood {
 			fmt.Fprintf(stdout, "warning: this machine's hostname (%q) won't resolve from another host — replace %q above with an address or hostname that actually reaches this machine.\n\n", localAddress, localAddress)
 		}
@@ -175,7 +168,7 @@ func connectionAdd(args []string, stdin io.Reader, stdout, stderr io.Writer) int
 		return connectionExitError
 	}
 	localName, localAddress, _ := installationAddress()
-	if err := connectionInstall(context.Background(), resolved, localName, localAddress, localKey); err != nil {
+	if err := connectionInstall(context.Background(), address, localName, localAddress, localKey); err != nil {
 		fmt.Fprintf(stderr, "l2sync: install remote restricted grant: %v\n", err)
 		return connectionExitError
 	}
@@ -365,7 +358,7 @@ func connectionRemove(args []string, stderr io.Writer) (exitCode int) {
 
 	// Folder ids must be captured before the grant or config are touched:
 	// once the remote registration is gone, its marker can no longer be
-	// resolved from config alone.
+	// address from config alone.
 	folderIDs := make(map[string]string, len(remoteTargets))
 	for _, remoteName := range remoteTargets {
 		if marker, markerErr := guard.ReadMarker(cfg.Remote[remoteName].Path); markerErr == nil {
@@ -571,7 +564,7 @@ func rejectDuplicatePeerKey(cfg config.Config, name, publicKey string) error {
 var errSSHUnreachable = errors.New("ssh destination unreachable")
 
 func probeExistingAccess(ctx context.Context, destination string) error {
-	cmd, err := androidexec.CommandContext(ctx, connectionSSH, "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ControlMaster=no", "-o", "ControlPath=none", destination, "true")
+	cmd, err := transport.LoginSSHCommand(ctx, destination, "true")
 	if err != nil {
 		return fmt.Errorf("%w: %w", errSSHUnreachable, err)
 	}
@@ -596,14 +589,14 @@ func installRemoteGrant(ctx context.Context, destination, localName, localAddres
 	if !safeBootstrapAddress(localAddress) {
 		return errors.New("local bootstrap address contains unsafe characters")
 	}
-	cmd, err := androidexec.CommandContext(ctx, connectionSSH, "-T", "-o", "ControlMaster=no", "-o", "ControlPath=none", destination, connectionBinary, "connection", "add", localName, localAddress, "--key", "-")
+	cmd, err := transport.LoginSSHCommand(ctx, destination, connectionBinary, "connection", "add", localName, localAddress, "--key", "-")
 	if err != nil {
 		return err
 	}
 	cmd.Stdin = strings.NewReader(publicKey + "\n")
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("remote connection add: %w: %s", err, strings.TrimSpace(string(output)))
+		return transport.RemoteExitError(destination, err, strings.TrimSpace(string(output)))
 	}
 	return nil
 }

@@ -58,8 +58,8 @@ func Validate(cfg config.Config) error {
 			}
 			peerKeys[normalized] = name
 		}
-		if _, err := config.ResolvePeerAddress(peer.Address); err != nil {
-			return fmt.Errorf("resolve peer %q: %w", name, err)
+		if err := config.ValidatePeerAddress(peer.Address); err != nil {
+			return fmt.Errorf("peer %q address: %w", name, err)
 		}
 	}
 	for name, folder := range cfg.Shared {

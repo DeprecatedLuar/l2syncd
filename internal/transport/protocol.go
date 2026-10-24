@@ -37,42 +37,44 @@ const (
 	frameHeaderSize = 4
 	maxFrameSize    = 16 << 20
 
-	messageListShares    = "list-shares"
-	messageHello         = "hello"
-	messageHelloReply    = "hello-reply"
-	messagePing          = "ping"
-	messageBindShare     = "bind-share"
-	messageUnbindShare   = "unbind-share"
-	messageListFiles     = "list-files"
-	messageReadFile      = "read-file"
-	messageWriteFile     = "write-file"
-	messageConflictCopy  = "write-conflict-copy"
-	messageConflictCheck = "check-conflict-copy"
-	messageRequestCycle  = "request-cycle"
-	messageDeleteFile    = "delete-file"
-	messageApplyDir      = "apply-directory"
-	messageDeleteDir     = "delete-directory"
-	messageReuseFile     = "reuse-file"
-	messageMergeVector   = "merge-vector"
-	messageAcknowledge   = "acknowledge-vector"
-	messageShare         = "share"
-	messageFile          = "file"
-	messageEnd           = "end"
-	messageChunk         = "chunk"
-	messageReused        = "reused"
-	messageReuseMiss     = "reuse-miss"
-	sshCommand           = "ssh"
-	remoteBinary         = "l2sync"
-	fileChunkSize        = 1 << 20
-	sshControlPersist    = "60s"
-	remoteLockedExitCode = 4
-	unixSocketPathLimit  = 104
-	controlHashLength    = 40
-	sshStderrLimit       = 4096
-	sshStderrExcerpt     = 512
-	sshConfigLimit       = 1 << 20
-	sshConfigPrefix      = "l2sync-ssh-"
-	sshConfigHost        = "l2sync-peer"
+	messageListShares     = "list-shares"
+	messageHello          = "hello"
+	messageHelloReply     = "hello-reply"
+	messagePing           = "ping"
+	messageBindShare      = "bind-share"
+	messageUnbindShare    = "unbind-share"
+	messageListFiles      = "list-files"
+	messageReadFile       = "read-file"
+	messageWriteFile      = "write-file"
+	messageConflictCopy   = "write-conflict-copy"
+	messageConflictCheck  = "check-conflict-copy"
+	messageRequestCycle   = "request-cycle"
+	messageDeleteFile     = "delete-file"
+	messageApplyDir       = "apply-directory"
+	messageDeleteDir      = "delete-directory"
+	messageReuseFile      = "reuse-file"
+	messageMergeVector    = "merge-vector"
+	messageAcknowledge    = "acknowledge-vector"
+	messageShare          = "share"
+	messageFile           = "file"
+	messageEnd            = "end"
+	messageChunk          = "chunk"
+	messageReused         = "reused"
+	messageReuseMiss      = "reuse-miss"
+	sshCommand            = "ssh"
+	remoteBinary          = "l2sync"
+	fileChunkSize         = 1 << 20
+	sshControlPersist     = "60s"
+	remoteLockedExitCode  = 4
+	remoteMissingExitCode = 127
+	sshConnectTimeout     = "10"
+	unixSocketPathLimit   = 104
+	controlHashLength     = 40
+	sshStderrLimit        = 4096
+	sshStderrExcerpt      = 512
+	sshConfigLimit        = 1 << 20
+	sshConfigPrefix       = "l2sync-ssh-"
+	sshConfigHost         = "l2sync-peer"
 )
 
 var errUnexpectedEnd = errors.New("peer listing ended without an end-of-stream marker")
@@ -1075,6 +1077,19 @@ func runSSH(ctx context.Context, endpoint Endpoint, bulk bool, input []byte) ([]
 	return io.ReadAll(reader)
 }
 
+// RemoteExitError explains a non-zero exit of a command ssh ran on address.
+// A missing binary is named, because the remote shell's wording is not.
+func RemoteExitError(address string, err error, detail string) error {
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == remoteMissingExitCode {
+		return fmt.Errorf("%s not found on PATH on %s", remoteBinary, address)
+	}
+	if detail != "" {
+		return fmt.Errorf("peer %q rejected request: %s", address, detail)
+	}
+	return fmt.Errorf("peer %q rejected request: %w", address, err)
+}
+
 func classifySSHFailure(address string, commandErr, contextErr error, stderr []byte) error {
 	if contextErr != nil {
 		return &Error{err: fmt.Errorf("connect to peer %q: %w", address, contextErr)}
@@ -1084,10 +1099,7 @@ func classifySSHFailure(address string, commandErr, contextErr error, stderr []b
 		if exitErr.ExitCode() == remoteLockedExitCode {
 			return fmt.Errorf("peer %q mutation lock unavailable: %w", address, lock.ErrTimeout)
 		}
-		if detail := sanitizeSSHStderr(stderr); detail != "" {
-			return fmt.Errorf("peer %q rejected request: %s", address, detail)
-		}
-		return fmt.Errorf("peer %q rejected request: %w", address, commandErr)
+		return RemoteExitError(address, commandErr, sanitizeSSHStderr(stderr))
 	}
 	detail := sanitizeSSHStderr(stderr)
 	auth := strings.Contains(detail, "Permission denied")
@@ -1127,6 +1139,7 @@ func sshArguments(configPath, controlPath, privateKey string, bulk bool) []strin
 		"-F", configPath,
 		"-T",
 		"-o", "BatchMode=yes",
+		"-o", "ConnectTimeout=" + sshConnectTimeout,
 		"-o", "IdentitiesOnly=yes",
 		"-o", "IdentityAgent=none",
 		"-o", "PreferredAuthentications=publickey",

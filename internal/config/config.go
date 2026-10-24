@@ -13,7 +13,6 @@ import (
 	"unicode"
 
 	"github.com/BurntSushi/toml"
-	"github.com/kevinburke/ssh_config"
 )
 
 const (
@@ -274,41 +273,6 @@ func CheckStateDirWritable() error {
 		return fmt.Errorf("remove state preflight file: %w", err)
 	}
 	return nil
-}
-
-// ResolvePeerAddress returns the SSH HostName for peer when it is configured,
-// or its configured address when no matching SSH configuration exists.
-func ResolvePeerAddress(address string) (string, error) {
-	if err := ValidatePeerAddress(address); err != nil {
-		return "", err
-	}
-	if strings.ContainsAny(address, "@:") {
-		return address, nil
-	}
-
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", fmt.Errorf("find home directory: %w", err)
-	}
-	sshConfigPath := filepath.Join(home, ".ssh", "config")
-	sshConfig, err := os.Open(sshConfigPath)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return address, nil
-		}
-		return "", fmt.Errorf("open SSH config: %w", err)
-	}
-	defer sshConfig.Close()
-
-	parsed, err := ssh_config.Decode(sshConfig)
-	if err != nil {
-		return "", fmt.Errorf("parse SSH config: %w", err)
-	}
-	// Parsing validates the file. Return the original alias so OpenSSH still
-	// applies every option in its matching Host block (User, Port, ProxyJump,
-	// IdentityFile, and others), not only HostName.
-	_ = parsed
-	return address, nil
 }
 
 // ValidatePeerAddress rejects values that OpenSSH could interpret as options

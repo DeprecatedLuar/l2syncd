@@ -501,6 +501,9 @@ func TestSSHArgumentsReuseControlConnectionExceptForBulkTransfers(t *testing.T) 
 	if !slices.Contains(control, "ControlMaster=auto") || !slices.Contains(control, "ControlPersist="+sshControlPersist) || !slices.Contains(control, wantControlPath) || !slices.Contains(control, "BatchMode=yes") || !slices.Contains(control, "IdentitiesOnly=yes") || !slices.Contains(control, "-T") || !slices.Contains(control, "/key") {
 		t.Fatalf("control SSH arguments = %#v", control)
 	}
+	if !slices.Contains(control, "ConnectTimeout="+sshConnectTimeout) {
+		t.Fatalf("control SSH arguments lack connect timeout: %#v", control)
+	}
 	bulk := sshArguments(configPath, controlPath, "/key", true)
 	if !slices.Contains(bulk, "ControlPath=none") || !slices.Contains(bulk, "ControlMaster=no") {
 		t.Fatalf("bulk SSH arguments = %#v, want ControlPath=none", bulk)
@@ -751,4 +754,27 @@ func exitError(t *testing.T, code int) error {
 		t.Fatalf("exit error = %v", err)
 	}
 	return exitErr
+}
+
+func TestRemoteExitErrorNamesMissingBinary(t *testing.T) {
+	missing := exec.Command("sh", "-c", "exit 127").Run()
+	if got := RemoteExitError("phone", missing, "bash: l2sync: command not found"); !strings.Contains(got.Error(), "l2sync not found on PATH on phone") {
+		t.Fatalf("RemoteExitError(127) = %v", got)
+	}
+	other := exec.Command("sh", "-c", "exit 3").Run()
+	if got := RemoteExitError("phone", other, "refused"); !strings.Contains(got.Error(), "refused") {
+		t.Fatalf("RemoteExitError(3) = %v", got)
+	}
+}
+
+func TestLoginSSHCommandCarriesSharedOptions(t *testing.T) {
+	command, err := LoginSSHCommand(context.Background(), "luar@host", "l2sync", "connection", "ls")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"BatchMode=yes", "ConnectTimeout=" + sshConnectTimeout, "ControlPath=none", "luar@host", "l2sync"} {
+		if !slices.Contains(command.Args, want) {
+			t.Fatalf("args %#v lack %q", command.Args, want)
+		}
+	}
 }

@@ -52,39 +52,6 @@ func TestLoadMalformed(t *testing.T) {
 	}
 }
 
-func TestResolvePeerAddress(t *testing.T) {
-	root := t.TempDir()
-	t.Setenv("HOME", root)
-	sshDir := filepath.Join(root, ".ssh")
-	if err := os.MkdirAll(sshDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(sshDir, "config"), []byte("Host phone\n  HostName 192.0.2.10\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	got, err := ResolvePeerAddress("phone")
-	if err != nil {
-		t.Fatalf("ResolvePeerAddress() error = %v", err)
-	}
-	if got != "phone" {
-		t.Fatalf("ResolvePeerAddress() = %q, want %q", got, "phone")
-	}
-}
-
-func TestResolvePeerAddressFallsBackToRawAddress(t *testing.T) {
-	root := t.TempDir()
-	t.Setenv("HOME", root)
-
-	got, err := ResolvePeerAddress("phone")
-	if err != nil {
-		t.Fatalf("ResolvePeerAddress() error = %v", err)
-	}
-	if got != "phone" {
-		t.Fatalf("ResolvePeerAddress() = %q, want %q", got, "phone")
-	}
-}
-
 func TestLoadRejectsMalformedStructuredPeers(t *testing.T) {
 	for name, document := range map[string]string{
 		"wrong address type":    "[peers.phone]\naddress = 7\n",
@@ -192,14 +159,5 @@ func TestWasInstalledRecognizesPostRenameFailure(t *testing.T) {
 	}
 	if WasInstalled(underlying) {
 		t.Fatal("pre-rename failure classified as installed")
-	}
-}
-
-func TestResolvePeerAddressPreservesExplicitDestination(t *testing.T) {
-	for _, value := range []string{"user@example.test", "example.test:2222"} {
-		got, err := ResolvePeerAddress(value)
-		if err != nil || got != value {
-			t.Fatalf("ResolvePeerAddress(%q) = %q, %v", value, got, err)
-		}
 	}
 }
