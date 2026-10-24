@@ -144,3 +144,61 @@ func TestValidateRequiresExactlyOneUsableBindingForRemoteFolder(t *testing.T) {
 		})
 	}
 }
+
+func nestingFixture(t *testing.T) (string, config.Config) {
+	t.Helper()
+	base := t.TempDir()
+	outer := filepath.Join(base, "outer")
+	inner := filepath.Join(outer, "inner")
+	if err := os.MkdirAll(inner, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := guard.WriteMarker(outer, newTestMarker(t, "outer")); err != nil {
+		t.Fatal(err)
+	}
+	if err := guard.WriteMarker(inner, newTestMarker(t, "inner")); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.New()
+	cfg.Shared["outer"] = config.Folder{Path: outer}
+	return base, cfg
+}
+
+func TestValidateRejectsNestedFolders(t *testing.T) {
+	base, cfg := nestingFixture(t)
+	cfg.Shared["inner"] = config.Folder{Path: filepath.Join(base, "outer", "inner")}
+	err := Validate(cfg)
+	if err == nil || !strings.Contains(err.Error(), `"inner"`) || !strings.Contains(err.Error(), `"outer"`) {
+		t.Fatalf("Validate error = %v, want nesting error naming both folders", err)
+	}
+}
+
+func TestValidateRejectsFolderNestedThroughSymlink(t *testing.T) {
+	base, cfg := nestingFixture(t)
+	link := filepath.Join(base, "link")
+	if err := os.Symlink(filepath.Join(base, "outer", "inner"), link); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Shared["inner"] = config.Folder{Path: link}
+	if err := Validate(cfg); err == nil || !strings.Contains(err.Error(), "inside") {
+		t.Fatalf("Validate error = %v, want nesting error", err)
+	}
+}
+
+func TestValidateAcceptsSiblingFolders(t *testing.T) {
+	base := t.TempDir()
+	cfg := config.New()
+	for _, name := range []string{"left", "leftover"} {
+		root := filepath.Join(base, name)
+		if err := os.Mkdir(root, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := guard.WriteMarker(root, newTestMarker(t, name)); err != nil {
+			t.Fatal(err)
+		}
+		cfg.Shared[name] = config.Folder{Path: root}
+	}
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("Validate(siblings) = %v", err)
+	}
+}

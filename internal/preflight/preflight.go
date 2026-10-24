@@ -6,6 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"sort"
+	"strings"
 
 	"l2syncd/internal/config"
 	"l2syncd/internal/connection"
@@ -92,7 +95,7 @@ func Validate(cfg config.Config) error {
 			return fmt.Errorf("remote folder %q binds unavailable peer %q", name, folder.Peers[0])
 		}
 	}
-	return nil
+	return checkNesting(cfg)
 }
 
 func validateFolder(name, path string) error {
@@ -112,6 +115,38 @@ func validateFolder(name, path string) error {
 	}
 	if marker.Name != name {
 		return fmt.Errorf("marker names folder %q, want %q", marker.Name, name)
+	}
+	return nil
+}
+
+// checkNesting refuses two registered folders whose resolved roots are equal
+// or nested: both would scan, and fight over, the same files.
+func checkNesting(cfg config.Config) error {
+	type root struct{ name, path string }
+	roots := make([]root, 0, len(cfg.Shared)+len(cfg.Remote))
+	for _, table := range []map[string]config.Folder{cfg.Shared, cfg.Remote} {
+		for name, folder := range table {
+			resolved, err := guard.ResolveRoot(folder.Path)
+			if err != nil {
+				return fmt.Errorf("folder %q: %w", name, err)
+			}
+			roots = append(roots, root{name: name, path: resolved})
+		}
+	}
+	sort.Slice(roots, func(left, right int) bool { return roots[left].name < roots[right].name })
+	for i, outer := range roots {
+		for j, inner := range roots {
+			if i == j {
+				continue
+			}
+			relative, err := filepath.Rel(outer.path, inner.path)
+			if err != nil {
+				return fmt.Errorf("compare folders %q and %q: %w", outer.name, inner.name, err)
+			}
+			if relative == "." || relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+				return fmt.Errorf("folder %q (%s) is inside folder %q (%s)", inner.name, inner.path, outer.name, outer.path)
+			}
+		}
 	}
 	return nil
 }
