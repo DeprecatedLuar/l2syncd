@@ -72,11 +72,19 @@ func Attach(args []string, stderr io.Writer) (exitCode int) {
 		fmt.Fprintf(stderr, "l2sync: resolve folder path: %v\n", err)
 		return attachExitError
 	}
-	info, err := resolveFolderPath(path, rawPath, createMissing, stderr)
+	info, removeCreated, err := resolveFolderPath(path, rawPath, createMissing, stderr)
 	if err != nil {
 		fmt.Fprintf(stderr, "l2sync: folder %q: %v\n", rawPath, err)
 		return attachExitError
 	}
+	defer func() {
+		if exitCode == attachExitOK {
+			return
+		}
+		if err := removeCreated(); err != nil {
+			fmt.Fprintf(stderr, "l2sync: %v\n", err)
+		}
+	}()
 	if !info.IsDir() {
 		fmt.Fprintf(stderr, "l2sync: folder %q is not a directory\n", rawPath)
 		return attachExitError

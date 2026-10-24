@@ -1392,3 +1392,46 @@ func TestListKeepsLocalEntriesWhenPeerIsUnreachable(t *testing.T) {
 		t.Fatalf("stderr = %q, want unreachable message", stderr.String())
 	}
 }
+
+func TestResolveFolderPathCleanupRemovesOnlyCreatedDirectories(t *testing.T) {
+	base := t.TempDir()
+	target := filepath.Join(base, "a", "b")
+	_, cleanup, err := resolveFolderPath(target, target, true, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cleanup(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(base, "a")); !os.IsNotExist(err) {
+		t.Fatalf("created parent survived cleanup: %v", err)
+	}
+	if _, err := os.Stat(base); err != nil {
+		t.Fatalf("pre-existing directory removed: %v", err)
+	}
+}
+
+func TestAttachFailureRemovesCreatedDirectory(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
+	cfg := config.New()
+	cfg.Peers["phone"] = config.Peer{Address: "phone", PublicKey: generatedPublicKey(t, filepath.Join(root, "remote-key"))}
+	if err := config.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	previous := attachFindProvider
+	attachFindProvider = func(context.Context, config.Config, string) (string, transport.Endpoint, error) {
+		return "", transport.Endpoint{}, errors.New("no peer offers folder")
+	}
+	t.Cleanup(func() { attachFindProvider = previous })
+	target := filepath.Join(root, "new-folder")
+	var stderr bytes.Buffer
+	if code := Attach([]string{"notes", target, "-p"}, &stderr); code == attachExitOK {
+		t.Fatal("Attach succeeded without a provider")
+	}
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatalf("failed attach left %q behind: %v", target, err)
+	}
+}

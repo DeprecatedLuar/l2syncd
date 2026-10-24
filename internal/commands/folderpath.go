@@ -7,8 +7,11 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 )
+
+const createdFolderMode = 0o755
 
 // resolveFolderPath stats path, which the caller already resolved to an
 // absolute form; rawPath is the original argument, used only for error text.
@@ -16,30 +19,63 @@ import (
 // flag); otherwise, on an interactive terminal, the user is prompted to
 // create it, mirroring the rejoin-divergence prompt's non-interactive
 // refusal (concept.md 8.1: never silently choose a default without a
-// terminal to ask on).
-func resolveFolderPath(path, rawPath string, createMissing bool, stderr io.Writer) (os.FileInfo, error) {
+// terminal to ask on). The returned cleanup removes, deepest first, only the
+// directories this call created, and fails if any is not empty.
+func resolveFolderPath(path, rawPath string, createMissing bool, stderr io.Writer) (os.FileInfo, func() error, error) {
+	noCleanup := func() error { return nil }
 	info, err := os.Stat(path)
 	if err == nil {
-		return info, nil
+		return info, noCleanup, nil
 	}
 	if !os.IsNotExist(err) {
-		return nil, err
+		return nil, noCleanup, err
 	}
 	create := createMissing
 	if !create {
 		var promptErr error
 		create, promptErr = promptCreateFolder(stderr, rawPath)
 		if promptErr != nil {
-			return nil, promptErr
+			return nil, noCleanup, promptErr
 		}
 	}
 	if !create {
-		return nil, err
+		return nil, noCleanup, err
 	}
-	if mkdirErr := os.MkdirAll(path, 0o755); mkdirErr != nil {
-		return nil, fmt.Errorf("create folder %q: %w", rawPath, mkdirErr)
+	created, err := missingDirectories(path)
+	if err != nil {
+		return nil, noCleanup, err
 	}
-	return os.Stat(path)
+	if mkdirErr := os.MkdirAll(path, createdFolderMode); mkdirErr != nil {
+		return nil, noCleanup, fmt.Errorf("create folder %q: %w", rawPath, mkdirErr)
+	}
+	cleanup := func() error {
+		for _, directory := range created {
+			if err := os.Remove(directory); err != nil {
+				return fmt.Errorf("remove created folder %q: %w", directory, err)
+			}
+		}
+		return nil
+	}
+	info, err = os.Stat(path)
+	return info, cleanup, err
+}
+
+// missingDirectories lists path and each missing ancestor, deepest first.
+func missingDirectories(path string) ([]string, error) {
+	var missing []string
+	for current := path; ; current = filepath.Dir(current) {
+		_, err := os.Stat(current)
+		if err == nil {
+			return missing, nil
+		}
+		if !os.IsNotExist(err) {
+			return nil, err
+		}
+		missing = append(missing, current)
+		if filepath.Dir(current) == current {
+			return missing, nil
+		}
+	}
 }
 
 // promptCreateFolder asks whether to create a missing folder path. It never

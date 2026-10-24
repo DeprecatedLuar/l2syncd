@@ -22,7 +22,7 @@ const (
 	shareExitInvalid = 2
 )
 
-func share(args []string, stderr io.Writer) int {
+func share(args []string, stderr io.Writer) (exitCode int) {
 	name, rawPath, createMissing, err := parseSharePath(args)
 	if err != nil {
 		fmt.Fprintln(stderr, "usage: l2sync folder share <name> <path> [-p]")
@@ -38,11 +38,19 @@ func share(args []string, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "l2sync: resolve folder path: %v\n", err)
 		return shareExitError
 	}
-	info, err := resolveFolderPath(path, rawPath, createMissing, stderr)
+	info, removeCreated, err := resolveFolderPath(path, rawPath, createMissing, stderr)
 	if err != nil {
 		fmt.Fprintf(stderr, "l2sync: folder %q: %v\n", rawPath, err)
 		return shareExitError
 	}
+	defer func() {
+		if exitCode == shareExitOK {
+			return
+		}
+		if err := removeCreated(); err != nil {
+			fmt.Fprintf(stderr, "l2sync: %v\n", err)
+		}
+	}()
 	if !info.IsDir() {
 		fmt.Fprintf(stderr, "l2sync: folder %q is not a directory\n", rawPath)
 		return shareExitError
