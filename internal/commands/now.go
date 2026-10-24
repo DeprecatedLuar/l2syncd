@@ -93,6 +93,24 @@ type CycleSummary struct {
 	Outcomes []FolderOutcome
 }
 
+// errUncommitted marks a local mutation that landed on disk while its index
+// commit failed.
+var errUncommitted = errors.New("mutation applied without index commit")
+
+func uncommitted(err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%w: %w", errUncommitted, err)
+}
+
+func sharedPeerError(peer, name string, err error) error {
+	if transport.IsError(err) {
+		return fmt.Errorf("peer %q: %w", peer, err)
+	}
+	return fmt.Errorf("peer %q does not serve folder %q: %w", peer, name, err)
+}
+
 var (
 	requestPeerCycle   = transport.RequestCycle
 	runBoundFolderPlan = planBoundFolder
@@ -399,7 +417,9 @@ func planFolder(ctx context.Context, cfg config.Config, name, path, peer string,
 			continue
 		}
 		if err := applyAction(ctx, action, name, marker.ID, path, remoteIdentity, endpoint, local, remote); err != nil {
-			nowLogger.Error("initiator mutation applied WITHOUT index commit", "folder", name, "peer", peer, "path", action.Path, "kind", action.Kind, "error", err)
+			if errors.Is(err, errUncommitted) {
+				nowLogger.Error("initiator mutation applied WITHOUT index commit", "folder", name, "peer", peer, "path", action.Path, "kind", action.Kind, "error", err)
+			}
 			return 0, err
 		}
 	}
@@ -497,7 +517,7 @@ func restoreDirectoryMetadata(ctx context.Context, fileActions, directoryActions
 			if err := apply.ApplyDirectory(root, path, manifest); err != nil {
 				return err
 			}
-			return commitDirectory(folderID, path, manifest)
+			return uncommitted(commitDirectory(folderID, path, manifest))
 		}); err != nil {
 			return err
 		}
@@ -538,7 +558,7 @@ func applyDirectoryDelete(ctx context.Context, action engine.Action, share, fold
 			if err := apply.DeleteDirectory(root, action.Path); err != nil {
 				return err
 			}
-			return removeDirectoryEntry(folderID, action.Path)
+			return uncommitted(removeDirectoryEntry(folderID, action.Path))
 		})
 	}
 	return transport.DeleteDirectory(ctx, endpoint, share, action.Path)
@@ -554,7 +574,7 @@ func findPeerForShared(ctx context.Context, cfg config.Config, name string) (str
 		return "", transport.Endpoint{}, err
 	}
 	if _, _, err := transport.ListFiles(ctx, endpoint, name, ""); err != nil {
-		return "", transport.Endpoint{}, fmt.Errorf("peer %q does not serve folder %q: %w", peer, name, err)
+		return "", transport.Endpoint{}, sharedPeerError(peer, name, err)
 	}
 	return peer, endpoint, nil
 }
@@ -632,7 +652,7 @@ func applyConflict(ctx context.Context, action engine.Action, share, folderID, r
 			if err := apply.WriteConflictWinnerWithSuffix(root, action.Path, suffix, bytes.NewReader(data), remoteEntry.Hash, remoteEntry.Metadata); err != nil {
 				return err
 			}
-			return commitLocalEntry(folderID, action.Path, index.Entry{Version: action.Vector, Hash: remoteEntry.Hash, Metadata: remoteEntry.Metadata})
+			return uncommitted(commitLocalEntry(folderID, action.Path, index.Entry{Version: action.Vector, Hash: remoteEntry.Hash, Metadata: remoteEntry.Metadata}))
 		})
 	}
 	data, err := readShareFile(root, action.Path)
@@ -649,7 +669,7 @@ func applyConflict(ctx context.Context, action engine.Action, share, folderID, r
 		}
 		// The local canonical file already holds the winning bytes; only
 		// its vector advances to the merged value.
-		return commitLocalEntry(folderID, action.Path, index.Entry{Version: action.Vector, Hash: localEntry.Hash, Metadata: localEntry.Metadata})
+		return uncommitted(commitLocalEntry(folderID, action.Path, index.Entry{Version: action.Vector, Hash: localEntry.Hash, Metadata: localEntry.Metadata}))
 	}); err != nil {
 		return fmt.Errorf("preserve conflict loser %q locally: %w", action.Path, err)
 	}
@@ -676,7 +696,7 @@ func pullFile(ctx context.Context, endpoint transport.Endpoint, share, folderID,
 		if err := apply.WriteWithMetadata(root, relative, bytes.NewReader(data), entry.Hash, entry.Metadata); err != nil {
 			return err
 		}
-		return commitLocalEntry(folderID, relative, index.Entry{Version: vec, Hash: entry.Hash, Metadata: entry.Metadata})
+		return uncommitted(commitLocalEntry(folderID, relative, index.Entry{Version: vec, Hash: entry.Hash, Metadata: entry.Metadata}))
 	})
 }
 
@@ -696,7 +716,7 @@ func applyLocalDelete(ctx context.Context, share, folderID, root, relative strin
 		if err := apply.Delete(root, relative); err != nil {
 			return err
 		}
-		return commitLocalEntry(folderID, relative, index.Entry{Version: vec, Deleted: true, DeletedAt: time.Now().UTC()})
+		return uncommitted(commitLocalEntry(folderID, relative, index.Entry{Version: vec, Deleted: true, DeletedAt: time.Now().UTC()}))
 	})
 }
 
@@ -723,7 +743,7 @@ func reuseLocal(ctx context.Context, share, folderID, root, relative string, vec
 			if err := apply.Reuse(root, relative, source, offered.Hash, offered.Metadata); err != nil {
 				return err
 			}
-			return commitLocalEntry(folderID, relative, index.Entry{Version: vec, Hash: offered.Hash, Metadata: offered.Metadata})
+			return uncommitted(commitLocalEntry(folderID, relative, index.Entry{Version: vec, Hash: offered.Hash, Metadata: offered.Metadata}))
 		})
 		if err != nil {
 			if errors.Is(err, apply.ErrReuseMismatch) {

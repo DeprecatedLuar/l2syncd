@@ -4,13 +4,16 @@ package commands
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"l2syncd/internal/guard"
 	"l2syncd/internal/index"
+	"l2syncd/internal/transport"
 	"l2syncd/internal/vector"
 )
 
@@ -59,5 +62,26 @@ func TestApplyLocalDeleteSetsDeletedAt(t *testing.T) {
 	}
 	if entry.DeletedAt.Before(before) {
 		t.Fatalf("entry.DeletedAt = %v, want >= %v", entry.DeletedAt, before)
+	}
+}
+
+func TestUncommittedMarksOnlyCommitFailures(t *testing.T) {
+	if uncommitted(nil) != nil {
+		t.Fatal("uncommitted(nil) != nil")
+	}
+	wrapped := uncommitted(errors.New("disk full"))
+	if !errors.Is(wrapped, errUncommitted) || !strings.Contains(wrapped.Error(), "disk full") {
+		t.Fatalf("uncommitted = %v", wrapped)
+	}
+}
+
+func TestSharedPeerErrorSeparatesTransportFromRefusal(t *testing.T) {
+	err := sharedPeerError("phone", "notes", transport.NewAuthErrorForTest("connect to peer: timeout"))
+	if strings.Contains(err.Error(), "does not serve") {
+		t.Fatalf("transport failure reported as not served: %v", err)
+	}
+	served := sharedPeerError("phone", "notes", errors.New(`folder "notes" is not bound`))
+	if !strings.Contains(served.Error(), "does not serve") {
+		t.Fatalf("application refusal = %v, want does-not-serve", served)
 	}
 }
