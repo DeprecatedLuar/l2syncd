@@ -151,7 +151,7 @@ func loadIndex(id string) (index.Index, error) {
 
 // commitLocalEntry is the single index-commit function every mutating path
 // uses to persist the result of a local write, a peer-driven write, a
-// content reuse, or a vector-only merge (implementation-plan.md Phase C).
+// content reuse, or a vector-only merge.
 func commitLocalEntry(folderID, path string, entry index.Entry) error {
 	idx, err := loadIndex(folderID)
 	if err != nil {

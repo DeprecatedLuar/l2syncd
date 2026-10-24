@@ -127,8 +127,8 @@ type message struct {
 	Actions   int               `json:"actions,omitempty"`
 	// Version is the version vector attached to a listing entry, or the
 	// resulting vector a mutation's target path must hold once it lands
-	// (implementation-plan.md Phase C: every action carries its result
-	// vector so the receiving side never has to re-derive one).
+	// (every action carries its result vector so the receiving side never
+	// has to re-derive one).
 	Version vector.Vector `json:"version,omitempty"`
 	// Deleted marks a listing entry as a tombstone: no content fields are
 	// meaningful when this is set (concept.md 4.2).
@@ -172,7 +172,7 @@ type PeerFile struct {
 // A nil field disables its corresponding request. Every mutation callback
 // that persists an index entry receives the exact vector.Vector that entry
 // must hold once the mutation lands, so the receiving side never re-derives
-// one (implementation-plan.md Phase C).
+// one.
 type Callbacks struct {
 	ListShares         func() ([]string, error)
 	BindShare          func(string) (bool, error)
@@ -194,7 +194,7 @@ type Callbacks struct {
 	MergeVector func(share, relative string, vec vector.Vector) error
 	// AcknowledgeVector records that the calling peer's knowledge of share
 	// has reached vec, letting the callee prune any tombstone that vec now
-	// dominates (implementation-plan.md Phase E, concept.md 4.2 "Tombstone
+	// dominates (concept.md 4.2 "Tombstone
 	// lifetime"). It carries no per-path target: vec is a whole-folder
 	// watermark, not a single entry's vector.
 	AcknowledgeVector func(share string, vec vector.Vector) error
@@ -555,9 +555,9 @@ func MergeVector(ctx context.Context, endpoint Endpoint, share, relative string,
 }
 
 // AcknowledgeVector tells a peer that this installation's knowledge of share
-// has reached vec, so the peer may prune any tombstone vec now dominates
-// (implementation-plan.md Phase E). Unlike other mutation RPCs it carries no
-// relative path, so it bypasses runSimpleMutation's path validation.
+// has reached vec, so the peer may prune any tombstone vec now dominates.
+// Unlike other mutation RPCs it carries no relative path, so it bypasses
+// runSimpleMutation's path validation.
 func AcknowledgeVector(ctx context.Context, endpoint Endpoint, share string, vec vector.Vector) error {
 	if endpoint.Address == "" || share == "" {
 		return errors.New("peer address and share are required")

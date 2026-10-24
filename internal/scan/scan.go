@@ -81,7 +81,7 @@ func ListEntries(idx index.Index) []ListedFile {
 // Reconcile walks root and confirms local changes against previous,
 // incrementing fingerprint's counter only for paths a confirmed local
 // change touched (added, modified, or deleted) and never touching an
-// unchanged entry's vector (implementation-plan.md Phase C). A file
+// unchanged entry's vector. A file
 // deletion becomes a tombstone, never a removed entry (concept.md 4.2).
 func Reconcile(root string, previous index.Index, patterns []string, fingerprint string) (Result, error) {
 	if fingerprint == "" {

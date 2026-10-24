@@ -88,11 +88,10 @@ func TestCreationOnAPeerNeverSeenIsCreatedNotDeleted(t *testing.T) {
 	}
 }
 
-// TestThreePeerResurrectionNeverHappens is the three-peer regression case
-// from implementation-plan.md Phase C: A deletes, B applies the delete, and
-// C reconnects still holding the file from before the deletion. The file
-// must stay deleted on both A and B's perspective when C's stale entry is
-// compared, in either pairing.
+// TestThreePeerResurrectionNeverHappens is the three-peer regression case:
+// A deletes, B applies the delete, and C reconnects still holding the file
+// from before the deletion. The file must stay deleted on both A and B's
+// perspective when C's stale entry is compared, in either pairing.
 func TestThreePeerResurrectionNeverHappens(t *testing.T) {
 	// A deleted the file after B had already synced the original creation:
 	// both A and B's tombstone/knowledge dominates C's untouched copy.

@@ -284,7 +284,7 @@ func serveCallbacks(resolve folderResolver) transport.Callbacks {
 			// A conflict copy lands at a new path neither replica has
 			// tracked before, so it carries no vector to commit: the next
 			// local scan on either side picks it up as an ordinary
-			// creation (implementation-plan.md Phase C).
+			// creation.
 			return apply.WriteConflictCopyWithSuffix(folder.root, relative, suffix, contents, expectedHash, manifest)
 		})
 	}
@@ -479,8 +479,7 @@ func mutateServedFolder(name string, resolve folderResolver, mutation func(resol
 // mutation lock, logging start/failure/completion uniformly. op is
 // responsible for both applying the mutation and persisting its result --
 // via commitLocalEntry, commitDirectory, or removeDirectoryEntry, the
-// index-commit functions every mutating path uses (implementation-plan.md
-// Phase C).
+// index-commit functions every mutating path uses.
 func mutateAndLog(name, relative, handler string, resolve folderResolver, op func(resolvedFolder) error) error {
 	serveLogger.Debug("mutation start", "handler", handler, "folder", name, "path", relative)
 	err := mutateServedFolder(name, resolve, func(folder resolvedFolder) error {

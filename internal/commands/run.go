@@ -511,9 +511,8 @@ func seedPeerReachability(ctx context.Context, cfg config.Config, reachable map[
 }
 
 // pollPeerReachability updates reachable in place and reports whether any
-// bound peer just transitioned from unreachable to reachable
-// (implementation-plan.md Phase F: reconnect trigger). A change made while
-// the peer was unreachable already fired its filesystem event and was
+// bound peer just transitioned from unreachable to reachable. A change made
+// while the peer was unreachable already fired its filesystem event and was
 // otherwise lost until the periodic backstop; this lets it propagate as
 // soon as the peer comes back.
 func pollPeerReachability(ctx context.Context, cfg config.Config, reachable map[string]bool, logger *slog.Logger, probe func(context.Context, config.Config, string) bool) bool {

@@ -255,7 +255,7 @@ func localInitiatesCycle(localIdentity, remoteIdentity string) (bool, error) {
 }
 
 // folderCycleLocks serializes every full initiator cycle for one folder
-// within this process (implementation-plan.md Phase F). A locally
+// within this process. A locally
 // triggered cycle (filesystem, periodic, retry, startup) and an inbound
 // peer-requested cycle (serve.go's RequestCycle callback, reached over a
 // concurrent SSH session) both call runInitiatorFolderCycle for the same
@@ -364,8 +364,7 @@ func planBoundFolder(ctx context.Context, cfg config.Config, name, expectedPeer 
 // agreed-snapshot model, there is no separate "commit the whole tree at the
 // end" step: every applied action commits its own resulting vector as it
 // lands, through the single commitLocalEntry/commitDirectory/
-// removeDirectoryEntry functions also used by serve.go (implementation-plan.md
-// Phase C).
+// removeDirectoryEntry functions also used by serve.go.
 func planFolder(ctx context.Context, cfg config.Config, name, path, peer string, endpoint transport.Endpoint) (int, error) {
 	marker, err := guard.ReadMarker(path)
 	if err != nil {
@@ -445,7 +444,7 @@ func planFolder(ctx context.Context, cfg config.Config, name, path, peer string,
 // acknowledgeCycle records, at the end of a successful cycle, that peer
 // remoteIdentity's knowledge of this folder has caught up to every entry
 // this installation now holds, pruning any tombstone that watermark
-// dominates (implementation-plan.md Phase E, concept.md 4.2 "Tombstone
+// dominates (concept.md 4.2 "Tombstone
 // lifetime"). It never fails the cycle: a local index error or an
 // unreachable peer just postpones pruning to a later cycle, exactly as
 // pruning is specified to be lazy and optional.
@@ -582,8 +581,7 @@ func findPeerForShared(ctx context.Context, cfg config.Config, name string) (str
 // applyAction executes one file-entry decision. Every branch that changes
 // this installation's own index commits the resulting action.Vector through
 // commitLocalEntry; a branch that only changes the peer's copy relies on the
-// corresponding transport call to carry that same vector across
-// (implementation-plan.md Phase C).
+// corresponding transport call to carry that same vector across.
 func applyAction(ctx context.Context, action engine.Action, share, folderID, root, provider string, endpoint transport.Endpoint, local, remote index.Index) error {
 	remoteEntry := remote.Entries[action.Path]
 	localEntry := local.Entries[action.Path]
