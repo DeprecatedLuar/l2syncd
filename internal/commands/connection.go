@@ -109,7 +109,24 @@ func connectionAdd(args []string, stdin io.Reader, stdout, stderr io.Writer) int
 	if request.key != "" {
 		return acceptPeerKey(cfg, request, stdout, stderr)
 	}
+	request.destination = dialDestination(cfg, request)
+	if err := config.ValidatePeerAddress(request.destination); err != nil {
+		fmt.Fprintf(stderr, "l2sync: invalid SSH destination: %v\n", err)
+		return connectionExitError
+	}
 	return dialPeer(cfg, request, stdout, stderr)
+}
+
+// dialDestination is the destination given, else the address the peer
+// already stores, else the peer name.
+func dialDestination(cfg config.Config, request connectionAddRequest) string {
+	if request.destination != "" {
+		return request.destination
+	}
+	if peer, exists := cfg.Peers[request.name]; exists && peer.Address != "" {
+		return peer.Address
+	}
+	return request.name
 }
 
 // acceptPeerKey grants a peer's key restricted access here. With no
@@ -184,8 +201,8 @@ func dialPeer(cfg config.Config, request connectionAddRequest, stdout, stderr io
 		return connectionExitError
 	}
 	if existed && existing.PublicKey != "" {
-		if err := storePeerLocked(request.name, existing); err != nil {
-			fmt.Fprintf(stderr, "l2sync: verify active peer: %v\n", err)
+		if err := reverifyReturnRoute(ctx, request.name, existing, request.returnAddress); err != nil {
+			fmt.Fprintf(stderr, "l2sync: %v\n", err)
 			return connectionExitError
 		}
 		return connectionExitOK
@@ -614,9 +631,6 @@ func parseConnectionAdd(args []string, stdin io.Reader) (connectionAddRequest, e
 	}
 	if request.key != "" && request.returnAddress != "" {
 		return connectionAddRequest{}, errors.New("--address applies only when dialing a peer, not with --key")
-	}
-	if request.key == "" && request.destination == "" {
-		request.destination = request.name
 	}
 	if request.destination != "" {
 		if err := config.ValidatePeerAddress(request.destination); err != nil {

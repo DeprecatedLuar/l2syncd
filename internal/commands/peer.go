@@ -53,14 +53,35 @@ func activatePeer(ctx context.Context, cfg config.Config, name, returnAddress st
 	}
 	endpoint.PublicKey = peer.PublicKey
 	endpoint.AcceptPublicKey = nil
-	route, err := localReturnRoute(returnAddress)
-	if err == nil {
-		err = connectionVerifyReturn(ctx, endpoint, route)
-	}
-	if err != nil {
-		return transport.Endpoint{}, fmt.Errorf("peer %q cannot reach this machine back: %w; if the address it sees is wrong, rerun: l2sync connection add %s --address <user@host>", name, errors.Join(err, deactivatePeer(name, peer.PublicKey)), name)
+	if err := verifyLocalReturn(ctx, endpoint, returnAddress); err != nil {
+		return transport.Endpoint{}, returnRouteError(name, errors.Join(err, deactivatePeer(name, peer.PublicKey)))
 	}
 	return endpoint, nil
+}
+
+// reverifyReturnRoute asks an active peer to dial this machine back again,
+// refreshing the route it stores. The peer reverts its own side on failure.
+func reverifyReturnRoute(ctx context.Context, name string, peer config.Peer, returnAddress string) error {
+	endpoint, err := endpointForPeer(name, peer, nil)
+	if err != nil {
+		return err
+	}
+	if err := verifyLocalReturn(ctx, endpoint, returnAddress); err != nil {
+		return returnRouteError(name, err)
+	}
+	return nil
+}
+
+func verifyLocalReturn(ctx context.Context, endpoint transport.Endpoint, returnAddress string) error {
+	route, err := localReturnRoute(returnAddress)
+	if err != nil {
+		return err
+	}
+	return connectionVerifyReturn(ctx, endpoint, route)
+}
+
+func returnRouteError(name string, err error) error {
+	return fmt.Errorf("peer %q cannot reach this machine back: %w; if the address it sees is wrong, rerun: l2sync connection add %s --address <user@host>", name, err, name)
 }
 
 // deactivatePeer returns name to pending and removes its reciprocal grant.

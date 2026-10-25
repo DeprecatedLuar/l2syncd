@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -658,7 +659,7 @@ func TestParseConnectionAddForms(t *testing.T) {
 		args []string
 		want connectionAddRequest
 	}{
-		{[]string{"vps"}, connectionAddRequest{name: "vps", destination: "vps"}},
+		{[]string{"vps"}, connectionAddRequest{name: "vps"}},
 		{[]string{"vps", "luar@host"}, connectionAddRequest{name: "vps", destination: "luar@host"}},
 		{[]string{"vps", "luar@host", "--address", "me@mine"}, connectionAddRequest{name: "vps", destination: "luar@host", returnAddress: "me@mine"}},
 	} {
@@ -904,5 +905,212 @@ func TestLocalReturnRouteRejectsDegenerateOverrides(t *testing.T) {
 	}
 	if route.User != "alex" || route.Host != "host.lan" {
 		t.Fatalf("route = %+v, want alex@host.lan", route)
+	}
+}
+
+func TestConnectionAddRerunActivatesAcceptedInviteWithStoredDestination(t *testing.T) {
+	remoteKey := generatedPublicKey(t, filepath.Join(t.TempDir(), "remote"))
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
+	inviteAccepted := false
+	var dialedAddress string
+	var sentRoute transport.ReturnRoute
+	restore := []func(){
+		swap(&connectionProbe, func(context.Context, string) error { return errors.New("Permission denied (publickey)") }),
+		swap(&connectionInstall, func(context.Context, string, string, string) (bool, error) {
+			t.Fatal("login install attempted")
+			return false, nil
+		}),
+		swap(&connectionExchange, func(_ context.Context, endpoint transport.Endpoint) error {
+			if !inviteAccepted {
+				return transport.NewAuthErrorForTest("invite not run yet")
+			}
+			dialedAddress = endpoint.Address
+			return endpoint.AcceptPublicKey(remoteKey)
+		}),
+		swap(&localSSHD, func() (connectionpkg.SSHD, error) {
+			return connectionpkg.SSHD{Port: 22, HostKeys: []string{testReturnHostKey}}, nil
+		}),
+		swap(&connectionVerifyReturn, func(_ context.Context, _ transport.Endpoint, route transport.ReturnRoute) error {
+			sentRoute = route
+			return nil
+		}),
+	}
+	t.Cleanup(func() {
+		for _, undo := range restore {
+			undo()
+		}
+	})
+	var stdout, stderr bytes.Buffer
+	if code := connectionAdd([]string{"friend", "alex@example.test"}, strings.NewReader(""), &stdout, &stderr); code != connectionExitOK {
+		t.Fatalf("invite run = %d, stderr %q", code, stderr.String())
+	}
+	inviteAccepted = true
+	stdout.Reset()
+	stderr.Reset()
+	if code := connectionAdd([]string{"friend", "--address", "me@mine.example"}, strings.NewReader(""), &stdout, &stderr); code != connectionExitOK {
+		t.Fatalf("rerun = %d, stderr %q", code, stderr.String())
+	}
+	if dialedAddress != "alex@example.test" {
+		t.Fatalf("dialed %q, want stored destination", dialedAddress)
+	}
+	if sentRoute.User != "me" || sentRoute.Host != "mine.example" {
+		t.Fatalf("return route = %+v, want me@mine.example", sentRoute)
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if peer := cfg.Peers["friend"]; peer.PublicKey != remoteKey || peer.Address != "alex@example.test" {
+		t.Fatalf("peer after rerun = %+v", peer)
+	}
+}
+
+func TestConnectionAddRefusesDifferentExplicitDestination(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
+	cfg := config.New()
+	cfg.Peers["friend"] = config.Peer{Address: "alex@example.test"}
+	if err := config.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	if code := connectionAdd([]string{"friend", "other@example.test"}, strings.NewReader(""), &stdout, &stderr); code == connectionExitOK {
+		t.Fatal("different destination accepted")
+	}
+	if !strings.Contains(stderr.String(), "different connection data") {
+		t.Fatalf("stderr = %q", stderr.String())
+	}
+}
+
+// activePeerFixture stores an active peer and records every verify-return
+// call made against it.
+func activePeerFixture(t *testing.T, peer config.Peer, verifyErr error) (*[]transport.ReturnRoute, *[]transport.Endpoint) {
+	t.Helper()
+	_, cfg := cycleTestConfig(t, true)
+	peer.PublicKey = cfg.Peers["phone"].PublicKey
+	cfg.Peers["phone"] = peer
+	if err := config.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	var routes []transport.ReturnRoute
+	var endpoints []transport.Endpoint
+	restore := []func(){
+		swap(&connectionProbe, func(context.Context, string) error {
+			t.Fatal("login probe attempted for an active peer")
+			return nil
+		}),
+		swap(&connectionExchange, func(context.Context, transport.Endpoint) error {
+			t.Fatal("hello exchange attempted for an active peer")
+			return nil
+		}),
+		swap(&localSSHD, func() (connectionpkg.SSHD, error) {
+			return connectionpkg.SSHD{Port: 2222, HostKeys: []string{testReturnHostKey}}, nil
+		}),
+		swap(&connectionVerifyReturn, func(_ context.Context, endpoint transport.Endpoint, route transport.ReturnRoute) error {
+			routes = append(routes, route)
+			endpoints = append(endpoints, endpoint)
+			return verifyErr
+		}),
+	}
+	t.Cleanup(func() {
+		for _, undo := range restore {
+			undo()
+		}
+	})
+	return &routes, &endpoints
+}
+
+func TestConnectionAddActivePeerReverifiesReturnRoute(t *testing.T) {
+	current, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name               string
+		args               []string
+		wantUser, wantHost string
+	}{
+		{"no destination", []string{"phone"}, current.Username, ""},
+		{"same destination", []string{"phone", "luar@phone.example"}, current.Username, ""},
+		{"address override", []string{"phone", "--address", "user@Host.example"}, "user", "host.example"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			routes, endpoints := activePeerFixture(t, config.Peer{Address: "luar@phone.example", Port: 2200}, nil)
+			before, err := config.Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			var stdout, stderr bytes.Buffer
+			if code := connectionAdd(tc.args, strings.NewReader(""), &stdout, &stderr); code != connectionExitOK {
+				t.Fatalf("connectionAdd = %d, stderr %q", code, stderr.String())
+			}
+			if len(*routes) != 1 {
+				t.Fatalf("verify-return calls = %d, want 1", len(*routes))
+			}
+			route, endpoint := (*routes)[0], (*endpoints)[0]
+			if route.User != tc.wantUser || route.Host != tc.wantHost || route.Port != 2222 || len(route.HostKeys) != 1 {
+				t.Fatalf("route = %+v", route)
+			}
+			if endpoint.Address != "luar@phone.example" || endpoint.Port != 2200 || endpoint.PublicKey != before.Peers["phone"].PublicKey {
+				t.Fatalf("endpoint = %+v", endpoint)
+			}
+			after, err := config.Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if after.Peers["phone"] != before.Peers["phone"] {
+				t.Fatalf("peer changed: %+v -> %+v", before.Peers["phone"], after.Peers["phone"])
+			}
+		})
+	}
+}
+
+func TestConnectionAddActivePeerReportsReturnFailureWithHint(t *testing.T) {
+	routes, _ := activePeerFixture(t, config.Peer{Address: "luar@phone.example"}, errors.New("dial back timeout"))
+	before, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	if code := connectionAdd([]string{"phone"}, strings.NewReader(""), &stdout, &stderr); code == connectionExitOK {
+		t.Fatal("connection add succeeded despite failed dial-back")
+	}
+	if len(*routes) != 1 {
+		t.Fatalf("verify-return calls = %d, want 1", len(*routes))
+	}
+	if !strings.Contains(stderr.String(), "dial back timeout") || !strings.Contains(stderr.String(), "l2sync connection add phone --address <user@host>") {
+		t.Fatalf("stderr = %q, want cause and --address hint", stderr.String())
+	}
+	after, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Peers["phone"] != before.Peers["phone"] {
+		t.Fatalf("peer changed: %+v -> %+v", before.Peers["phone"], after.Peers["phone"])
+	}
+}
+
+func TestConnectionAddKeyOnlyActivePeerDoesNotDial(t *testing.T) {
+	routes, _ := activePeerFixture(t, config.Peer{}, nil)
+	before, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	connectionAdd([]string{"phone"}, strings.NewReader(""), &stdout, &stderr)
+	if len(*routes) != 0 {
+		t.Fatalf("key-only peer dialed back %d times", len(*routes))
+	}
+	after, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Peers["phone"] != before.Peers["phone"] {
+		t.Fatalf("peer changed: %+v -> %+v", before.Peers["phone"], after.Peers["phone"])
 	}
 }
