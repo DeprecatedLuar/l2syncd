@@ -143,7 +143,7 @@ func acceptPeerKey(cfg config.Config, request connectionAddRequest, stdout, stde
 		return connectionExitError
 	}
 	if err := connectionpkg.AddGrant(paths.AuthorizedKeys, request.name, request.key); err != nil {
-		fmt.Fprintf(stderr, "l2sync: install restricted grant: %v\n", err)
+		fmt.Fprintf(stderr, "l2sync: install restricted grant: %v\n", errors.Join(err, revertAcceptedPeer(request.name, peer, existing, existed)))
 		return connectionExitError
 	}
 	if shell, err := loginShell(); err == nil && filepath.Base(shell) == "bash" {
@@ -155,6 +155,22 @@ func acceptPeerKey(cfg config.Config, request connectionAddRequest, stdout, stde
 	}
 	fmt.Fprintf(stdout, message+"\n", request.name)
 	return connectionExitOK
+}
+
+// revertAcceptedPeer undoes the entry acceptPeerKey stored, leaving any
+// concurrent change to the entry untouched.
+func revertAcceptedPeer(name string, stored, previous config.Peer, existed bool) error {
+	return updateConfigLocked(func(current *config.Config) error {
+		if latest, exists := current.Peers[name]; !exists || latest != stored {
+			return nil
+		}
+		if existed {
+			current.Peers[name] = previous
+		} else {
+			delete(current.Peers, name)
+		}
+		return nil
+	})
 }
 
 // dialPeer registers a peer reached over SSH and proves both directions:
@@ -439,9 +455,12 @@ func connectionRemove(args []string, stderr io.Writer) (exitCode int) {
 		}
 	}
 	if peer.Address != "" {
-		if err := connectionpkg.UnpinHostKeys(paths.KnownHosts, config.AddressHost(peer.Address), peer.Port); err != nil {
-			fmt.Fprintf(stderr, "l2sync: remove pinned host keys: %v; retry connection rm\n", err)
-			return connectionExitError
+		host := config.AddressHost(peer.Address)
+		if _, shared := peerUsingEndpoint(&cfg, name, host, peer.Port); !shared {
+			if err := connectionpkg.UnpinHostKeys(paths.KnownHosts, host, peer.Port); err != nil {
+				fmt.Fprintf(stderr, "l2sync: remove pinned host keys: %v; retry connection rm\n", err)
+				return connectionExitError
+			}
 		}
 	}
 

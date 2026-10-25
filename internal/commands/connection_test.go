@@ -791,3 +791,88 @@ func stubReturnRouteSuccess(t *testing.T) {
 	restoreVerify := swap(&connectionVerifyReturn, func(context.Context, transport.Endpoint, transport.ReturnRoute) error { return nil })
 	t.Cleanup(func() { restoreSSHD(); restoreVerify() })
 }
+
+func TestConnectionRemoveUnpinsHostKeysUnlessShared(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		otherHost  string
+		wantPinned bool
+	}{
+		{"unshared", "elsewhere", false},
+		{"shared", "pinned.test", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			t.Setenv("HOME", root)
+			t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+			t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
+			paths, err := connectionpkg.DefaultPaths()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := connectionpkg.PinHostKeys(paths.KnownHosts, "pinned.test", 22, []string{testReturnHostKey}); err != nil {
+				t.Fatal(err)
+			}
+			cfg := config.New()
+			cfg.Peers["gone"] = config.Peer{Address: "luar@pinned.test"}
+			cfg.Peers["stays"] = config.Peer{Address: "other@" + tc.otherHost}
+			if err := config.Save(cfg); err != nil {
+				t.Fatal(err)
+			}
+			var stderr bytes.Buffer
+			if code := connectionRemove([]string{"gone"}, &stderr); code != connectionExitOK {
+				t.Fatalf("connectionRemove = %d, stderr %q", code, stderr.String())
+			}
+			keys, err := connectionpkg.HostKeysFor(paths.KnownHosts, "pinned.test", 22)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if pinned := len(keys) > 0; pinned != tc.wantPinned {
+				t.Fatalf("pinned keys after rm = %v, want pinned=%v", keys, tc.wantPinned)
+			}
+		})
+	}
+}
+
+func TestAcceptPeerKeyRevertsStoredPeerWhenGrantFails(t *testing.T) {
+	for _, existed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("existing=%v", existed), func(t *testing.T) {
+			root := t.TempDir()
+			t.Setenv("HOME", root)
+			t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+			t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
+			key := generatedPublicKey(t, filepath.Join(root, "remote"))
+			staleKey := generatedPublicKey(t, filepath.Join(root, "stale"))
+			paths, err := connectionpkg.DefaultPaths()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := connectionpkg.AddGrant(paths.AuthorizedKeys, "phone", staleKey); err != nil {
+				t.Fatal(err)
+			}
+			cfg := config.New()
+			previous := config.Peer{Address: "phone-host", Port: 2222}
+			if existed {
+				cfg.Peers["phone"] = previous
+			}
+			if err := config.Save(cfg); err != nil {
+				t.Fatal(err)
+			}
+			var stdout, stderr bytes.Buffer
+			if code := connectionAdd([]string{"phone", "--key", key}, strings.NewReader(""), &stdout, &stderr); code == connectionExitOK {
+				t.Fatal("connection add succeeded despite grant refusal")
+			}
+			if !strings.Contains(stderr.String(), "install restricted grant") {
+				t.Fatalf("stderr = %q", stderr.String())
+			}
+			after, err := config.Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, exists := after.Peers["phone"]
+			if existed && got != previous || !existed && exists {
+				t.Fatalf("peer after failed grant = %+v, exists=%v", got, exists)
+			}
+		})
+	}
+}
