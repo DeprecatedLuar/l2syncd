@@ -32,6 +32,17 @@ const (
 	connectionExitOK    = 0
 	connectionExitError = 1
 	connectionBinary    = "l2sync"
+
+	connectionAddUsage       = "usage: l2sync connection add <name> [destination] [--key <pubkey>] [--address <user@host>]"
+	connectionAddedMessage   = "peer %q added"
+	connectionPresentMessage = "peer %q already present"
+	suppliedKeyLimit         = 16 << 10
+
+	flagPrefix  = "--"
+	keyFlag     = "--key"
+	addressFlag = "--address"
+	forceFlag   = "--force"
+	stdinMarker = "-"
 )
 
 const (
@@ -55,11 +66,12 @@ var connectionStatusRank = map[string]int{
 }
 
 var (
-	connectionProbe      = probeExistingAccess
-	connectionInstall    = installRemoteGrant
-	connectionExchange   = transport.Exchange
-	connectionListShares = transport.ListShares
-	loginShell           = currentLoginShell
+	connectionProbe        = probeExistingAccess
+	connectionInstall      = installRemoteGrant
+	connectionRemoteRemove = removeRemotePeer
+	connectionExchange     = transport.Exchange
+	connectionListShares   = transport.ListShares
+	loginShell             = currentLoginShell
 )
 
 // Connection dispatches peer credential management commands. With no
@@ -84,7 +96,7 @@ func Connection(args []string, stdout, stderr io.Writer) int {
 }
 
 func connectionAdd(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
-	name, address, suppliedKey, err := parseConnectionAdd(args, stdin)
+	request, err := parseConnectionAdd(args, stdin)
 	if err != nil {
 		fmt.Fprintf(stderr, "l2sync: %v\n", err)
 		return connectionExitError
@@ -94,102 +106,140 @@ func connectionAdd(args []string, stdin io.Reader, stdout, stderr io.Writer) int
 		fmt.Fprintf(stderr, "l2sync: %v\n", err)
 		return connectionExitError
 	}
-	if existing, found := cfg.Peers[name]; found {
-		if existing.Address != address || suppliedKey != "" && existing.PublicKey != "" && existing.PublicKey != suppliedKey {
-			fmt.Fprintf(stderr, "l2sync: peer %q already exists with different connection data\n", name)
-			return connectionExitError
-		}
-		if suppliedKey == "" && existing.PublicKey != "" {
-			if err := storePeerLocked(name, existing); err != nil {
-				fmt.Fprintf(stderr, "l2sync: verify active peer: %v\n", err)
-				return connectionExitError
-			}
-			return connectionExitOK
-		}
+	if request.key != "" {
+		return acceptPeerKey(cfg, request, stdout, stderr)
 	}
-	if suppliedKey != "" {
-		if err := rejectDuplicatePeerKey(cfg, name, suppliedKey); err != nil {
-			fmt.Fprintf(stderr, "l2sync: %v\n", err)
+	return dialPeer(cfg, request, stdout, stderr)
+}
+
+// acceptPeerKey grants a peer's key restricted access here. With no
+// destination the peer is key-only until it connects and its address is
+// learned through verify-return.
+func acceptPeerKey(cfg config.Config, request connectionAddRequest, stdout, stderr io.Writer) int {
+	existing, existed := cfg.Peers[request.name]
+	if existed && (existing.PublicKey != "" && existing.PublicKey != request.key ||
+		request.destination != "" && existing.Address != "" && existing.Address != request.destination) {
+		fmt.Fprintf(stderr, "l2sync: peer %q already exists with different connection data\n", request.name)
+		return connectionExitError
+	}
+	if err := rejectDuplicatePeerKey(cfg, request.name, request.key); err != nil {
+		fmt.Fprintf(stderr, "l2sync: %v\n", err)
+		return connectionExitError
+	}
+	paths, localKey, ok := resolveLocalKey(stderr, "load")
+	if !ok {
+		return connectionExitError
+	}
+	if localKey == request.key {
+		fmt.Fprintln(stderr, "l2sync: peer public key is this installation's key")
+		return connectionExitError
+	}
+	peer := config.Peer{Address: existing.Address, Port: existing.Port, PublicKey: request.key}
+	if request.destination != "" {
+		peer.Address = request.destination
+	}
+	if err := storePeerLocked(request.name, peer); err != nil {
+		fmt.Fprintf(stderr, "l2sync: save peer: %v\n", err)
+		return connectionExitError
+	}
+	if err := connectionpkg.AddGrant(paths.AuthorizedKeys, request.name, request.key); err != nil {
+		fmt.Fprintf(stderr, "l2sync: install restricted grant: %v\n", err)
+		return connectionExitError
+	}
+	if shell, err := loginShell(); err == nil && filepath.Base(shell) == "bash" {
+		fmt.Fprintf(stderr, "l2sync: warning: login shell %q sources startup files before SSH forced commands; use a dedicated sync account for hardened isolation\n", shell)
+	}
+	message := connectionAddedMessage
+	if existed {
+		message = connectionPresentMessage
+	}
+	fmt.Fprintf(stdout, message+"\n", request.name)
+	return connectionExitOK
+}
+
+// dialPeer registers a peer reached over SSH and proves both directions:
+// this side's key works there and the peer can dial back. A failed run
+// removes what it created locally and remotely.
+func dialPeer(cfg config.Config, request connectionAddRequest, stdout, stderr io.Writer) int {
+	ctx := context.Background()
+	existing, existed := cfg.Peers[request.name]
+	if existed && existing.Address != request.destination {
+		fmt.Fprintf(stderr, "l2sync: peer %q already exists with different connection data\n", request.name)
+		return connectionExitError
+	}
+	if existed && existing.PublicKey != "" {
+		if err := storePeerLocked(request.name, existing); err != nil {
+			fmt.Fprintf(stderr, "l2sync: verify active peer: %v\n", err)
 			return connectionExitError
-		}
-		paths, localKey, ok := resolveLocalKey(stderr, "load")
-		if !ok {
-			return connectionExitError
-		}
-		if localKey == suppliedKey {
-			fmt.Fprintln(stderr, "l2sync: peer public key is this installation's key")
-			return connectionExitError
-		}
-		cfg.Peers[name] = config.Peer{Address: address, PublicKey: suppliedKey}
-		if err := storePeerLocked(name, cfg.Peers[name]); err != nil {
-			fmt.Fprintf(stderr, "l2sync: save pending peer: %v\n", err)
-			return connectionExitError
-		}
-		if err := connectionpkg.AddGrant(paths.AuthorizedKeys, name, suppliedKey); err != nil {
-			fmt.Fprintf(stderr, "l2sync: install restricted grant: %v (peer remains pending)\n", err)
-			return connectionExitError
-		}
-		if shell, err := loginShell(); err == nil && filepath.Base(shell) == "bash" {
-			fmt.Fprintf(stderr, "l2sync: warning: login shell %q sources startup files before SSH forced commands; use a dedicated sync account for hardened isolation\n", shell)
 		}
 		return connectionExitOK
 	}
-
+	if existed {
+		// An accepted invite makes the l2sync key work before any login access.
+		if _, err := activatePeer(ctx, cfg, request.name, request.returnAddress); err == nil {
+			return connectionExitOK
+		} else if !transport.IsAuthError(err) {
+			fmt.Fprintf(stderr, "l2sync: %v\n", err)
+			return connectionExitError
+		}
+	}
 	_, localKey, ok := resolveLocalKey(stderr, "prepare")
 	if !ok {
 		return connectionExitError
 	}
-	probeErr := connectionProbe(context.Background(), address)
+	localName := installationName()
+	probeErr := connectionProbe(ctx, request.destination)
 	if probeErr != nil && errors.Is(probeErr, errSSHUnreachable) {
-		fmt.Fprintf(stderr, "l2sync: %s is unreachable via SSH: %v\n", address, probeErr)
+		fmt.Fprintf(stderr, "l2sync: %s is unreachable via SSH: %v\n", request.destination, probeErr)
 		return connectionExitError
 	}
-	available := probeErr == nil
-	if !available {
-		cfg.Peers[name] = config.Peer{Address: address}
-		if err := storePeerLocked(name, cfg.Peers[name]); err != nil {
+	if !existed {
+		cfg.Peers[request.name] = config.Peer{Address: request.destination}
+		if err := storePeerLocked(request.name, cfg.Peers[request.name]); err != nil {
 			fmt.Fprintf(stderr, "l2sync: save pending peer: %v\n", err)
 			return connectionExitError
 		}
-		localName, localAddress, addressKnownGood := installationAddress()
-		command := fmt.Sprintf("l2sync connection add %s %s --key %q", localName, localAddress, localKey)
+	}
+	removeLocal := func() error {
+		if existed {
+			return nil
+		}
+		return removePendingPeer(request.name)
+	}
+	if probeErr != nil {
+		command := fmt.Sprintf("l2sync connection add %s --key %q", localName, localKey)
 		if isTerminalWriter(stdout) {
 			command = ansiBlue + command + ansiReset
 		}
-		fmt.Fprintf(stdout, "%s is reachable but doesn't have your key yet. Have someone run this there:\n\n  %s\n\n", address, command)
-		if !addressKnownGood {
-			fmt.Fprintf(stdout, "warning: this machine's hostname (%q) won't resolve from another host — replace %q above with an address or hostname that actually reaches this machine.\n\n", localAddress, localAddress)
-		}
+		fmt.Fprintf(stdout, "%s is reachable but doesn't have your key yet. Have someone run this there:\n\n  %s\n\nThen run this command again to finish.\n", request.destination, command)
 		return connectionExitOK
 	}
-	peer := config.Peer{Address: address}
-	cfg.Peers[name] = peer
-	if err := storePeerLocked(name, peer); err != nil {
-		fmt.Fprintf(stderr, "l2sync: save pending peer: %v\n", err)
-		return connectionExitError
-	}
-	localName, localAddress, _ := installationAddress()
-	if err := connectionInstall(context.Background(), address, localName, localAddress, localKey); err != nil {
-		fmt.Fprintf(stderr, "l2sync: install remote restricted grant: %v\n", err)
-		return connectionExitError
-	}
-	endpoint, err := endpointForPeer(name, peer, func(publicKey string) error {
-		if err := rejectDuplicatePeerKey(cfg, name, publicKey); err != nil {
-			return err
-		}
-		peer.PublicKey = publicKey
-		cfg.Peers[name] = peer
-		return storePeerLocked(name, peer)
-	})
+	remoteCreated, err := connectionInstall(ctx, request.destination, localName, localKey)
 	if err != nil {
-		fmt.Fprintf(stderr, "l2sync: prepare peer handshake: %v\n", err)
+		fmt.Fprintf(stderr, "l2sync: install remote restricted grant: %v\n", errors.Join(err, removeLocal()))
 		return connectionExitError
 	}
-	if err := connectionExchange(context.Background(), endpoint); err != nil {
-		fmt.Fprintf(stderr, "l2sync: peer handshake: %v\n", err)
+	if _, err := activatePeer(ctx, cfg, request.name, request.returnAddress); err != nil {
+		var remoteCleanup error
+		if remoteCreated {
+			if removeErr := connectionRemoteRemove(ctx, request.destination, localName); removeErr != nil {
+				remoteCleanup = fmt.Errorf("grant left in %s's authorized_keys: %w", request.destination, removeErr)
+			}
+		}
+		fmt.Fprintf(stderr, "l2sync: %v\n", errors.Join(err, remoteCleanup, removeLocal()))
 		return connectionExitError
 	}
 	return connectionExitOK
+}
+
+// removePendingPeer deletes name only while it is still pending.
+func removePendingPeer(name string) error {
+	return updateConfigLocked(func(current *config.Config) error {
+		if peer, exists := current.Peers[name]; exists && peer.PublicKey == "" {
+			delete(current.Peers, name)
+		}
+		return nil
+	})
 }
 
 // resolveLocalKey resolves this installation's key paths and ensures its
@@ -369,7 +419,7 @@ func connectionRemove(args []string, stderr io.Writer) (exitCode int) {
 
 	// Folder ids must be captured before the grant or config are touched:
 	// once the remote registration is gone, its marker can no longer be
-	// address from config alone.
+	// located from config alone.
 	folderIDs := make(map[string]string, len(remoteTargets))
 	for _, remoteName := range remoteTargets {
 		if marker, markerErr := guard.ReadMarker(cfg.Remote[remoteName].Path); markerErr == nil {
@@ -377,14 +427,20 @@ func connectionRemove(args []string, stderr io.Writer) (exitCode int) {
 		}
 	}
 
+	paths, err := connectionpkg.DefaultPaths()
+	if err != nil {
+		fmt.Fprintf(stderr, "l2sync: resolve authorized_keys: %v\n", err)
+		return connectionExitError
+	}
 	if peer.PublicKey != "" {
-		paths, err := connectionpkg.DefaultPaths()
-		if err != nil {
-			fmt.Fprintf(stderr, "l2sync: resolve authorized_keys: %v\n", err)
-			return connectionExitError
-		}
 		if err := connectionpkg.RemoveGrant(paths.AuthorizedKeys, name, peer.PublicKey); err != nil {
 			fmt.Fprintf(stderr, "l2sync: remove restricted grant: %v; retry connection rm\n", err)
+			return connectionExitError
+		}
+	}
+	if peer.Address != "" {
+		if err := connectionpkg.UnpinHostKeys(paths.KnownHosts, config.AddressHost(peer.Address), peer.Port); err != nil {
+			fmt.Fprintf(stderr, "l2sync: remove pinned host keys: %v; retry connection rm\n", err)
 			return connectionExitError
 		}
 	}
@@ -445,7 +501,7 @@ func parseConnectionRemove(args []string) (name string, force bool, err error) {
 	case 1:
 		return args[0], false, nil
 	case 2:
-		if args[1] != "--force" {
+		if args[1] != forceFlag {
 			return "", false, errors.New(usage)
 		}
 		return args[0], true, nil
@@ -501,43 +557,63 @@ func revocationTargets(cfg config.Config, peerName string) (sharedTargets, remot
 	return sharedTargets, remoteTargets
 }
 
-func parseConnectionAdd(args []string, stdin io.Reader) (string, string, string, error) {
+type connectionAddRequest struct {
+	name, destination, key, returnAddress string
+}
+
+func parseConnectionAdd(args []string, stdin io.Reader) (connectionAddRequest, error) {
 	if len(args) < 1 {
-		return "", "", "", errors.New("usage: l2sync connection add <name> [destination] [--key <pubkey>]")
+		return connectionAddRequest{}, errors.New(connectionAddUsage)
 	}
-	name := strings.ToLower(args[0])
-	if err := peername.Validate(name); err != nil {
-		return "", "", "", err
+	request := connectionAddRequest{name: strings.ToLower(args[0])}
+	if err := peername.Validate(request.name); err != nil {
+		return connectionAddRequest{}, err
 	}
-	address := name
-	var key string
-	position := 1
-	if position < len(args) && args[position] != "--key" {
-		address = args[position]
-		position++
+	rest := args[1:]
+	if len(rest) > 0 && !strings.HasPrefix(rest[0], flagPrefix) {
+		request.destination, rest = rest[0], rest[1:]
 	}
-	if position < len(args) {
-		if args[position] != "--key" || position+2 != len(args) {
-			return "", "", "", errors.New("usage: l2sync connection add <name> [destination] [--key <pubkey>]")
+	for len(rest) > 0 {
+		if len(rest) < 2 {
+			return connectionAddRequest{}, errors.New(connectionAddUsage)
 		}
-		key = args[position+1]
-		if key == "-" {
-			contents, err := io.ReadAll(io.LimitReader(stdin, 16<<10))
+		switch rest[0] {
+		case keyFlag:
+			key, err := readSuppliedKey(rest[1], stdin)
 			if err != nil {
-				return "", "", "", fmt.Errorf("read public key: %w", err)
+				return connectionAddRequest{}, err
 			}
-			key = string(contents)
+			request.key = key
+		case addressFlag:
+			request.returnAddress = rest[1]
+		default:
+			return connectionAddRequest{}, errors.New(connectionAddUsage)
 		}
-		normalized, err := connectionpkg.NormalizePublicKey(key)
+		rest = rest[2:]
+	}
+	if request.key != "" && request.returnAddress != "" {
+		return connectionAddRequest{}, errors.New("--address applies only when dialing a peer, not with --key")
+	}
+	if request.key == "" && request.destination == "" {
+		request.destination = request.name
+	}
+	if request.destination != "" {
+		if err := config.ValidatePeerAddress(request.destination); err != nil {
+			return connectionAddRequest{}, fmt.Errorf("invalid SSH destination: %w", err)
+		}
+	}
+	return request, nil
+}
+
+func readSuppliedKey(value string, stdin io.Reader) (string, error) {
+	if value == stdinMarker {
+		contents, err := io.ReadAll(io.LimitReader(stdin, suppliedKeyLimit))
 		if err != nil {
-			return "", "", "", err
+			return "", fmt.Errorf("read public key: %w", err)
 		}
-		key = normalized
+		value = string(contents)
 	}
-	if err := config.ValidatePeerAddress(address); err != nil {
-		return "", "", "", fmt.Errorf("invalid SSH destination: %w", err)
-	}
-	return name, address, key, nil
+	return connectionpkg.NormalizePublicKey(value)
 }
 
 func loadConfigWithoutFolderPreflight() (config.Config, error) {
@@ -593,67 +669,47 @@ func probeExistingAccess(ctx context.Context, destination string) error {
 	return fmt.Errorf("%w: %s", errSSHUnreachable, detail)
 }
 
-func installRemoteGrant(ctx context.Context, destination, localName, localAddress, publicKey string) error {
-	if err := peername.Validate(localName); err != nil {
-		return err
-	}
-	if !safeBootstrapAddress(localAddress) {
-		return errors.New("local bootstrap address contains unsafe characters")
-	}
-	cmd, err := transport.LoginSSHCommand(ctx, destination, connectionBinary, "connection", "add", localName, localAddress, "--key", "-")
+func removeRemotePeer(ctx context.Context, destination, localName string) error {
+	cmd, err := transport.LoginSSHCommand(ctx, destination, connectionBinary, "connection", "rm", localName, forceFlag)
 	if err != nil {
 		return err
 	}
-	cmd.Stdin = strings.NewReader(publicKey + "\n")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
+	if output, err := cmd.CombinedOutput(); err != nil {
 		return transport.RemoteExitError(destination, err, strings.TrimSpace(string(output)))
 	}
 	return nil
 }
 
-// unadvertisableHostnames are hostnames that resolve to "this machine" only
-// from the machine itself; printed as a peer address they would send the
-// remote side back to itself instead of to us.
-var unadvertisableHostnames = map[string]bool{
-	"localhost":     true,
-	"127.0.0.1":     true,
-	"::1":           true,
-	"ip6-localhost": true,
+func installRemoteGrant(ctx context.Context, destination, localName, publicKey string) (bool, error) {
+	if err := peername.Validate(localName); err != nil {
+		return false, err
+	}
+	cmd, err := transport.LoginSSHCommand(ctx, destination, connectionBinary, "connection", "add", localName, keyFlag, stdinMarker)
+	if err != nil {
+		return false, err
+	}
+	cmd.Stdin = strings.NewReader(publicKey + "\n")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return false, transport.RemoteExitError(destination, err, strings.TrimSpace(string(output)))
+	}
+	return strings.Contains(string(output), fmt.Sprintf(connectionAddedMessage, localName)), nil
 }
 
-// installationAddress returns this installation's peer name and the address
-// to advertise it under, plus whether that address is actually likely to
-// reach this machine from elsewhere. os.Hostname() commonly returns
-// "localhost" (notably under Termux) or a bare LAN name a remote peer can't
-// resolve, so callers must surface the false case rather than presenting
-// the address as trustworthy.
-func installationAddress() (string, string, bool) {
+// installationName is this machine's peer name as other installations see
+// it: the hostname, lowercased, with unsupported characters replaced.
+func installationName() string {
 	host, err := os.Hostname()
 	if err != nil || host == "" {
 		host = "localhost"
 	}
 	name := strings.TrimSuffix(strings.ToLower(host), ".")
-	name = strings.Map(func(character rune) rune {
+	return strings.Map(func(character rune) rune {
 		if unicode.IsLetter(character) || unicode.IsDigit(character) || character == '-' || character == '_' {
 			return character
 		}
 		return '-'
 	}, name)
-	knownGood := !unadvertisableHostnames[strings.ToLower(host)]
-	return name, host, knownGood
-}
-
-func safeBootstrapAddress(value string) bool {
-	if value == "" || strings.HasPrefix(value, "-") {
-		return false
-	}
-	for _, character := range value {
-		if !(unicode.IsLetter(character) || unicode.IsDigit(character) || strings.ContainsRune("@._:-", character)) {
-			return false
-		}
-	}
-	return true
 }
 
 func currentLoginShell() (string, error) {

@@ -1499,6 +1499,7 @@ func TestListIsolatesConcurrentFirstContactFromSharedConfig(t *testing.T) {
 	}
 	connectionListShares = func(context.Context, transport.Endpoint) ([]string, error) { return nil, nil }
 	t.Cleanup(func() { connectionExchange, connectionListShares = originalExchange, originalShares })
+	stubReturnRouteSuccess(t)
 
 	var stdout, stderr bytes.Buffer
 	if got := list(cfg, nil, &stdout, &stderr); got != listExitOK {

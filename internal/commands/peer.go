@@ -6,10 +6,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os/user"
+	"strings"
 
 	"l2syncd/internal/config"
 	"l2syncd/internal/connection"
 	"l2syncd/internal/transport"
+)
+
+var (
+	connectionVerifyReturn = transport.VerifyReturn
+	localSSHD              = connection.LocalSSHD
 )
 
 func peerEndpoint(ctx context.Context, cfg config.Config, name string) (transport.Endpoint, error) {
@@ -20,6 +27,14 @@ func peerEndpoint(ctx context.Context, cfg config.Config, name string) (transpor
 	if peer.PublicKey != "" {
 		return endpointForPeer(name, peer, nil)
 	}
+	return activatePeer(ctx, cfg, name, "")
+}
+
+// activatePeer completes first contact with a pending peer: the hello pins
+// its key and installs its reciprocal grant, then the peer must dial back
+// over the returned route. Any failure returns this side to pending.
+func activatePeer(ctx context.Context, cfg config.Config, name, returnAddress string) (transport.Endpoint, error) {
+	peer := cfg.Peers[name]
 	endpoint, err := endpointForPeer(name, peer, func(publicKey string) error {
 		if err := rejectDuplicatePeerKey(cfg, name, publicKey); err != nil {
 			return err
@@ -32,11 +47,63 @@ func peerEndpoint(ctx context.Context, cfg config.Config, name string) (transpor
 		return transport.Endpoint{}, err
 	}
 	if err := connectionExchange(ctx, endpoint); err != nil {
+		if peer.PublicKey != "" {
+			err = errors.Join(err, deactivatePeer(name, peer.PublicKey))
+		}
 		return transport.Endpoint{}, fmt.Errorf("complete first contact with peer %q: %w", name, err)
 	}
 	endpoint.PublicKey = peer.PublicKey
 	endpoint.AcceptPublicKey = nil
+	route, err := localReturnRoute(returnAddress)
+	if err == nil {
+		err = connectionVerifyReturn(ctx, endpoint, route)
+	}
+	if err != nil {
+		return transport.Endpoint{}, fmt.Errorf("peer %q cannot reach this machine back: %w; if the address it sees is wrong, rerun: l2sync connection add %s --address <user@host>", name, errors.Join(err, deactivatePeer(name, peer.PublicKey)), name)
+	}
 	return endpoint, nil
+}
+
+// deactivatePeer returns name to pending and removes its reciprocal grant.
+func deactivatePeer(name, publicKey string) error {
+	paths, err := connection.DefaultPaths()
+	if err != nil {
+		return err
+	}
+	configErr := updateConfigLocked(func(current *config.Config) error {
+		peer, exists := current.Peers[name]
+		if !exists || peer.PublicKey != publicKey {
+			return nil
+		}
+		peer.PublicKey = ""
+		current.Peers[name] = peer
+		return nil
+	})
+	return errors.Join(configErr, connection.RemoveGrant(paths.AuthorizedKeys, name, publicKey))
+}
+
+// localReturnRoute describes how a peer reaches this machine. returnAddress
+// ("user@host" or "host") overrides the user and the host the peer observes.
+func localReturnRoute(returnAddress string) (transport.ReturnRoute, error) {
+	sshd, err := localSSHD()
+	if err != nil {
+		return transport.ReturnRoute{}, err
+	}
+	current, err := user.Current()
+	if err != nil {
+		return transport.ReturnRoute{}, fmt.Errorf("current user: %w", err)
+	}
+	route := transport.ReturnRoute{User: current.Username, Port: sshd.Port, HostKeys: sshd.HostKeys}
+	if returnAddress != "" {
+		if err := config.ValidatePeerAddress(returnAddress); err != nil {
+			return transport.ReturnRoute{}, fmt.Errorf("--address: %w", err)
+		}
+		if userPart, _, found := strings.Cut(returnAddress, "@"); found {
+			route.User = userPart
+		}
+		route.Host = config.AddressHost(returnAddress)
+	}
+	return route, nil
 }
 
 func endpointForPeer(name string, peer config.Peer, accept func(string) error) (transport.Endpoint, error) {

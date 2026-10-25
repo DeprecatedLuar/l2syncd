@@ -107,9 +107,9 @@ func TestConnectionAddWithoutAccessRecordsPendingAndPrintsInvite(t *testing.T) {
 	originalProbe := connectionProbe
 	originalInstall := connectionInstall
 	connectionProbe = func(context.Context, string) error { return errors.New("Permission denied (publickey)") }
-	connectionInstall = func(context.Context, string, string, string, string) error {
+	connectionInstall = func(context.Context, string, string, string) (bool, error) {
 		t.Fatal("remote state was written")
-		return nil
+		return false, nil
 	}
 	t.Cleanup(func() { connectionProbe, connectionInstall = originalProbe, originalInstall })
 
@@ -117,8 +117,12 @@ func TestConnectionAddWithoutAccessRecordsPendingAndPrintsInvite(t *testing.T) {
 	if code := connectionAdd([]string{"friend", "alex@example.test"}, strings.NewReader(""), &stdout, &stderr); code != connectionExitOK {
 		t.Fatalf("connectionAdd = %d, stderr %q", code, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "l2sync connection add") || !strings.Contains(stdout.String(), "--key \"") {
-		t.Fatalf("invite = %q", stdout.String())
+	invite := stdout.String()
+	if !strings.Contains(invite, "l2sync connection add") || !strings.Contains(invite, "--key \"") || !strings.HasSuffix(invite, "Then run this command again to finish.\n") {
+		t.Fatalf("invite = %q", invite)
+	}
+	if strings.Contains(invite, "warning: this machine's hostname") {
+		t.Fatalf("invite carries an address warning: %q", invite)
 	}
 	cfg, err := config.Load()
 	if err != nil {
@@ -139,9 +143,9 @@ func TestConnectionAddUnreachableFailsWithoutWritingConfig(t *testing.T) {
 	connectionProbe = func(context.Context, string) error {
 		return fmt.Errorf("%w: ssh: Could not resolve hostname bogus: Name or service not known", errSSHUnreachable)
 	}
-	connectionInstall = func(context.Context, string, string, string, string) error {
+	connectionInstall = func(context.Context, string, string, string) (bool, error) {
 		t.Fatal("remote state was written")
-		return nil
+		return false, nil
 	}
 	t.Cleanup(func() { connectionProbe, connectionInstall = originalProbe, originalInstall })
 
@@ -163,20 +167,25 @@ func TestConnectionAddWithAccessActivatesPinnedPeer(t *testing.T) {
 	t.Setenv("HOME", root)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
 	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
-	originalProbe, originalInstall := connectionProbe, connectionInstall
-	originalExchange := connectionExchange
-	connectionProbe = func(context.Context, string) error { return nil }
 	installed := false
-	connectionInstall = func(_ context.Context, destination, name, address, key string) error {
-		installed = destination == "login@example.test" && name != "" && address != "" && strings.HasPrefix(key, "ssh-ed25519 ")
-		return nil
-	}
-	connectionExchange = func(_ context.Context, endpoint transport.Endpoint) error {
-		return endpoint.AcceptPublicKey(remoteKey)
+	restore := []func(){
+		swap(&connectionProbe, func(context.Context, string) error { return nil }),
+		swap(&connectionInstall, func(_ context.Context, destination, name, key string) (bool, error) {
+			installed = destination == "login@example.test" && name != "" && strings.HasPrefix(key, "ssh-ed25519 ")
+			return true, nil
+		}),
+		swap(&connectionExchange, func(_ context.Context, endpoint transport.Endpoint) error {
+			return endpoint.AcceptPublicKey(remoteKey)
+		}),
+		swap(&localSSHD, func() (connectionpkg.SSHD, error) {
+			return connectionpkg.SSHD{Port: 22, HostKeys: []string{testReturnHostKey}}, nil
+		}),
+		swap(&connectionVerifyReturn, func(context.Context, transport.Endpoint, transport.ReturnRoute) error { return nil }),
 	}
 	t.Cleanup(func() {
-		connectionProbe, connectionInstall = originalProbe, originalInstall
-		connectionExchange = originalExchange
+		for _, undo := range restore {
+			undo()
+		}
 	})
 	var stdout, stderr bytes.Buffer
 	if code := connectionAdd([]string{"vps", "login@example.test"}, strings.NewReader(""), &stdout, &stderr); code != connectionExitOK {
@@ -432,6 +441,7 @@ func TestPeerEndpointCompletesPendingHandshakeBeforeNormalUse(t *testing.T) {
 		return endpoint.AcceptPublicKey(remoteKey)
 	}
 	t.Cleanup(func() { connectionExchange = originalExchange })
+	stubReturnRouteSuccess(t)
 	endpoint, err := peerEndpoint(context.Background(), cfg, "phone")
 	if err != nil {
 		t.Fatal(err)
@@ -641,4 +651,143 @@ func TestConnectionBareDispatchListsSameAsLs(t *testing.T) {
 	if bare.String() != ls.String() {
 		t.Fatalf("bare dispatch = %q, ls = %q", bare.String(), ls.String())
 	}
+}
+
+func TestParseConnectionAddForms(t *testing.T) {
+	for _, tc := range []struct {
+		args []string
+		want connectionAddRequest
+	}{
+		{[]string{"vps"}, connectionAddRequest{name: "vps", destination: "vps"}},
+		{[]string{"vps", "luar@host"}, connectionAddRequest{name: "vps", destination: "luar@host"}},
+		{[]string{"vps", "luar@host", "--address", "me@mine"}, connectionAddRequest{name: "vps", destination: "luar@host", returnAddress: "me@mine"}},
+	} {
+		got, err := parseConnectionAdd(tc.args, strings.NewReader(""))
+		if err != nil || got != tc.want {
+			t.Fatalf("parse %v = %+v, %v; want %+v", tc.args, got, err, tc.want)
+		}
+	}
+}
+
+func TestParseConnectionAddKeyOnlyHasNoDestination(t *testing.T) {
+	_, cfg := cycleTestConfig(t, true)
+	key := cfg.Peers["phone"].PublicKey
+	got, err := parseConnectionAdd([]string{"paraloid", "--key", key}, strings.NewReader(""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.destination != "" || got.key == "" {
+		t.Fatalf("key-only parse = %+v", got)
+	}
+	if _, err := parseConnectionAdd([]string{"paraloid", "--key", key, "--address", "x@y"}, strings.NewReader("")); err == nil {
+		t.Fatal("--address accepted together with --key")
+	}
+}
+
+func TestActivatePeerRevertsOnReturnFailure(t *testing.T) {
+	_, cfg := cycleTestConfig(t, true)
+	remoteKey := cfg.Peers["phone"].PublicKey
+	cfg.Peers["phone"] = config.Peer{Address: "phone"}
+	if err := config.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	paths, err := connectionpkg.DefaultPaths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	restore := []func(){
+		swap(&connectionExchange, func(ctx context.Context, endpoint transport.Endpoint) error {
+			if err := endpoint.AcceptPublicKey(remoteKey); err != nil {
+				return err
+			}
+			return connectionpkg.AddGrant(endpoint.AuthorizedKeys, endpoint.Name, remoteKey)
+		}),
+		swap(&localSSHD, func() (connectionpkg.SSHD, error) {
+			return connectionpkg.SSHD{Port: 22, HostKeys: []string{testReturnHostKey}}, nil
+		}),
+		swap(&connectionVerifyReturn, func(context.Context, transport.Endpoint, transport.ReturnRoute) error {
+			return errors.New("dial back timeout")
+		}),
+	}
+	t.Cleanup(func() {
+		for _, undo := range restore {
+			undo()
+		}
+	})
+	if _, err := activatePeer(context.Background(), cfg, "phone", ""); err == nil || !strings.Contains(err.Error(), "--address") {
+		t.Fatalf("activatePeer error = %v, want failure suggesting --address", err)
+	}
+	after, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Peers["phone"].PublicKey != "" {
+		t.Fatal("peer left active after failed return verification")
+	}
+	contents, err := os.ReadFile(paths.AuthorizedKeys)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(contents), "l2sync:phone") {
+		t.Fatal("reciprocal grant left behind")
+	}
+}
+
+func TestDialPeerFailedActivationRemovesRemoteAndLocalState(t *testing.T) {
+	_, cfg := cycleTestConfig(t, true)
+	remoteKey := cfg.Peers["phone"].PublicKey
+	delete(cfg.Peers, "phone")
+	if err := config.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	removedRemote := false
+	restore := []func(){
+		swap(&connectionProbe, func(context.Context, string) error { return nil }),
+		swap(&connectionInstall, func(context.Context, string, string, string) (bool, error) { return true, nil }),
+		swap(&connectionRemoteRemove, func(context.Context, string, string) error { removedRemote = true; return nil }),
+		swap(&connectionExchange, func(ctx context.Context, endpoint transport.Endpoint) error {
+			return endpoint.AcceptPublicKey(remoteKey)
+		}),
+		swap(&localSSHD, func() (connectionpkg.SSHD, error) {
+			return connectionpkg.SSHD{Port: 22, HostKeys: []string{testReturnHostKey}}, nil
+		}),
+		swap(&connectionVerifyReturn, func(context.Context, transport.Endpoint, transport.ReturnRoute) error {
+			return errors.New("dial back timeout")
+		}),
+	}
+	t.Cleanup(func() {
+		for _, undo := range restore {
+			undo()
+		}
+	})
+	var stdout, stderr bytes.Buffer
+	if code := connectionAdd([]string{"phone", "luar@phone"}, strings.NewReader(""), &stdout, &stderr); code == connectionExitOK {
+		t.Fatal("connection add succeeded despite failed dial-back")
+	}
+	if !removedRemote {
+		t.Fatal("remote grant created by this run was not removed")
+	}
+	after, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := after.Peers["phone"]; exists {
+		t.Fatalf("local peer entry left behind: %+v", after.Peers["phone"])
+	}
+}
+
+func swap[T any](target *T, value T) func() {
+	previous := *target
+	*target = value
+	return func() { *target = previous }
+}
+
+// stubReturnRouteSuccess makes the dial-back step of activation succeed.
+func stubReturnRouteSuccess(t *testing.T) {
+	t.Helper()
+	restoreSSHD := swap(&localSSHD, func() (connectionpkg.SSHD, error) {
+		return connectionpkg.SSHD{Port: 22, HostKeys: []string{testReturnHostKey}}, nil
+	})
+	restoreVerify := swap(&connectionVerifyReturn, func(context.Context, transport.Endpoint, transport.ReturnRoute) error { return nil })
+	t.Cleanup(func() { restoreSSHD(); restoreVerify() })
 }
