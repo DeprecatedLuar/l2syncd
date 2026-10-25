@@ -65,6 +65,9 @@ func verifyReturnRoute(ctx context.Context, peerName, fingerprint string, route 
 		if err := requireAuthenticatedFingerprint(peer, fingerprint); err != nil {
 			return fmt.Errorf("peer %q authorization changed: %w", peerName, err)
 		}
+		if other, used := peerUsingEndpoint(current, peerName, host, port); used {
+			return fmt.Errorf("return route %s port %d is already used by peer %q", host, route.Port, other)
+		}
 		previous = peer
 		peer.Address, peer.Port = address, port
 		current.Peers[peerName] = peer
@@ -93,12 +96,51 @@ func verifyReturnRoute(ctx context.Context, peerName, fingerprint string, route 
 	if err := returnDial(dialCtx, endpoint); err != nil {
 		return revert(fmt.Errorf("dial back %s port %d: %w", address, route.Port, err))
 	}
-	if previous.Address != "" && (config.AddressHost(previous.Address) != host || previous.Port != port) {
-		if err := connection.UnpinHostKeys(paths.KnownHosts, config.AddressHost(previous.Address), previous.Port); err != nil {
-			return fmt.Errorf("dial-back succeeded, but remove stale pins for %s: %w", previous.Address, err)
-		}
+	return removeStalePins(paths.KnownHosts, peerName, previous, host, port)
+}
+
+// removeStalePins unpins the host:port previous pointed at, unless it is the
+// route just stored or another peer still uses it.
+func removeStalePins(knownHosts, peerName string, previous config.Peer, host string, port int) error {
+	if previous.Address == "" {
+		return nil
+	}
+	previousHost := config.AddressHost(previous.Address)
+	if previousHost == host && normalizedPort(previous.Port) == normalizedPort(port) {
+		return nil
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		return fmt.Errorf("dial-back succeeded, but load config to remove stale pins for %s: %w", previous.Address, err)
+	}
+	if _, used := peerUsingEndpoint(&cfg, peerName, previousHost, previous.Port); used {
+		return nil
+	}
+	if err := connection.UnpinHostKeys(knownHosts, previousHost, previous.Port); err != nil {
+		return fmt.Errorf("dial-back succeeded, but remove stale pins for %s: %w", previous.Address, err)
 	}
 	return nil
+}
+
+// peerUsingEndpoint returns a peer other than excluded whose address host and
+// port match, treating port 0 as the default sshd port.
+func peerUsingEndpoint(cfg *config.Config, excluded, host string, port int) (string, bool) {
+	for name, peer := range cfg.Peers {
+		if name == excluded || peer.Address == "" {
+			continue
+		}
+		if config.AddressHost(peer.Address) == host && normalizedPort(peer.Port) == normalizedPort(port) {
+			return name, true
+		}
+	}
+	return "", false
+}
+
+func normalizedPort(port int) int {
+	if port == 0 {
+		return config.DefaultSSHPort
+	}
+	return port
 }
 
 func returnHost(route transport.ReturnRoute, sshConnection string) (string, error) {
