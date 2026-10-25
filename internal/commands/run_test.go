@@ -405,3 +405,31 @@ func TestExecuteCycleArmsRetryForFailedPeer(t *testing.T) {
 		t.Fatal("retry timer not armed for a failed peer")
 	}
 }
+
+func TestExecuteCycleFailureLogsRetryOnlyWhenScheduled(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		outcomes  []FolderOutcome
+		wantRetry bool
+	}{
+		{"no outcome", nil, false},
+		{"failed peer", []FolderOutcome{{Name: "pics", Peer: "phone"}}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var output bytes.Buffer
+			logger := slog.New(slog.NewTextHandler(&output, nil))
+			backoff := newPeerBackoff()
+			backoff.jitter = func(time.Duration) time.Duration { return 0 }
+			retry := stoppedTimer(t)
+			t.Cleanup(func() { retry.Stop() })
+			executeCycle(context.Background(), logger, retry, backoff, cycleTriggerRetry,
+				func(context.Context, func(string) bool) (CycleSummary, error) {
+					return CycleSummary{Outcomes: tc.outcomes}, errors.New("load config: invalid")
+				})
+			assertLogContains(t, output.String(), `msg="sync cycle failed"`)
+			if got := strings.Contains(output.String(), "retry_in="); got != tc.wantRetry {
+				t.Fatalf("retry_in logged = %v, want %v; log %q", got, tc.wantRetry, output.String())
+			}
+		})
+	}
+}

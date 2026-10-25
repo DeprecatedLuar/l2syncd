@@ -366,14 +366,16 @@ func executeCycle(ctx context.Context, logger *slog.Logger, retry *time.Timer, b
 		}
 	}
 	if err != nil {
-		logger.Error("sync cycle failed",
+		attributes := []any{
 			"trigger", trigger,
 			"duration", time.Since(started),
 			"folders_completed", summary.Folders,
 			"actions_completed", summary.Actions,
-			"retry_in", wait,
-			"error", err,
-		)
+		}
+		if waiting {
+			attributes = append(attributes, "retry_in", wait)
+		}
+		logger.Error("sync cycle failed", append(attributes, "error", err)...)
 		return
 	}
 	logger.Info("sync cycle completed",
