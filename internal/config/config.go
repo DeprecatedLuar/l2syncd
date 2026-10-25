@@ -47,10 +47,12 @@ type Config struct {
 	Remote map[string]Folder `toml:"remote"`
 }
 
-// Peer is an SSH destination plus, once first contact has pinned it, the
-// peer installation's public key. An empty PublicKey is the only
-// representation of "bootstrap incomplete": trust-on-first-use is still
-// permitted for this peer. A pinned key is never unpinned.
+// Peer is an SSH destination, its sshd port when not 22, and, once first
+// contact has stored it, the peer installation's public key. An empty
+// PublicKey is the only representation of "bootstrap incomplete": the next
+// hello with this peer stores the key it presents. A key stored by an
+// activation whose dial-back fails is cleared in the same run; any other
+// stored key is never cleared.
 type Peer struct {
 	Address   string `toml:"address"`
 	PublicKey string `toml:"public_key,omitempty"`
