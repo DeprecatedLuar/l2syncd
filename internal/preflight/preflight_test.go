@@ -202,3 +202,16 @@ func TestValidateAcceptsSiblingFolders(t *testing.T) {
 		t.Fatalf("Validate(siblings) = %v", err)
 	}
 }
+
+func TestValidateAcceptsKeyOnlyPeerAndRejectsExplicitDefaultPort(t *testing.T) {
+	key := "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOa5yPFeboA77SXJofjIFkkOV0eAl3rSsKLIIyNMZ9jJ"
+	cfg := config.New()
+	cfg.Peers["phone"] = config.Peer{PublicKey: key}
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("key-only peer rejected: %v", err)
+	}
+	cfg.Peers["phone"] = config.Peer{Address: "u@10.0.0.2", PublicKey: key, Port: 22}
+	if err := Validate(cfg); err == nil {
+		t.Fatal("explicit port 22 accepted")
+	}
+}

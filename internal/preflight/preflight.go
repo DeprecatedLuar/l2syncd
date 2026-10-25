@@ -17,6 +17,8 @@ import (
 	"l2syncd/internal/sharename"
 )
 
+const maxPeerPort = 65535
+
 // LoadConfig loads configuration and verifies it is safe to use.
 func LoadConfig() (config.Config, error) {
 	cfg, err := config.Load()
@@ -58,8 +60,16 @@ func Validate(cfg config.Config) error {
 			}
 			peerKeys[normalized] = name
 		}
-		if err := config.ValidatePeerAddress(peer.Address); err != nil {
-			return fmt.Errorf("peer %q address: %w", name, err)
+		switch {
+		case peer.Address == "" && peer.PublicKey == "":
+			return fmt.Errorf("peer %q has neither an address nor a public key", name)
+		case peer.Address != "":
+			if err := config.ValidatePeerAddress(peer.Address); err != nil {
+				return fmt.Errorf("peer %q address: %w", name, err)
+			}
+		}
+		if peer.Port < 0 || peer.Port > maxPeerPort || peer.Port == config.DefaultSSHPort {
+			return fmt.Errorf("peer %q port %d must be omitted for 22 or within 1-%d", name, peer.Port, maxPeerPort)
 		}
 	}
 	for name, folder := range cfg.Shared {

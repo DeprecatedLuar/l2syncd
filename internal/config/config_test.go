@@ -161,3 +161,11 @@ func TestWasInstalledRecognizesPostRenameFailure(t *testing.T) {
 		t.Fatal("pre-rename failure classified as installed")
 	}
 }
+
+func TestAddressHost(t *testing.T) {
+	for address, want := range map[string]string{"luar@10.0.0.1": "10.0.0.1", "host": "host", "u@fd7a::1": "fd7a::1"} {
+		if got := AddressHost(address); got != want {
+			t.Fatalf("AddressHost(%q) = %q, want %q", address, got, want)
+		}
+	}
+}

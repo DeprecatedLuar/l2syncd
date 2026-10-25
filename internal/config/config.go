@@ -22,6 +22,9 @@ const (
 	directoryMode   = 0o700
 	fileMode        = 0o600
 	preflightPrefix = ".l2sync-preflight-*"
+
+	// DefaultSSHPort is the port ssh uses when none is configured.
+	DefaultSSHPort = 22
 )
 
 var ErrNotFound = errors.New("configuration file does not exist")
@@ -51,6 +54,15 @@ type Config struct {
 type Peer struct {
 	Address   string `toml:"address"`
 	PublicKey string `toml:"public_key,omitempty"`
+	Port      int    `toml:"port,omitempty"`
+}
+
+// AddressHost returns the host part of a "user@host" or "host" destination.
+func AddressHost(address string) string {
+	if index := strings.LastIndex(address, "@"); index >= 0 {
+		return address[index+1:]
+	}
+	return address
 }
 
 // Folder is one registered directory. Which table it lives in is its role:

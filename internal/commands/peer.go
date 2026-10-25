@@ -40,6 +40,9 @@ func peerEndpoint(ctx context.Context, cfg config.Config, name string) (transpor
 }
 
 func endpointForPeer(name string, peer config.Peer, accept func(string) error) (transport.Endpoint, error) {
+	if peer.Address == "" {
+		return transport.Endpoint{}, fmt.Errorf("peer %q has no address yet; it is learned when %q next connects to this machine", name, name)
+	}
 	if err := config.ValidatePeerAddress(peer.Address); err != nil {
 		return transport.Endpoint{}, fmt.Errorf("peer %q address: %w", name, err)
 	}
@@ -52,9 +55,10 @@ func endpointForPeer(name string, peer config.Peer, accept func(string) error) (
 		return transport.Endpoint{}, fmt.Errorf("load installation key: %w", err)
 	}
 	return transport.Endpoint{
-		Name: name, Address: peer.Address, PublicKey: peer.PublicKey,
+		Name: name, Address: peer.Address, Port: peer.Port, PublicKey: peer.PublicKey,
 		LocalPublicKey: localKey, PrivateKey: paths.PrivateKey,
 		AuthorizedKeys: paths.AuthorizedKeys, AcceptPublicKey: accept,
+		KnownHosts: []string{paths.KnownHosts, paths.UserKnownHosts},
 	}, nil
 }
 

@@ -496,7 +496,7 @@ func TestServeWriteRejectsUnsafePeerAndDeclaredSizeOverflow(t *testing.T) {
 func TestSSHArgumentsReuseControlConnectionExceptForBulkTransfers(t *testing.T) {
 	configPath := filepath.Join("tmp", "runtime", "l2sync", "ssh-%C")
 	controlPath := "phone"
-	control := sshArguments(configPath, controlPath, "/key", false)
+	control := sshArguments(configPath, controlPath, "/key", testKnownHosts, false)
 	wantControlPath := "ControlPath=" + controlPath
 	if !slices.Contains(control, "ControlMaster=auto") || !slices.Contains(control, "ControlPersist="+sshControlPersist) || !slices.Contains(control, wantControlPath) || !slices.Contains(control, "BatchMode=yes") || !slices.Contains(control, "IdentitiesOnly=yes") || !slices.Contains(control, "-T") || !slices.Contains(control, "/key") {
 		t.Fatalf("control SSH arguments = %#v", control)
@@ -504,7 +504,10 @@ func TestSSHArgumentsReuseControlConnectionExceptForBulkTransfers(t *testing.T) 
 	if !slices.Contains(control, "ConnectTimeout="+sshConnectTimeout) {
 		t.Fatalf("control SSH arguments lack connect timeout: %#v", control)
 	}
-	bulk := sshArguments(configPath, controlPath, "/key", true)
+	if !slices.Contains(control, "StrictHostKeyChecking=yes") || !slices.Contains(control, "UserKnownHostsFile=/state/known_hosts /home/.ssh/known_hosts") {
+		t.Fatalf("control SSH arguments lack host key pinning: %#v", control)
+	}
+	bulk := sshArguments(configPath, controlPath, "/key", testKnownHosts, true)
 	if !slices.Contains(bulk, "ControlPath=none") || !slices.Contains(bulk, "ControlMaster=no") {
 		t.Fatalf("bulk SSH arguments = %#v, want ControlPath=none", bulk)
 	}
@@ -563,7 +566,7 @@ func TestControlSocketSelectionDisablesMultiplexingForLongOrUnsafeRuntimePath(t 
 	if path := safeControlSocketPath(); path != "" {
 		t.Fatalf("long runtime path selected control socket %q", path)
 	}
-	arguments := sshArguments("config", safeControlSocketPath(), "/key", false)
+	arguments := sshArguments("config", safeControlSocketPath(), "/key", testKnownHosts, false)
 	if !slices.Contains(arguments, "ControlMaster=no") || !slices.Contains(arguments, "ControlPath=none") {
 		t.Fatalf("long-path SSH arguments = %#v", arguments)
 	}
@@ -776,5 +779,13 @@ func TestLoginSSHCommandCarriesSharedOptions(t *testing.T) {
 		if !slices.Contains(command.Args, want) {
 			t.Fatalf("args %#v lack %q", command.Args, want)
 		}
+	}
+}
+
+const testKnownHosts = "/state/known_hosts /home/.ssh/known_hosts"
+
+func TestKnownHostsOptionRejectsWhitespacePaths(t *testing.T) {
+	if _, err := knownHostsOption([]string{"/a b/known_hosts"}); err == nil {
+		t.Fatal("accepted a path with whitespace")
 	}
 }

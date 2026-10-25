@@ -17,6 +17,8 @@ func testPaths(root string) Paths {
 		PrivateKey:     filepath.Join(root, "state", "id_l2sync"),
 		PublicKey:      filepath.Join(root, "state", "id_l2sync.pub"),
 		AuthorizedKeys: filepath.Join(root, ".ssh", "authorized_keys"),
+		KnownHosts:     filepath.Join(root, "state", "known_hosts"),
+		UserKnownHosts: filepath.Join(root, ".ssh", "known_hosts"),
 	}
 }
 

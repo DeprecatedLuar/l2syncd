@@ -19,9 +19,11 @@ import (
 	"path"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
+	"unicode"
 
 	"l2syncd/internal/androidexec"
 	"l2syncd/internal/config"
@@ -148,6 +150,8 @@ type Endpoint struct {
 	PrivateKey      string
 	AuthorizedKeys  string
 	AcceptPublicKey func(string) error
+	Port            int
+	KnownHosts      []string
 }
 
 // Handshake configures the authenticated server-side hello exchange.
@@ -1014,10 +1018,10 @@ func ValidateRelativePath(value string) error {
 }
 
 func runSSH(ctx context.Context, endpoint Endpoint, bulk bool, input []byte) ([]byte, error) {
-	if endpoint.Name == "" || endpoint.Address == "" || endpoint.LocalPublicKey == "" || endpoint.PrivateKey == "" || endpoint.AuthorizedKeys == "" {
+	if endpoint.Name == "" || endpoint.Address == "" || endpoint.LocalPublicKey == "" || endpoint.PrivateKey == "" || endpoint.AuthorizedKeys == "" || len(endpoint.KnownHosts) == 0 {
 		return nil, errors.New("complete pinned peer endpoint is required")
 	}
-	command, cleanup, err := sshProcess(ctx, endpoint.Address, endpoint.PrivateKey, bulk)
+	command, cleanup, err := sshProcess(ctx, endpoint, bulk)
 	if err != nil {
 		return nil, err
 	}
@@ -1109,11 +1113,15 @@ func classifySSHFailure(address string, commandErr, contextErr error, stderr []b
 	return &Error{err: fmt.Errorf("connect to peer %q: %w", address, commandErr), auth: auth}
 }
 
-func sshProcess(ctx context.Context, address, privateKey string, bulk bool) (*exec.Cmd, func(), error) {
-	if err := config.ValidatePeerAddress(address); err != nil {
+func sshProcess(ctx context.Context, endpoint Endpoint, bulk bool) (*exec.Cmd, func(), error) {
+	if err := config.ValidatePeerAddress(endpoint.Address); err != nil {
 		return nil, nil, fmt.Errorf("invalid SSH destination: %w", err)
 	}
-	configPath, cleanup, err := sanitizedSSHConfig(ctx, address)
+	knownHosts, err := knownHostsOption(endpoint.KnownHosts)
+	if err != nil {
+		return nil, nil, err
+	}
+	configPath, cleanup, err := sanitizedSSHConfig(ctx, endpoint.Address, endpoint.Port)
 	if err != nil {
 		return nil, nil, fmt.Errorf("prepare dedicated-key SSH configuration: %w", err)
 	}
@@ -1121,7 +1129,7 @@ func sshProcess(ctx context.Context, address, privateKey string, bulk bool) (*ex
 	if !bulk {
 		controlPath = safeControlSocketPath()
 	}
-	command, err := androidexec.CommandContext(ctx, sshCommand, sshArguments(configPath, controlPath, privateKey, bulk)...)
+	command, err := androidexec.CommandContext(ctx, sshCommand, sshArguments(configPath, controlPath, endpoint.PrivateKey, knownHosts, bulk)...)
 	if err != nil {
 		cleanup()
 		return nil, nil, err
@@ -1129,7 +1137,18 @@ func sshProcess(ctx context.Context, address, privateKey string, bulk bool) (*ex
 	return command, cleanup, nil
 }
 
-func sshArguments(configPath, controlPath, privateKey string, bulk bool) []string {
+// knownHostsOption joins known_hosts files for UserKnownHostsFile, which
+// splits on whitespace.
+func knownHostsOption(files []string) (string, error) {
+	for _, file := range files {
+		if strings.ContainsFunc(file, unicode.IsSpace) {
+			return "", fmt.Errorf("known_hosts path %q contains whitespace", file)
+		}
+	}
+	return strings.Join(files, " "), nil
+}
+
+func sshArguments(configPath, controlPath, privateKey, knownHosts string, bulk bool) []string {
 	controlMaster := "auto"
 	if bulk || controlPath == "" {
 		controlPath = "none"
@@ -1140,6 +1159,8 @@ func sshArguments(configPath, controlPath, privateKey string, bulk bool) []strin
 		"-T",
 		"-o", "BatchMode=yes",
 		"-o", "ConnectTimeout=" + sshConnectTimeout,
+		"-o", "StrictHostKeyChecking=yes",
+		"-o", "UserKnownHostsFile=" + knownHosts,
 		"-o", "IdentitiesOnly=yes",
 		"-o", "IdentityAgent=none",
 		"-o", "PreferredAuthentications=publickey",
@@ -1151,8 +1172,13 @@ func sshArguments(configPath, controlPath, privateKey string, bulk bool) []strin
 	}
 }
 
-func sanitizedSSHConfig(ctx context.Context, address string) (string, func(), error) {
-	command, err := androidexec.CommandContext(ctx, sshCommand, "-G", address)
+func sanitizedSSHConfig(ctx context.Context, address string, port int) (string, func(), error) {
+	arguments := []string{"-G"}
+	if port != 0 {
+		arguments = append(arguments, "-p", strconv.Itoa(port))
+	}
+	arguments = append(arguments, address)
+	command, err := androidexec.CommandContext(ctx, sshCommand, arguments...)
 	if err != nil {
 		return "", nil, err
 	}

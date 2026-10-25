@@ -28,27 +28,30 @@ import (
 )
 
 const (
-	credentialDirMode = 0o700
-	privateKeyMode    = 0o600
-	publicKeyMode     = 0o644
-	authorizedMode    = 0o600
-	keyFilename       = "id_l2sync"
-	keyType           = "ssh-ed25519"
-	commentPrefix     = "l2sync:"
-	forcedBinary      = "l2sync"
-	fingerprintBytes  = 12
+	credentialDirMode  = 0o700
+	privateKeyMode     = 0o600
+	publicKeyMode      = 0o644
+	authorizedMode     = 0o600
+	keyFilename        = "id_l2sync"
+	keyType            = "ssh-ed25519"
+	commentPrefix      = "l2sync:"
+	forcedBinary       = "l2sync"
+	fingerprintBytes   = 12
+	knownHostsFilename = "known_hosts"
+	replaceTempPrefix  = ".l2sync-replace-*"
 )
 
-// Paths identifies the installation key and grant files. It is explicit so
-// bootstrap behavior can be tested without touching real SSH or state
-// directories. The keypair and the grant file are deliberately not colocated:
-// the keypair is l2sync's own credential and lives under its XDG state
-// directory, while the grant file is sshd's authorized_keys, which only ever
-// lives at ~/.ssh/authorized_keys.
+// Paths identifies the installation key, grant and host-key files. It is
+// explicit so bootstrap behavior can be tested without touching real SSH or
+// state directories. The keypair and l2sync's pinned host keys live under the
+// XDG state directory; authorized_keys (sshd's grant file) and the user's
+// known_hosts live under ~/.ssh, the latter only read.
 type Paths struct {
 	PrivateKey     string
 	PublicKey      string
 	AuthorizedKeys string
+	KnownHosts     string
+	UserKnownHosts string
 }
 
 // DefaultPaths returns the installation keypair under the current user's
@@ -75,6 +78,8 @@ func DefaultPaths() (Paths, error) {
 		PrivateKey:     filepath.Join(stateDir, keyFilename),
 		PublicKey:      filepath.Join(stateDir, keyFilename+".pub"),
 		AuthorizedKeys: filepath.Join(home, ".ssh", "authorized_keys"),
+		KnownHosts:     filepath.Join(stateDir, knownHostsFilename),
+		UserKnownHosts: filepath.Join(home, ".ssh", knownHostsFilename),
 	}, nil
 }
 
@@ -405,9 +410,9 @@ func writeExclusive(path string, contents []byte, mode fs.FileMode) error {
 
 func replaceFile(path string, contents []byte, mode fs.FileMode) error {
 	directory := filepath.Dir(path)
-	temporary, err := os.CreateTemp(directory, ".authorized_keys-*")
+	temporary, err := os.CreateTemp(directory, replaceTempPrefix)
 	if err != nil {
-		return fmt.Errorf("create temporary authorized_keys: %w", err)
+		return fmt.Errorf("create temporary file for %q: %w", path, err)
 	}
 	name := temporary.Name()
 	defer os.Remove(name)
