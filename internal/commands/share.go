@@ -13,6 +13,7 @@ import (
 
 	"l2syncd/internal/config"
 	"l2syncd/internal/guard"
+	"l2syncd/internal/preflight"
 	"l2syncd/internal/sharename"
 )
 
@@ -66,11 +67,14 @@ func share(args []string, stderr io.Writer) (exitCode int) {
 		if _, exists := current.Remote[name]; exists {
 			return fmt.Errorf("folder %q already exists as remote", name)
 		}
+		current.Shared[name] = config.Folder{Path: path}
+		if err := preflight.CheckNesting(*current); err != nil {
+			return err
+		}
 		markerCreated, err := prepareAttachMarker(path, name, "")
 		if err != nil {
 			return fmt.Errorf("write folder marker: %w", err)
 		}
-		current.Shared[name] = config.Folder{Path: path}
 		saveErr := saveConfig(*current)
 		installed := saveErr == nil || config.WasInstalled(saveErr)
 		if saveErr != nil {

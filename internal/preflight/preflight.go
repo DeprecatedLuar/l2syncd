@@ -105,7 +105,7 @@ func Validate(cfg config.Config) error {
 			return fmt.Errorf("remote folder %q binds unavailable peer %q", name, folder.Peers[0])
 		}
 	}
-	return checkNesting(cfg)
+	return CheckNesting(cfg)
 }
 
 func validateFolder(name, path string) error {
@@ -129,9 +129,9 @@ func validateFolder(name, path string) error {
 	return nil
 }
 
-// checkNesting refuses two registered folders whose resolved roots are equal
+// CheckNesting refuses two registered folders whose resolved roots are equal
 // or nested: both would scan, and fight over, the same files.
-func checkNesting(cfg config.Config) error {
+func CheckNesting(cfg config.Config) error {
 	type root struct{ name, path string }
 	roots := make([]root, 0, len(cfg.Shared)+len(cfg.Remote))
 	for _, table := range []map[string]config.Folder{cfg.Shared, cfg.Remote} {

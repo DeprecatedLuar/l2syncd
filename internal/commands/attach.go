@@ -263,12 +263,15 @@ func commitAttachedFolder(name, path, peerName string, expectedPeer config.Peer,
 		if missingMatchingBinding {
 			return fmt.Errorf("existing remote folder %q has no matching peer binding", name)
 		}
+		if !remoteExists {
+			current.Remote[name] = config.Folder{Path: path, Peers: []string{peerName}}
+		}
+		if err := preflight.CheckNesting(*current); err != nil {
+			return err
+		}
 		markerCreated, err := prepareAttachMarker(path, name, providerID)
 		if err != nil {
 			return fmt.Errorf("write folder marker: %w", err)
-		}
-		if !remoteExists {
-			current.Remote[name] = config.Folder{Path: path, Peers: []string{peerName}}
 		}
 		saveErr := saveConfig(*current)
 		installed = saveErr == nil || config.WasInstalled(saveErr)

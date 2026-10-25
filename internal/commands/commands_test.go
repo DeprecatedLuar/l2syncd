@@ -1506,3 +1506,137 @@ func TestListIsolatesConcurrentFirstContactFromSharedConfig(t *testing.T) {
 		t.Fatalf("list = %d, stderr %q", got, stderr.String())
 	}
 }
+
+func nestingTestHome(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
+	return root
+}
+
+func loadConfigFile(t *testing.T) []byte {
+	t.Helper()
+	path, err := config.Path()
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return contents
+}
+
+func TestShareRefusesFolderInsideAnotherFolder(t *testing.T) {
+	for _, createMissing := range []bool{false, true} {
+		t.Run(fmt.Sprintf("create=%v", createMissing), func(t *testing.T) {
+			root := nestingTestHome(t)
+			outer := filepath.Join(root, "outer")
+			inner := filepath.Join(outer, "inner")
+			if err := os.Mkdir(outer, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			var stderr bytes.Buffer
+			if code := Share([]string{"outer", outer}, &stderr); code != shareExitOK {
+				t.Fatalf("share outer exit = %d, stderr = %q", code, stderr.String())
+			}
+			before := loadConfigFile(t)
+			args := []string{"inner", inner}
+			if createMissing {
+				args = append(args, "-p")
+			} else if err := os.Mkdir(inner, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			stderr.Reset()
+			if code := Share(args, &stderr); code == shareExitOK {
+				t.Fatal("nested share succeeded")
+			}
+			if !strings.Contains(stderr.String(), `folder "inner"`) || !strings.Contains(stderr.String(), `inside folder "outer"`) {
+				t.Fatalf("stderr = %q, want both folders named", stderr.String())
+			}
+			if _, err := os.Lstat(guard.MarkerPath(inner)); !os.IsNotExist(err) {
+				t.Fatalf("nested share left a marker: %v", err)
+			}
+			if createMissing {
+				if _, err := os.Stat(inner); !os.IsNotExist(err) {
+					t.Fatalf("nested share -p left %q behind: %v", inner, err)
+				}
+			}
+			if after := loadConfigFile(t); !bytes.Equal(before, after) {
+				t.Fatalf("config changed:\nbefore %s\nafter %s", before, after)
+			}
+		})
+	}
+}
+
+func TestShareAcceptsSiblingWithSharedNamePrefix(t *testing.T) {
+	root := nestingTestHome(t)
+	notes := filepath.Join(root, "notes")
+	archive := filepath.Join(root, "notes-archive")
+	for _, dir := range []string{notes, archive} {
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var stderr bytes.Buffer
+	if code := Share([]string{"notes", notes}, &stderr); code != shareExitOK {
+		t.Fatalf("share notes exit = %d, stderr = %q", code, stderr.String())
+	}
+	if code := Share([]string{"archive", archive}, &stderr); code != shareExitOK {
+		t.Fatalf("share sibling exit = %d, stderr = %q", code, stderr.String())
+	}
+}
+
+func TestAttachRefusesFolderInsideAnotherFolder(t *testing.T) {
+	root := nestingTestHome(t)
+	outer := filepath.Join(root, "outer")
+	inner := filepath.Join(outer, "inner")
+	if err := os.Mkdir(outer, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.New()
+	cfg.Peers["phone"] = config.Peer{Address: "phone", PublicKey: generatedPublicKey(t, filepath.Join(root, "remote-key"))}
+	if err := config.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	if code := Share([]string{"outer", outer}, &stderr); code != shareExitOK {
+		t.Fatalf("share outer exit = %d, stderr = %q", code, stderr.String())
+	}
+	before := loadConfigFile(t)
+	originalFind, originalBind, originalUnbind, originalList := attachFindProvider, attachBindShare, attachUnbindShare, attachListFiles
+	t.Cleanup(func() {
+		attachFindProvider, attachBindShare, attachUnbindShare, attachListFiles = originalFind, originalBind, originalUnbind, originalList
+	})
+	providerID, err := guard.NewMarkerID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	unbound := 0
+	attachFindProvider = func(context.Context, config.Config, string) (string, transport.Endpoint, error) {
+		return "phone", transport.Endpoint{Name: "phone"}, nil
+	}
+	attachBindShare = func(context.Context, transport.Endpoint, string) (bool, error) { return true, nil }
+	attachUnbindShare = func(context.Context, transport.Endpoint, string) error { unbound++; return nil }
+	attachListFiles = func(context.Context, transport.Endpoint, string, string) ([]transport.PeerFile, string, error) {
+		return nil, providerID, nil
+	}
+	stderr.Reset()
+	if code := Attach([]string{"inner", inner, "-p"}, &stderr); code == attachExitOK {
+		t.Fatal("nested attach succeeded")
+	}
+	if !strings.Contains(stderr.String(), `folder "inner"`) || !strings.Contains(stderr.String(), `inside folder "outer"`) {
+		t.Fatalf("stderr = %q, want both folders named", stderr.String())
+	}
+	if _, err := os.Stat(inner); !os.IsNotExist(err) {
+		t.Fatalf("nested attach -p left %q behind: %v", inner, err)
+	}
+	if unbound != 1 {
+		t.Fatalf("remote binding released %d times, want 1", unbound)
+	}
+	if after := loadConfigFile(t); !bytes.Equal(before, after) {
+		t.Fatalf("config changed:\nbefore %s\nafter %s", before, after)
+	}
+}
