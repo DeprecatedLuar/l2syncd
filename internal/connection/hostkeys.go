@@ -147,6 +147,9 @@ func KnownHostsPattern(host string, port int) string {
 
 // HostKeysFor returns the keys pinned for host:port.
 func HostKeysFor(path, host string, port int) ([]string, error) {
+	if err := requireNormalizedHost(host); err != nil {
+		return nil, err
+	}
 	lines, err := readKnownHosts(path)
 	if err != nil {
 		return nil, err
@@ -163,8 +166,8 @@ func HostKeysFor(path, host string, port int) ([]string, error) {
 
 // PinHostKeys makes keys the only keys pinned for host:port.
 func PinHostKeys(path, host string, port int, keys []string) error {
-	if host == "" || strings.ContainsAny(host, " \t[],#") {
-		return fmt.Errorf("invalid known_hosts host %q", host)
+	if err := requireNormalizedHost(host); err != nil {
+		return err
 	}
 	normalized := make([]string, 0, len(keys))
 	for _, key := range keys {
@@ -179,7 +182,24 @@ func PinHostKeys(path, host string, port int, keys []string) error {
 
 // UnpinHostKeys removes every key pinned for host:port.
 func UnpinHostKeys(path, host string, port int) error {
+	if err := requireNormalizedHost(host); err != nil {
+		return err
+	}
 	return rewriteKnownHosts(path, KnownHostsPattern(host, port), nil)
+}
+
+// requireNormalizedHost refuses any host that is not already in
+// config.NormalizeHost form, so no caller can write or match a known_hosts
+// pattern.
+func requireNormalizedHost(host string) error {
+	normalized, err := config.NormalizeHost(host)
+	if err != nil {
+		return fmt.Errorf("invalid known_hosts host: %w", err)
+	}
+	if normalized != host {
+		return fmt.Errorf("known_hosts host %q is not normalized (want %q)", host, normalized)
+	}
+	return nil
 }
 
 func rewriteKnownHosts(path, pattern string, keys []string) error {

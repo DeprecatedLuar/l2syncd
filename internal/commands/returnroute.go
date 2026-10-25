@@ -27,9 +27,13 @@ var returnDial = transport.Exchange
 // host keys, and dials back. Any failure restores the previous address and
 // pins.
 func verifyReturnRoute(ctx context.Context, peerName, fingerprint string, route transport.ReturnRoute, sshConnection string) error {
-	host, err := returnHost(route, sshConnection)
+	rawHost, err := returnHost(route, sshConnection)
 	if err != nil {
 		return err
+	}
+	host, err := config.NormalizeHost(rawHost)
+	if err != nil {
+		return fmt.Errorf("return host: %w", err)
 	}
 	if route.User == "" || strings.ContainsAny(route.User, "@ \t") {
 		return fmt.Errorf("invalid return user %q", route.User)
@@ -105,8 +109,8 @@ func removeStalePins(knownHosts, peerName string, previous config.Peer, host str
 	if previous.Address == "" {
 		return nil
 	}
-	previousHost := config.AddressHost(previous.Address)
-	if previousHost == host && normalizedPort(previous.Port) == normalizedPort(port) {
+	previousHost, pinned := pinnedHost(previous.Address)
+	if !pinned || previousHost == host && normalizedPort(previous.Port) == normalizedPort(port) {
 		return nil
 	}
 	cfg, err := config.Load()
@@ -122,18 +126,31 @@ func removeStalePins(knownHosts, peerName string, previous config.Peer, host str
 	return nil
 }
 
-// peerUsingEndpoint returns a peer other than excluded whose address host and
-// port match, treating port 0 as the default sshd port.
+// peerUsingEndpoint returns a peer other than excluded whose normalized
+// address host and port match, treating port 0 as the default sshd port. A
+// host that does not normalize never matches: it can share no pin.
 func peerUsingEndpoint(cfg *config.Config, excluded, host string, port int) (string, bool) {
+	wanted, err := config.NormalizeHost(host)
+	if err != nil {
+		return "", false
+	}
 	for name, peer := range cfg.Peers {
 		if name == excluded || peer.Address == "" {
 			continue
 		}
-		if config.AddressHost(peer.Address) == host && normalizedPort(peer.Port) == normalizedPort(port) {
+		if stored, ok := pinnedHost(peer.Address); ok && stored == wanted && normalizedPort(peer.Port) == normalizedPort(port) {
 			return name, true
 		}
 	}
 	return "", false
+}
+
+// pinnedHost returns the known_hosts host of a stored address. ok is false
+// when that host is not a plain hostname or IP literal (an ssh_config alias
+// such as "my_box"): l2sync never pins under such a host.
+func pinnedHost(address string) (string, bool) {
+	host, err := config.NormalizeHost(config.AddressHost(address))
+	return host, err == nil
 }
 
 func normalizedPort(port int) int {

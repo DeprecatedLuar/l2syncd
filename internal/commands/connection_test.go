@@ -876,3 +876,33 @@ func TestAcceptPeerKeyRevertsStoredPeerWhenGrantFails(t *testing.T) {
 		})
 	}
 }
+
+func TestParseConnectionAddRejectsDegenerateReturnAddress(t *testing.T) {
+	for _, address := range []string{"", "@host", "user@", "bad*host", "user@!x", "user@ho st", "user@a@b", "-oProxyCommand=x", "user@|x"} {
+		if got, err := parseConnectionAdd([]string{"vps", "luar@host", "--address", address}, strings.NewReader("")); err == nil {
+			t.Errorf("--address %q accepted: %+v", address, got)
+		}
+	}
+	if _, err := parseConnectionAdd([]string{"vps", "luar@host", "--address", "alex@Host.LAN"}, strings.NewReader("")); err != nil {
+		t.Fatalf("valid --address refused: %v", err)
+	}
+}
+
+func TestLocalReturnRouteRejectsDegenerateOverrides(t *testing.T) {
+	restore := swap(&localSSHD, func() (connectionpkg.SSHD, error) {
+		return connectionpkg.SSHD{Port: 22, HostKeys: []string{testReturnHostKey}}, nil
+	})
+	t.Cleanup(restore)
+	for _, address := range []string{"@host", "user@", "bad*host", "user@!x"} {
+		if route, err := localReturnRoute(address); err == nil {
+			t.Errorf("localReturnRoute(%q) = %+v, want error", address, route)
+		}
+	}
+	route, err := localReturnRoute("alex@Host.LAN")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if route.User != "alex" || route.Host != "host.lan" {
+		t.Fatalf("route = %+v, want alex@host.lan", route)
+	}
+}

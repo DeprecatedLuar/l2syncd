@@ -3,8 +3,10 @@
 package commands
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"os"
 	"slices"
 	"strings"
 	"testing"
@@ -162,6 +164,9 @@ func TestVerifyReturnRefusesHostPortUsedByAnotherPeer(t *testing.T) {
 		{"same port", config.Peer{Address: "x@100.64.0.5", Port: 8022, PublicKey: testOtherHostKey}, 8022, 8022, "100.64.0.5", ""},
 		{"default port normalized", config.Peer{Address: "x@100.64.0.5", PublicKey: testOtherHostKey}, config.DefaultSSHPort, 0, "100.64.0.5", ""},
 		{"override host", config.Peer{Address: "me.example", PublicKey: testOtherHostKey}, config.DefaultSSHPort, 0, "me.example", "me.example"},
+		{"override case variant", config.Peer{Address: "x@relay.lan", PublicKey: testOtherHostKey}, config.DefaultSSHPort, 0, "relay.lan", "RELAY.lan"},
+		{"stored case variant", config.Peer{Address: "x@RELAY.lan", PublicKey: testOtherHostKey}, config.DefaultSSHPort, 0, "relay.lan", "relay.lan"},
+		{"trailing dot", config.Peer{Address: "x@relay.lan", PublicKey: testOtherHostKey}, config.DefaultSSHPort, 0, "relay.lan", "relay.lan."},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -251,6 +256,55 @@ func TestVerifyReturnStalePinRemoval(t *testing.T) {
 			}
 			if (len(keys) > 0) != tc.wantPinned {
 				t.Fatalf("stale pins = %v, wantPinned %v", keys, tc.wantPinned)
+			}
+		})
+	}
+}
+
+func readOptionalFile(t *testing.T, path string) []byte {
+	t.Helper()
+	contents, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	return contents
+}
+
+func TestVerifyReturnRefusesPatternHostsWithoutWriting(t *testing.T) {
+	for _, tc := range []struct{ name, routeHost, sshConnection string }{
+		{"star", "*", testSSHConnection},
+		{"question", "?", testSSHConnection},
+		{"negation", "!x", testSSHConnection},
+		{"wildcard domain", "*.example.com", testSSHConnection},
+		{"hashed", "|x", testSSHConnection},
+		{"marker", "@x", testSSHConnection},
+		{"derived pattern", "", "* 50000 100.64.0.1 22"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fingerprint, route := returnRouteFixture(t)
+			route.Host = tc.routeHost
+			configPath, err := config.Path()
+			if err != nil {
+				t.Fatal(err)
+			}
+			paths, err := connection.DefaultPaths()
+			if err != nil {
+				t.Fatal(err)
+			}
+			configBefore := readOptionalFile(t, configPath)
+			pinsBefore := readOptionalFile(t, paths.KnownHosts)
+			dialed := stubReturnDial(t, nil)
+			if err := verifyReturnRoute(context.Background(), "phone", fingerprint, route, tc.sshConnection); err == nil {
+				t.Fatal("pattern host accepted")
+			}
+			if dialed.Address != "" {
+				t.Fatalf("dial attempted: %+v", *dialed)
+			}
+			if after := readOptionalFile(t, configPath); !bytes.Equal(configBefore, after) {
+				t.Fatalf("config changed:\n%s\n->\n%s", configBefore, after)
+			}
+			if after := readOptionalFile(t, paths.KnownHosts); !bytes.Equal(pinsBefore, after) {
+				t.Fatalf("known_hosts changed: %q -> %q", pinsBefore, after)
 			}
 		})
 	}

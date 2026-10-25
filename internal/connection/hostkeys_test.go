@@ -122,3 +122,21 @@ func TestKnownHostsPatternBracketsNonDefaultPorts(t *testing.T) {
 		}
 	}
 }
+
+func TestHostKeyFunctionsRejectUnnormalizedHosts(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state", "known_hosts")
+	for _, host := range []string{"", "*", "?", "!x", "*.example.com", "|x", "@x", "Relay.lan", "relay.lan.", "a,b", "[x]:22"} {
+		if err := PinHostKeys(path, host, 22, []string{testHostKey}); err == nil {
+			t.Errorf("PinHostKeys accepted %q", host)
+		}
+		if err := UnpinHostKeys(path, host, 22); err == nil {
+			t.Errorf("UnpinHostKeys accepted %q", host)
+		}
+		if _, err := HostKeysFor(path, host, 22); err == nil {
+			t.Errorf("HostKeysFor accepted %q", host)
+		}
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("known_hosts written for rejected hosts: %v", err)
+	}
+}

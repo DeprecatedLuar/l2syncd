@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"os/user"
-	"strings"
 
 	"l2syncd/internal/config"
 	"l2syncd/internal/connection"
@@ -95,15 +94,29 @@ func localReturnRoute(returnAddress string) (transport.ReturnRoute, error) {
 	}
 	route := transport.ReturnRoute{User: current.Username, Port: sshd.Port, HostKeys: sshd.HostKeys}
 	if returnAddress != "" {
-		if err := config.ValidatePeerAddress(returnAddress); err != nil {
-			return transport.ReturnRoute{}, fmt.Errorf("--address: %w", err)
+		userPart, host, err := parseReturnAddress(returnAddress)
+		if err != nil {
+			return transport.ReturnRoute{}, err
 		}
-		if userPart, _, found := strings.Cut(returnAddress, "@"); found {
+		if userPart != "" {
 			route.User = userPart
 		}
-		route.Host = config.AddressHost(returnAddress)
+		route.Host = host
 	}
 	return route, nil
+}
+
+// parseReturnAddress validates an --address value, "user@host" or "host",
+// and returns its user (empty when absent) and normalized host.
+func parseReturnAddress(value string) (user, host string, err error) {
+	if err := config.ValidatePeerAddress(value); err != nil {
+		return "", "", fmt.Errorf("--address: %w", err)
+	}
+	user, host, err = config.SplitAddress(value)
+	if err != nil {
+		return "", "", fmt.Errorf("--address: %w", err)
+	}
+	return user, host, nil
 }
 
 func endpointForPeer(name string, peer config.Peer, accept func(string) error) (transport.Endpoint, error) {

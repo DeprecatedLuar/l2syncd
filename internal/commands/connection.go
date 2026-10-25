@@ -454,8 +454,7 @@ func connectionRemove(args []string, stderr io.Writer) (exitCode int) {
 			return connectionExitError
 		}
 	}
-	if peer.Address != "" {
-		host := config.AddressHost(peer.Address)
+	if host, pinned := pinnedHost(peer.Address); pinned {
 		if _, shared := peerUsingEndpoint(&cfg, name, host, peer.Port); !shared {
 			if err := connectionpkg.UnpinHostKeys(paths.KnownHosts, host, peer.Port); err != nil {
 				fmt.Fprintf(stderr, "l2sync: remove pinned host keys: %v; retry connection rm\n", err)
@@ -604,6 +603,9 @@ func parseConnectionAdd(args []string, stdin io.Reader) (connectionAddRequest, e
 			}
 			request.key = key
 		case addressFlag:
+			if _, _, err := parseReturnAddress(rest[1]); err != nil {
+				return connectionAddRequest{}, err
+			}
 			request.returnAddress = rest[1]
 		default:
 			return connectionAddRequest{}, errors.New(connectionAddUsage)
