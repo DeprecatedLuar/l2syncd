@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -83,5 +84,20 @@ func TestSharedPeerErrorSeparatesTransportFromRefusal(t *testing.T) {
 	served := sharedPeerError("phone", "notes", errors.New(`folder "notes" is not bound`))
 	if !strings.Contains(served.Error(), "does not serve") {
 		t.Fatalf("application refusal = %v, want does-not-serve", served)
+	}
+}
+
+func TestSharedPeerErrorNamesMissingBinary(t *testing.T) {
+	missing := exec.Command("sh", "-c", "exit 127").Run()
+	err := sharedPeerError("peer", "notes", transport.RemoteExitError("peer", missing, ""))
+	if strings.Contains(err.Error(), "does not serve") {
+		t.Fatalf("missing binary reported as not served: %v", err)
+	}
+	want := `peer "peer": l2sync not found on PATH on peer`
+	if err.Error() != want {
+		t.Fatalf("sharedPeerError = %q, want %q", err, want)
+	}
+	if !transport.IsError(err) {
+		t.Fatalf("sharedPeerError(%v) is not a transport error", err)
 	}
 }

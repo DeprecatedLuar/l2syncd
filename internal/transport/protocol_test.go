@@ -764,8 +764,11 @@ func TestRemoteExitErrorNamesMissingBinary(t *testing.T) {
 	if got := RemoteExitError("phone", missing, "bash: l2sync: command not found"); !strings.Contains(got.Error(), "l2sync not found on PATH on phone") {
 		t.Fatalf("RemoteExitError(127) = %v", got)
 	}
+	if got := RemoteExitError("phone", missing, ""); !IsError(got) || IsAuthError(got) {
+		t.Fatalf("RemoteExitError(127) transport=%v auth=%v, want transport only", IsError(got), IsAuthError(got))
+	}
 	other := exec.Command("sh", "-c", "exit 3").Run()
-	if got := RemoteExitError("phone", other, "refused"); !strings.Contains(got.Error(), "refused") {
+	if got := RemoteExitError("phone", other, "refused"); !strings.Contains(got.Error(), "refused") || IsError(got) {
 		t.Fatalf("RemoteExitError(3) = %v", got)
 	}
 }

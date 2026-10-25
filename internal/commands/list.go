@@ -73,9 +73,7 @@ func listWithLister(cfg config.Config, args []string, stdout, stderr io.Writer, 
 		if err := listings[i].err; err != nil {
 			networkFailure = true
 			peerFailed[peerName] = true
-			if len(args) == 1 && args[0] == peerName {
-				fmt.Fprintf(stderr, "l2sync: peer %q unreachable: %v\n", peerName, err)
-			}
+			fmt.Fprintf(stderr, "l2sync: peer %q unreachable: %v\n", peerName, err)
 			continue
 		}
 		peerShares[peerName] = listings[i].shares

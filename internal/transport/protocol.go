@@ -1096,11 +1096,12 @@ func runSSH(ctx context.Context, endpoint Endpoint, bulk bool, input []byte) ([]
 }
 
 // RemoteExitError explains a non-zero exit of a command ssh ran on address.
-// A missing binary is named, because the remote shell's wording is not.
+// A missing binary is named, because the remote shell's wording is not, and
+// is a transport error: the peer is reachable but cannot serve.
 func RemoteExitError(address string, err error, detail string) error {
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) && exitErr.ExitCode() == remoteMissingExitCode {
-		return fmt.Errorf("%s not found on PATH on %s", remoteBinary, address)
+		return &Error{err: fmt.Errorf("%s not found on PATH on %s", remoteBinary, address)}
 	}
 	if detail != "" {
 		return fmt.Errorf("peer %q rejected request: %s", address, detail)

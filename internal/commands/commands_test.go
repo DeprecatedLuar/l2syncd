@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -1390,6 +1391,32 @@ func TestListKeepsLocalEntriesWhenPeerIsUnreachable(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "peer \"phone\" unreachable") {
 		t.Fatalf("stderr = %q, want unreachable message", stderr.String())
+	}
+}
+
+func TestListReportsReasonForEveryUnreachablePeer(t *testing.T) {
+	missing := exec.Command("sh", "-c", "exit 127").Run()
+	failure := transport.RemoteExitError("phone", missing, "")
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{"all peers", nil},
+		{"named peer", []string{"phone"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := config.New()
+			cfg.Peers["phone"] = config.Peer{Address: "phone"}
+			var stdout, stderr bytes.Buffer
+			got := listWithLister(cfg, test.args, &stdout, &stderr, func(context.Context, string) ([]string, error) {
+				return nil, failure
+			})
+			want := "l2sync: peer \"phone\" unreachable: l2sync not found on PATH on phone\n"
+			if got != listExitUnreachable || stderr.String() != want {
+				t.Fatalf("list = code %d, stderr %q, want code %d, stderr %q", got, stderr.String(), listExitUnreachable, want)
+			}
+		})
 	}
 }
 
