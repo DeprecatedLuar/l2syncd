@@ -56,7 +56,7 @@ type Config struct {
 type Peer struct {
 	Address   string `toml:"address"`
 	PublicKey string `toml:"public_key,omitempty"`
-	Port      int    `toml:"port,omitempty"`
+	Port      int    `toml:"port,omitzero"`
 }
 
 // AddressHost returns the host part of a "user@host" or "host" destination.

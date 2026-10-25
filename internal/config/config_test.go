@@ -169,3 +169,50 @@ func TestAddressHost(t *testing.T) {
 		}
 	}
 }
+
+func TestSaveWritesPortOnlyWhenSet(t *testing.T) {
+	const (
+		portKey      = "port ="
+		customPort   = 8022
+		customPortLn = "port = 8022"
+	)
+	tests := []struct {
+		name     string
+		port     int
+		wantLine string
+	}{
+		{name: "default port omitted", port: 0},
+		{name: "custom port written", port: customPort, wantLine: customPortLn},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			t.Setenv("HOME", root)
+			t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+
+			cfg := New()
+			cfg.Peers["phone"] = Peer{Address: "phone", Port: tt.port}
+			if err := Save(cfg); err != nil {
+				t.Fatalf("Save() error = %v", err)
+			}
+			path, err := Path()
+			if err != nil {
+				t.Fatalf("Path() error = %v", err)
+			}
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("ReadFile() error = %v", err)
+			}
+			text := string(data)
+			if tt.wantLine == "" {
+				if strings.Contains(text, portKey) {
+					t.Fatalf("config has port line, want none:\n%s", text)
+				}
+				return
+			}
+			if !strings.Contains(text, tt.wantLine) {
+				t.Fatalf("config missing %q:\n%s", tt.wantLine, text)
+			}
+		})
+	}
+}
