@@ -51,6 +51,7 @@ const (
 	messageConflictCopy   = "write-conflict-copy"
 	messageConflictCheck  = "check-conflict-copy"
 	messageRequestCycle   = "request-cycle"
+	messageVerifyReturn   = "verify-return"
 	messageDeleteFile     = "delete-file"
 	messageApplyDir       = "apply-directory"
 	messageDeleteDir      = "delete-directory"
@@ -129,6 +130,10 @@ type message struct {
 	Created   bool              `json:"created,omitempty"`
 	Exists    bool              `json:"exists,omitempty"`
 	Actions   int               `json:"actions,omitempty"`
+	User      string            `json:"user,omitempty"`
+	Host      string            `json:"host,omitempty"`
+	Port      int               `json:"port,omitempty"`
+	HostKeys  []string          `json:"host_keys,omitempty"`
 	// Version is the version vector attached to a listing entry, or the
 	// resulting vector a mutation's target path must hold once it lands
 	// (every action carries its result vector so the receiving side never
@@ -191,6 +196,7 @@ type Callbacks struct {
 	WriteConflictCopy  func(share, relative, suffix, expectedHash string, manifest metadata.Manifest, contents io.Reader) error
 	ConflictCopyExists func(string, string, string) (bool, error)
 	RequestCycle       func(string) (int, error)
+	VerifyReturn       func(ReturnRoute) error
 	ReuseFile          func(share, relative, expectedHash string, manifest metadata.Manifest, vec vector.Vector) (bool, error)
 	ApplyDirectory     func(string, string, metadata.Manifest) error
 	DeleteDirectory    func(string, string) error
@@ -648,6 +654,14 @@ func Serve(reader io.Reader, writer io.Writer, callbacks Callbacks, handshake *H
 	}
 	switch request.Type {
 	case messagePing:
+		return (frameWriter{w: writer}).write(message{Type: messageEnd})
+	case messageVerifyReturn:
+		if callbacks.VerifyReturn == nil {
+			return errors.New("return verification is not configured")
+		}
+		if err := callbacks.VerifyReturn(ReturnRoute{User: request.User, Host: request.Host, Port: request.Port, HostKeys: request.HostKeys}); err != nil {
+			return err
+		}
 		return (frameWriter{w: writer}).write(message{Type: messageEnd})
 	case messageRequestCycle:
 		if callbacks.RequestCycle == nil {
@@ -1327,6 +1341,26 @@ func sanitizeSSHStderr(value []byte) string {
 func Exchange(ctx context.Context, endpoint Endpoint) error {
 	var request bytes.Buffer
 	if err := (frameWriter{w: &request}).write(message{Type: messagePing}); err != nil {
+		return err
+	}
+	return runMutation(ctx, endpoint, request.Bytes(), false)
+}
+
+// ReturnRoute is how a peer reaches back to the caller: the caller's login
+// user, sshd port and host keys. Host is empty unless the caller overrides
+// the address the peer observes.
+type ReturnRoute struct {
+	User     string
+	Host     string
+	Port     int
+	HostKeys []string
+}
+
+// VerifyReturn asks the peer to store route and dial back over it before
+// replying, proving both directions work.
+func VerifyReturn(ctx context.Context, endpoint Endpoint, route ReturnRoute) error {
+	var request bytes.Buffer
+	if err := (frameWriter{w: &request}).write(message{Type: messageVerifyReturn, User: route.User, Host: route.Host, Port: route.Port, HostKeys: route.HostKeys}); err != nil {
 		return err
 	}
 	return runMutation(ctx, endpoint, request.Bytes(), false)

@@ -789,3 +789,19 @@ func TestKnownHostsOptionRejectsWhitespacePaths(t *testing.T) {
 		t.Fatal("accepted a path with whitespace")
 	}
 }
+
+func TestServeVerifyReturnPassesRoute(t *testing.T) {
+	var request bytes.Buffer
+	if err := (frameWriter{w: &request}).write(message{Type: messageVerifyReturn, User: "u0_a1", Port: 8022, HostKeys: []string{"ssh-ed25519 AAAA"}}); err != nil {
+		t.Fatal(err)
+	}
+	var got ReturnRoute
+	callbacks := Callbacks{VerifyReturn: func(received ReturnRoute) error { got = received; return nil }}
+	var response bytes.Buffer
+	if err := Serve(&request, &response, callbacks, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got.User != "u0_a1" || got.Port != 8022 || len(got.HostKeys) != 1 || got.Host != "" {
+		t.Fatalf("route = %+v", got)
+	}
+}

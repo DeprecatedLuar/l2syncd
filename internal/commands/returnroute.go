@@ -1,0 +1,127 @@
+//go:build linux
+
+package commands
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"l2syncd/internal/config"
+	"l2syncd/internal/connection"
+	"l2syncd/internal/transport"
+)
+
+const (
+	returnDialWait   = 30 * time.Second
+	sshConnectionEnv = "SSH_CONNECTION"
+	maxReturnPort    = 65535
+)
+
+var returnDial = transport.Exchange
+
+// verifyReturnRoute stores how to reach peerName (the source address of the
+// SSH connection it arrived on, unless route overrides the host), pins its
+// host keys, and dials back. Any failure restores the previous address and
+// pins.
+func verifyReturnRoute(ctx context.Context, peerName, fingerprint string, route transport.ReturnRoute, sshConnection string) error {
+	host, err := returnHost(route, sshConnection)
+	if err != nil {
+		return err
+	}
+	if route.User == "" || strings.ContainsAny(route.User, "@ \t") {
+		return fmt.Errorf("invalid return user %q", route.User)
+	}
+	if route.Port < 1 || route.Port > maxReturnPort {
+		return fmt.Errorf("invalid return port %d", route.Port)
+	}
+	if len(route.HostKeys) == 0 {
+		return errors.New("return route carries no host keys")
+	}
+	address := route.User + "@" + host
+	if err := config.ValidatePeerAddress(address); err != nil {
+		return fmt.Errorf("return address: %w", err)
+	}
+	port := route.Port
+	if port == config.DefaultSSHPort {
+		port = 0
+	}
+	paths, err := connection.DefaultPaths()
+	if err != nil {
+		return err
+	}
+	previousPins, err := connection.HostKeysFor(paths.KnownHosts, host, port)
+	if err != nil {
+		return err
+	}
+	var previous config.Peer
+	if err := updateConfigLocked(func(current *config.Config) error {
+		peer, exists := current.Peers[peerName]
+		if !exists || peer.PublicKey == "" {
+			return fmt.Errorf("peer %q has no configured public key", peerName)
+		}
+		if err := requireAuthenticatedFingerprint(peer, fingerprint); err != nil {
+			return fmt.Errorf("peer %q authorization changed: %w", peerName, err)
+		}
+		previous = peer
+		peer.Address, peer.Port = address, port
+		current.Peers[peerName] = peer
+		return nil
+	}); err != nil {
+		return err
+	}
+	revert := func(cause error) error {
+		restorePins := connection.UnpinHostKeys(paths.KnownHosts, host, port)
+		if len(previousPins) > 0 {
+			restorePins = connection.PinHostKeys(paths.KnownHosts, host, port, previousPins)
+		}
+		return errors.Join(cause, restorePins, restorePeerRoute(peerName, previous, address, port))
+	}
+	if err := connection.PinHostKeys(paths.KnownHosts, host, port, route.HostKeys); err != nil {
+		return revert(err)
+	}
+	updated := previous
+	updated.Address, updated.Port = address, port
+	endpoint, err := endpointForPeer(peerName, updated, nil)
+	if err != nil {
+		return revert(err)
+	}
+	dialCtx, cancel := context.WithTimeout(ctx, returnDialWait)
+	defer cancel()
+	if err := returnDial(dialCtx, endpoint); err != nil {
+		return revert(fmt.Errorf("dial back %s port %d: %w", address, route.Port, err))
+	}
+	if previous.Address != "" && (config.AddressHost(previous.Address) != host || previous.Port != port) {
+		if err := connection.UnpinHostKeys(paths.KnownHosts, config.AddressHost(previous.Address), previous.Port); err != nil {
+			return fmt.Errorf("dial-back succeeded, but remove stale pins for %s: %w", previous.Address, err)
+		}
+	}
+	return nil
+}
+
+func returnHost(route transport.ReturnRoute, sshConnection string) (string, error) {
+	if route.Host != "" {
+		return route.Host, nil
+	}
+	fields := strings.Fields(sshConnection)
+	if len(fields) == 0 {
+		return "", fmt.Errorf("%s is not set; cannot observe the caller's address", sshConnectionEnv)
+	}
+	return fields[0], nil
+}
+
+// restorePeerRoute puts back the address this run replaced, unless another
+// writer changed it since.
+func restorePeerRoute(peerName string, previous config.Peer, address string, port int) error {
+	return updateConfigLocked(func(current *config.Config) error {
+		peer, exists := current.Peers[peerName]
+		if !exists || peer.Address != address || peer.Port != port {
+			return nil
+		}
+		peer.Address, peer.Port = previous.Address, previous.Port
+		current.Peers[peerName] = peer
+		return nil
+	})
+}

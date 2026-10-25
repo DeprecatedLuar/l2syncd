@@ -124,6 +124,9 @@ func Serve(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	callbacks.RequestCycle = func(name string) (int, error) {
 		return runInitiatorFolderCycle(context.Background(), name, peerName, forcedFingerprint)
 	}
+	callbacks.VerifyReturn = func(route transport.ReturnRoute) error {
+		return verifyReturnRoute(context.Background(), peerName, forcedFingerprint, route, os.Getenv(sshConnectionEnv))
+	}
 	callbacks.AcknowledgeVector = func(name string, vec vector.Vector) error {
 		return mutateServedFolder(name, resolve, func(folder resolvedFolder) error {
 			idx, err := loadIndex(folder.marker.ID)
