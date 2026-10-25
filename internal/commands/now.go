@@ -367,11 +367,10 @@ func planBoundFolder(ctx context.Context, cfg config.Config, name, expectedPeer 
 	return planFolder(ctx, cfg, name, root, provider, endpoint)
 }
 
-// planFolder reconciles one folder against its bound peer. Unlike the
-// agreed-snapshot model, there is no separate "commit the whole tree at the
-// end" step: every applied action commits its own resulting vector as it
-// lands, through the single commitLocalEntry/commitDirectory/
-// removeDirectoryEntry functions also used by serve.go.
+// planFolder reconciles one folder against its bound peer. Every applied
+// action commits its own resulting vector as it lands, through the
+// commitLocalEntry/commitDirectory/removeDirectoryEntry functions also used
+// by serve.go; there is no whole-tree commit at the end.
 func planFolder(ctx context.Context, cfg config.Config, name, path, peer string, endpoint transport.Endpoint) (int, error) {
 	marker, err := guard.ReadMarker(path)
 	if err != nil {
