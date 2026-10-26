@@ -114,3 +114,21 @@ func TestDefaultIgnoreConflictArtifacts(t *testing.T) {
 		t.Fatal("regular file is unexpectedly ignored")
 	}
 }
+
+func TestMarkerHonorsGitIgnore(t *testing.T) {
+	off, on := false, true
+	tests := []struct {
+		name   string
+		marker Marker
+		want   bool
+	}{
+		{"absent", Marker{}, true},
+		{"true", Marker{GitIgnore: &on}, true},
+		{"false", Marker{GitIgnore: &off}, false},
+	}
+	for _, test := range tests {
+		if got := test.marker.HonorsGitIgnore(); got != test.want {
+			t.Errorf("%s: HonorsGitIgnore() = %v, want %v", test.name, got, test.want)
+		}
+	}
+}

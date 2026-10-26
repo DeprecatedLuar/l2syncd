@@ -83,7 +83,7 @@ func ListEntries(idx index.Index) []ListedFile {
 // change touched (added, modified, or deleted) and never touching an
 // unchanged entry's vector. A file
 // deletion becomes a tombstone, never a removed entry (concept.md 4.2).
-func Reconcile(root string, previous index.Index, patterns []string, fingerprint string) (Result, error) {
+func Reconcile(root string, previous index.Index, marker guard.Marker, fingerprint string) (Result, error) {
 	if fingerprint == "" {
 		return Result{}, errors.New("local installation fingerprint is required")
 	}
@@ -100,11 +100,11 @@ func Reconcile(root string, previous index.Index, patterns []string, fingerprint
 	if err := guard.Filesystem(root); err != nil {
 		return Result{}, err
 	}
-	ignore, err := guard.NewIgnore(patterns)
+	ignore, err := guard.NewIgnore(marker.Ignore)
 	if err != nil {
 		return Result{}, err
 	}
-	gitignore := guard.NewGitIgnore(root)
+	gitignore := guard.NewGitIgnoreFor(root, marker)
 	next := index.New(previous.ID)
 	changes := make([]Change, 0)
 	skipped := make([]string, 0)

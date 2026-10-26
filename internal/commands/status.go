@@ -83,7 +83,7 @@ func IndexCommit(args []string, stderr io.Writer) int {
 		if err != nil {
 			return fmt.Errorf("load index: %w", err)
 		}
-		result, err := scan.Reconcile(root, previous, marker.Ignore, localIdentity)
+		result, err := scan.Reconcile(root, previous, marker, localIdentity)
 		if err != nil {
 			return fmt.Errorf("scan folder: %w", err)
 		}
@@ -121,7 +121,7 @@ func printStatus(stdout io.Writer, name, path string) error {
 	if err != nil {
 		return err
 	}
-	result, err := scan.Reconcile(root, previous, marker.Ignore, localIdentity)
+	result, err := scan.Reconcile(root, previous, marker, localIdentity)
 	if err != nil {
 		return err
 	}

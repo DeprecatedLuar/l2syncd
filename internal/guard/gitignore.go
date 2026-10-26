@@ -24,8 +24,9 @@ type gitignoreRule struct {
 // matching line wins (negation included). Rulesets are read lazily and
 // cached per directory, so construction never touches the filesystem.
 type GitIgnore struct {
-	root  string
-	cache map[string][]gitignoreRule
+	root     string
+	cache    map[string][]gitignoreRule
+	disabled bool
 }
 
 // NewGitIgnore returns a matcher scoped to root. It performs no I/O.
@@ -33,9 +34,20 @@ func NewGitIgnore(root string) *GitIgnore {
 	return &GitIgnore{root: root, cache: make(map[string][]gitignoreRule)}
 }
 
+// NewGitIgnoreFor returns a matcher scoped to root that matches nothing when
+// the marker opts out of the .gitignore layer.
+func NewGitIgnoreFor(root string, marker Marker) *GitIgnore {
+	g := NewGitIgnore(root)
+	g.disabled = !marker.HonorsGitIgnore()
+	return g
+}
+
 // Match reports whether relative (a root-relative, slash-separated path) is
 // excluded by any .gitignore found along its ancestor directories.
 func (g *GitIgnore) Match(relative string, isDir bool) (bool, error) {
+	if g.disabled {
+		return false, nil
+	}
 	relative = strings.Trim(relative, "/")
 	if relative == "" {
 		return false, nil

@@ -6,11 +6,13 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"golang.org/x/sys/unix"
+	"l2syncd/internal/guard"
 	"l2syncd/internal/index"
 	"l2syncd/internal/metadata"
 	"l2syncd/internal/vector"
@@ -27,7 +29,7 @@ func TestReconcileDetectsAddedModifiedAndDeleted(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "new.txt"), []byte("new"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	first, err := Reconcile(root, index.New("test-id"), nil, testFingerprint)
+	first, err := Reconcile(root, index.New("test-id"), guard.Marker{}, testFingerprint)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,7 +45,7 @@ func TestReconcileDetectsAddedModifiedAndDeleted(t *testing.T) {
 		}
 	}
 
-	second, err := Reconcile(root, first.Index, nil, testFingerprint)
+	second, err := Reconcile(root, first.Index, guard.Marker{}, testFingerprint)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,7 +62,7 @@ func TestReconcileDetectsAddedModifiedAndDeleted(t *testing.T) {
 	if err := os.Remove(filepath.Join(root, "new.txt")); err != nil {
 		t.Fatal(err)
 	}
-	third, err := Reconcile(root, first.Index, nil, testFingerprint)
+	third, err := Reconcile(root, first.Index, guard.Marker{}, testFingerprint)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,7 +87,7 @@ func TestReconcileCarriesExistingTombstonesForward(t *testing.T) {
 	writeTestMarker(t, root)
 	previous := index.New("test-id")
 	previous.Entries["gone.txt"] = index.Entry{Version: vector.Vector{testFingerprint: 3}, Deleted: true, DeletedAt: time.Unix(1, 0)}
-	result, err := Reconcile(root, previous, nil, testFingerprint)
+	result, err := Reconcile(root, previous, guard.Marker{}, testFingerprint)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,7 +108,7 @@ func TestReconcileTreatsLocalRecreationAfterDeletionAsANewChange(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "back.txt"), []byte("recreated"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	result, err := Reconcile(root, previous, nil, testFingerprint)
+	result, err := Reconcile(root, previous, guard.Marker{}, testFingerprint)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,7 +135,7 @@ func TestReconcileFindsMetadataOnlyFileAndDirectoryEdits(t *testing.T) {
 	if err := os.WriteFile(file, []byte("same bytes"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	first, err := Reconcile(root, index.New("test-id"), nil, testFingerprint)
+	first, err := Reconcile(root, index.New("test-id"), guard.Marker{}, testFingerprint)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,7 +147,7 @@ func TestReconcileFindsMetadataOnlyFileAndDirectoryEdits(t *testing.T) {
 	if err := os.Chtimes(directory, mtime, mtime); err != nil {
 		t.Fatal(err)
 	}
-	second, err := Reconcile(root, first.Index, nil, testFingerprint)
+	second, err := Reconcile(root, first.Index, guard.Marker{}, testFingerprint)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -185,7 +187,7 @@ func TestReconcileReportsOutOfSetEntriesWithoutFailing(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	result, err := Reconcile(root, index.New("test-id"), nil, testFingerprint)
+	result, err := Reconcile(root, index.New("test-id"), guard.Marker{}, testFingerprint)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -243,7 +245,7 @@ func TestReconcileFailsClosedWhenOpenedPathIsReplacedBySymlink(t *testing.T) {
 				}
 			}
 			t.Cleanup(func() { afterScanOpen = original })
-			if _, err := Reconcile(root, index.New("test-id"), nil, testFingerprint); err == nil {
+			if _, err := Reconcile(root, index.New("test-id"), guard.Marker{}, testFingerprint); err == nil {
 				t.Fatal("scan accepted a path replaced after its anchored open")
 			}
 			contents, err := os.ReadFile(outsideFile)
@@ -264,7 +266,7 @@ func TestReconcileRejectsHardLinkedRegularFile(t *testing.T) {
 	if err := os.Link(first, filepath.Join(root, "second")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Reconcile(root, index.New("test-id"), nil, testFingerprint); err == nil || !strings.Contains(err.Error(), "hard link") {
+	if _, err := Reconcile(root, index.New("test-id"), guard.Marker{}, testFingerprint); err == nil || !strings.Contains(err.Error(), "hard link") {
 		t.Fatalf("Reconcile error = %v, want hard-link rejection", err)
 	}
 }
@@ -272,7 +274,7 @@ func TestReconcileRejectsHardLinkedRegularFile(t *testing.T) {
 func TestReconcileRequiresFingerprint(t *testing.T) {
 	root := t.TempDir()
 	writeTestMarker(t, root)
-	if _, err := Reconcile(root, index.New("test-id"), nil, ""); err == nil {
+	if _, err := Reconcile(root, index.New("test-id"), guard.Marker{}, ""); err == nil {
 		t.Fatal("Reconcile with empty fingerprint = nil error, want error")
 	}
 }
@@ -306,7 +308,7 @@ func TestReconcileSkipsIgnoredFilesAndSymlinks(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	result, err := Reconcile(root, index.New("test-id"), []string{"custom.txt"}, testFingerprint)
+	result, err := Reconcile(root, index.New("test-id"), guard.Marker{Ignore: []string{"custom.txt"}}, testFingerprint)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -327,14 +329,14 @@ func TestReconcileCarriesNowIgnoredEntryForwardWithoutReportingADeletion(t *test
 	if err := os.WriteFile(filepath.Join(root, "keep.txt"), []byte("keep"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	first, err := Reconcile(root, index.New("test-id"), nil, testFingerprint)
+	first, err := Reconcile(root, index.New("test-id"), guard.Marker{}, testFingerprint)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := first.Index.Entries["keep.txt"]; !ok {
 		t.Fatal("setup failed: keep.txt was not tracked")
 	}
-	second, err := Reconcile(root, first.Index, []string{"keep.txt"}, testFingerprint)
+	second, err := Reconcile(root, first.Index, guard.Marker{Ignore: []string{"keep.txt"}}, testFingerprint)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -360,7 +362,7 @@ func TestReconcileCarriesNowGitignoredEntryForward(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "secret.env"), []byte("token"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	first, err := Reconcile(root, index.New("test-id"), nil, testFingerprint)
+	first, err := Reconcile(root, index.New("test-id"), guard.Marker{}, testFingerprint)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -371,7 +373,7 @@ func TestReconcileCarriesNowGitignoredEntryForward(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	second, err := Reconcile(root, first.Index, nil, testFingerprint)
+	second, err := Reconcile(root, first.Index, guard.Marker{}, testFingerprint)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -432,8 +434,76 @@ func TestReconcileRefusesSymlinkRoot(t *testing.T) {
 	if err := os.Symlink(target, link); err != nil {
 		t.Fatal(err)
 	}
-	_, err := Reconcile(link, index.New("test-id"), nil, testFingerprint)
+	_, err := Reconcile(link, index.New("test-id"), guard.Marker{}, testFingerprint)
 	if err == nil || !strings.Contains(err.Error(), "is a symlink") {
 		t.Fatalf("Reconcile(symlink root) error = %v, want symlink refusal", err)
+	}
+}
+
+func TestReconcileGitIgnoreOptOut(t *testing.T) {
+	off := false
+	tests := []struct {
+		name      string
+		marker    guard.Marker
+		wantFound map[string]bool
+	}{
+		{"default honors gitignore", guard.Marker{}, map[string]bool{"notes.md": false, "kept.txt": true}},
+		{"opt-out syncs gitignored files", guard.Marker{GitIgnore: &off}, map[string]bool{"notes.md": true, "kept.txt": true}},
+		{"opt-out keeps marker ignore", guard.Marker{GitIgnore: &off, Ignore: []string{"notes.md"}}, map[string]bool{"notes.md": false, "kept.txt": true}},
+		{"opt-out keeps default ignore", guard.Marker{GitIgnore: &off}, map[string]bool{".git/config": false}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			writeTestMarker(t, root)
+			files := map[string]string{".gitignore": "*.md\n", "notes.md": "n", "kept.txt": "k", ".git/config": "c"}
+			for name, content := range files {
+				path := filepath.Join(root, filepath.FromSlash(name))
+				if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			result, err := Reconcile(root, index.New("test-id"), test.marker, testFingerprint)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for path, want := range test.wantFound {
+				if _, found := result.Index.Entries[path]; found != want {
+					t.Errorf("entry %q present = %v, want %v", path, found, want)
+				}
+			}
+		})
+	}
+}
+
+func TestReconcileGitIgnoreToggleCarriesEntryForward(t *testing.T) {
+	off := false
+	root := t.TempDir()
+	writeTestMarker(t, root)
+	for name, content := range map[string]string{".gitignore": "*.md\n", "notes.md": "n"} {
+		if err := os.WriteFile(filepath.Join(root, name), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	optedOut, err := Reconcile(root, index.New("test-id"), guard.Marker{GitIgnore: &off}, testFingerprint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restored, err := Reconcile(root, optedOut.Index, guard.Marker{}, testFingerprint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, found := restored.Index.Entries["notes.md"]
+	if !found || got.Deleted {
+		t.Fatalf("notes.md entry = %#v (found %v), want carried forward live", got, found)
+	}
+	if !reflect.DeepEqual(got.Version, optedOut.Index.Entries["notes.md"].Version) {
+		t.Fatal("carried-forward entry version changed")
+	}
+	if len(restored.Changes) != 0 {
+		t.Fatalf("changes = %#v, want none", restored.Changes)
 	}
 }

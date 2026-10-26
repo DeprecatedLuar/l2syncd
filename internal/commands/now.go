@@ -389,7 +389,7 @@ func planFolder(ctx context.Context, cfg config.Config, name, path, peer string,
 	if err != nil {
 		return 0, fmt.Errorf("load index: %w", err)
 	}
-	local, err := scanShare(path, previous, marker.Ignore, localIdentity)
+	local, err := scanShare(path, previous, marker, localIdentity)
 	if err != nil {
 		return 0, err
 	}
@@ -760,8 +760,8 @@ func reuseLocal(ctx context.Context, share, folderID, root, relative string, vec
 	return false, nil
 }
 
-func scanShare(path string, previous index.Index, ignore []string, localIdentity string) (index.Index, error) {
-	result, err := scan.Reconcile(path, previous, ignore, localIdentity)
+func scanShare(path string, previous index.Index, marker guard.Marker, localIdentity string) (index.Index, error) {
+	result, err := scan.Reconcile(path, previous, marker, localIdentity)
 	if err != nil {
 		return index.Index{}, fmt.Errorf("scan share: %w", err)
 	}

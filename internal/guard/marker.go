@@ -24,7 +24,13 @@ type Marker struct {
 	ID     string   `toml:"id"`
 	Name   string   `toml:"name"`
 	Ignore []string `toml:"ignore"`
+	// GitIgnore disables the .gitignore layer when set to false; absent
+	// means .gitignore files are honored.
+	GitIgnore *bool `toml:"gitignore,omitempty"`
 }
+
+// HonorsGitIgnore reports whether .gitignore files inside the folder apply.
+func (m Marker) HonorsGitIgnore() bool { return m.GitIgnore == nil || *m.GitIgnore }
 
 func MarkerPath(folder string) string { return filepath.Join(folder, markerFilename) }
 

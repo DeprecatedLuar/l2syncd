@@ -225,7 +225,7 @@ func serveCallbacks(resolve folderResolver) transport.Callbacks {
 			if loadErr != nil {
 				return loadErr
 			}
-			result, scanErr := scan.Reconcile(current.root, previous, current.marker.Ignore, localIdentity)
+			result, scanErr := scan.Reconcile(current.root, previous, current.marker, localIdentity)
 			if scanErr != nil {
 				return fmt.Errorf("list folder %q: %w", name, scanErr)
 			}

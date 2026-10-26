@@ -169,11 +169,11 @@ func Attach(args []string, stderr io.Writer) (exitCode int) {
 		fmt.Fprintf(stderr, "l2sync: folder %q: %v\n", name, compensateRemote(err))
 		return attachExitError
 	}
-	var localIgnore []string
+	var localMarker guard.Marker
 	if existingMarker, markerErr := guard.ReadMarker(path); markerErr == nil {
-		localIgnore = existingMarker.Ignore
+		localMarker = existingMarker
 	}
-	extras, err := divergentLocalPaths(root, localIgnore, remoteFiles)
+	extras, err := divergentLocalPaths(root, localMarker, remoteFiles)
 	if err != nil {
 		fmt.Fprintf(stderr, "l2sync: compare folder %q against provider %q: %v\n", name, peerName, compensateRemote(err))
 		return attachExitError
@@ -232,7 +232,7 @@ func prepareAttachMarker(path, name, id string) (bool, error) {
 			return false, genErr
 		}
 	}
-	if err := guard.WriteMarker(path, guard.Marker{ID: id, Name: name}); err != nil {
+	if err := guard.WriteMarker(path, guard.Marker{ID: id, Name: name, Ignore: []string{}}); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -301,12 +301,12 @@ var attachResolveDivergence = promptDivergenceInteractive
 // path the provider's listing does not carry live. Symlinks and other
 // unsupported types are skipped, matching scan.Reconcile's own handling,
 // since v1 has no fidelity contract for them either way.
-func divergentLocalPaths(root string, patterns []string, providerFiles []transport.PeerFile) ([]string, error) {
-	ignore, err := guard.NewIgnore(patterns)
+func divergentLocalPaths(root string, marker guard.Marker, providerFiles []transport.PeerFile) ([]string, error) {
+	ignore, err := guard.NewIgnore(marker.Ignore)
 	if err != nil {
 		return nil, err
 	}
-	gitignore := guard.NewGitIgnore(root)
+	gitignore := guard.NewGitIgnoreFor(root, marker)
 	providerPaths := make(map[string]bool, len(providerFiles))
 	for _, file := range providerFiles {
 		if file.Deleted || file.Directory {
